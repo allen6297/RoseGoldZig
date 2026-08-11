@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const Lexer = @import("fontend/lexer.zig");
 const Parser = @import("fontend/parser.zig");
+const Analyzer = @import("fontend/analyzer.zig");
 
 const RoseGold_Zig = @import("RoseGold_Zig");
 
@@ -32,9 +33,34 @@ pub fn main(init: std.process.Init) !void {
     try RoseGold_Zig.printAnotherMessage(stdout_writer);
 
     try parserDemo(arena, stdout_writer);
+    try analyzerDemo(arena, stdout_writer);
 
     try stdout_writer.flush(); // Don't forget to flush!
 }
+
+/// Runs the semantic analyzer over a small program with a deliberate typo, to
+/// show name resolution catching an undefined reference.
+fn analyzerDemo(gpa: std.mem.Allocator, out: *Io.Writer) !void {
+    var tree = try Parser.parse(gpa, analyzer_demo_source);
+    defer tree.deinit();
+    var analysis = try Analyzer.analyze(gpa, tree.module);
+    defer analysis.deinit();
+
+    try out.print("\n== analyzer demo ==\n", .{});
+    try out.print("diagnostics: {d}\n", .{analysis.diagnostics.len});
+    for (analysis.diagnostics) |diag| {
+        try out.print("  {d}:{d} {s}\n", .{ diag.line, diag.col, diag.message });
+    }
+}
+
+const analyzer_demo_source =
+    \\const LIMIT: int = 10
+    \\
+    \\pub func clamp(value: int) -> int:
+    \\    if value > LIMIT:
+    \\        return LIMIT
+    \\    return valve
+;
 
 /// A small program exercising the whole front end: it lexes and parses
 /// `demo_source`, then prints a summary of the top-level declarations and any
