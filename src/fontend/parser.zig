@@ -194,7 +194,7 @@ fn spanFrom(a: Token, b: Token) Span {
     return joinSpan(a.span, b.span);
 }
 
-fn exprSpan(e: Expr) Span {
+pub fn exprSpan(e: Expr) Span {
     return switch (e) {
         .int_literal, .float_literal, .string_literal => |lit| lit.span,
         .bool_literal => |b| b.span,

@@ -38,8 +38,9 @@ pub fn main(init: std.process.Init) !void {
     try stdout_writer.flush(); // Don't forget to flush!
 }
 
-/// Runs the semantic analyzer over a small program with a deliberate typo, to
-/// show name resolution catching an undefined reference.
+/// Runs the semantic analyzer over a small program with two deliberate mistakes
+/// — a type mismatch and an undefined reference — to show name resolution and
+/// type checking catching them.
 fn analyzerDemo(gpa: std.mem.Allocator, out: *Io.Writer) !void {
     var tree = try Parser.parse(gpa, analyzer_demo_source);
     defer tree.deinit();
@@ -58,7 +59,7 @@ const analyzer_demo_source =
     \\
     \\pub func clamp(value: int) -> int:
     \\    if value > LIMIT:
-    \\        return LIMIT
+    \\        return "too big"
     \\    return valve
 ;
 
