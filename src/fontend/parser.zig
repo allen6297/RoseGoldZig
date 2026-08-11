@@ -6,8 +6,9 @@
 //!   * top-level declarations: `import`, `const`/`var`, `enum`, `func`, `class`
 //!   * statements: `return`, `if`/`elif`/`else`, `while`, `for`, `pass`,
 //!     local `var`/`const`, assignments, and expression statements
-//!   * expressions: literals, identifiers, member access, calls, unary `-`,
-//!     binary operators with precedence, and `match`
+//!   * expressions: literals, identifiers, member access, calls, indexing,
+//!     array/map literals, unary `-`/`not`, arithmetic/comparison/logical
+//!     operators with precedence, and `match`
 //!
 //! Layout: colon-blocks are delimited by INDENT/DEDENT, brace-blocks by
 //! `{`/`}`, and statements are separated by NEWLINE. Errors are reported as
@@ -52,7 +53,11 @@ pub const BinaryOp = enum {
     le,
     gt,
     ge,
+    logical_and,
+    logical_or,
 };
+
+pub const UnaryOp = enum { neg, not };
 
 pub const Expr = union(enum) {
     int_literal: Literal,
@@ -60,19 +65,25 @@ pub const Expr = union(enum) {
     string_literal: Literal,
     bool_literal: Bool,
     identifier: Ident,
-    unary_neg: Unary,
+    unary: Unary,
     binary: Binary,
     call: Call,
+    index: Index,
     member: MemberAccess,
+    array: Array,
+    map: Map,
     match: Match,
 
     pub const Literal = struct { text: []const u8, span: Span };
     pub const Bool = struct { value: bool, span: Span };
     pub const Ident = struct { name: []const u8, span: Span };
-    pub const Unary = struct { operand: *Expr, span: Span };
+    pub const Unary = struct { op: UnaryOp, operand: *Expr, span: Span };
     pub const Binary = struct { op: BinaryOp, lhs: *Expr, rhs: *Expr, span: Span };
     pub const Call = struct { callee: *Expr, args: []const *Expr, span: Span };
+    pub const Index = struct { object: *Expr, index: *Expr, span: Span };
     pub const MemberAccess = struct { object: *Expr, name: []const u8, span: Span };
+    pub const Array = struct { elements: []const *Expr, span: Span };
+    pub const Map = struct { entries: []const MapEntry, span: Span };
     pub const Match = struct { subject: *Expr, arms: []const MatchArm, span: Span };
 };
 
@@ -80,6 +91,11 @@ pub const MatchArm = struct {
     pattern: Pattern,
     body: *Expr,
     span: Span,
+};
+
+pub const MapEntry = struct {
+    key: *Expr,
+    value: *Expr,
 };
 
 pub const Pattern = union(enum) {
@@ -129,7 +145,7 @@ pub const Stmt = union(enum) {
     pub const Assign = struct { target: *Expr, value: *Expr, span: Span };
 };
 
-pub const EnumMember = struct { name: []const u8, span: Span };
+pub const EnumMember = struct { name: []const u8, value: ?*Expr, span: Span };
 
 pub const Decl = union(enum) {
     import: Import,
@@ -183,10 +199,13 @@ fn exprSpan(e: Expr) Span {
         .int_literal, .float_literal, .string_literal => |lit| lit.span,
         .bool_literal => |b| b.span,
         .identifier => |id| id.span,
-        .unary_neg => |u| u.span,
+        .unary => |u| u.span,
         .binary => |b| b.span,
         .call => |c| c.span,
+        .index => |i| i.span,
         .member => |m| m.span,
+        .array => |a| a.span,
+        .map => |m| m.span,
         .match => |m| m.span,
     };
 }
@@ -473,7 +492,15 @@ const Parser = struct {
         var members: std.ArrayList(EnumMember) = .empty;
         while (!self.at(.r_brace) and !self.atEnd()) {
             const m = try self.expect(.identifier, "expected an enum member name");
-            try members.append(self.alloc, .{ .name = m.text, .span = m.span });
+            var value: ?*Expr = null;
+            if (self.eat(.assign)) value = try self.parseExpr();
+            try members.append(self.alloc, .{
+                .name = m.text,
+                .value = value,
+                .span = if (value) |v| joinSpan(m.span, exprSpan(v.*)) else m.span,
+            });
+            // Members may be separated by a newline, a comma, or both.
+            _ = self.eat(.comma);
             self.skipNewlines();
         }
         _ = try self.expect(.r_brace, "expected '}' to close the enum body");
@@ -631,6 +658,55 @@ const Parser = struct {
     // --- expressions ---------------------------------------------------------
 
     fn parseExpr(self: *Parser) Error!*Expr {
+        return self.parseOr();
+    }
+
+    // Logical operators sit below the comparison/arithmetic precedence table:
+    // `or` is loosest, then `and`, then the prefix `not` (which binds looser
+    // than comparisons, so `not a == b` is `not (a == b)`).
+
+    fn parseOr(self: *Parser) Error!*Expr {
+        var lhs = try self.parseAnd();
+        while (self.at(.kw_or)) {
+            _ = self.advance();
+            const lhs_span = exprSpan(lhs.*);
+            const rhs = try self.parseAnd();
+            lhs = try self.mkExpr(.{ .binary = .{
+                .op = .logical_or,
+                .lhs = lhs,
+                .rhs = rhs,
+                .span = joinSpan(lhs_span, exprSpan(rhs.*)),
+            } });
+        }
+        return lhs;
+    }
+
+    fn parseAnd(self: *Parser) Error!*Expr {
+        var lhs = try self.parseNot();
+        while (self.at(.kw_and)) {
+            _ = self.advance();
+            const lhs_span = exprSpan(lhs.*);
+            const rhs = try self.parseNot();
+            lhs = try self.mkExpr(.{ .binary = .{
+                .op = .logical_and,
+                .lhs = lhs,
+                .rhs = rhs,
+                .span = joinSpan(lhs_span, exprSpan(rhs.*)),
+            } });
+        }
+        return lhs;
+    }
+
+    fn parseNot(self: *Parser) Error!*Expr {
+        if (self.at(.kw_not)) {
+            const op = self.advance();
+            const operand = try self.parseNot();
+            return self.mkExpr(.{ .unary = .{
+                .op = .not,
+                .operand = operand,
+                .span = joinSpan(op.span, exprSpan(operand.*)),
+            } });
+        }
         return self.parseBinary(1);
     }
 
@@ -656,7 +732,8 @@ const Parser = struct {
         if (self.at(.minus)) {
             const op = self.advance();
             const operand = try self.parseUnary();
-            return self.mkExpr(.{ .unary_neg = .{
+            return self.mkExpr(.{ .unary = .{
+                .op = .neg,
                 .operand = operand,
                 .span = joinSpan(op.span, exprSpan(operand.*)),
             } });
@@ -693,6 +770,16 @@ const Parser = struct {
                         .span = joinSpan(exprSpan(expr.*), rparen.span),
                     } });
                 },
+                .l_bracket => {
+                    _ = self.advance();
+                    const idx = try self.parseExpr();
+                    const rbracket = try self.expect(.r_bracket, "expected ']' to close the index");
+                    expr = try self.mkExpr(.{ .index = .{
+                        .object = expr,
+                        .index = idx,
+                        .span = joinSpan(exprSpan(expr.*), rbracket.span),
+                    } });
+                },
                 else => break,
             }
         }
@@ -727,6 +814,8 @@ const Parser = struct {
                 return self.mkExpr(.{ .identifier = .{ .name = t.text, .span = t.span } });
             },
             .kw_match => return self.mkExpr(.{ .match = try self.parseMatch() }),
+            .l_bracket => return self.mkExpr(.{ .array = try self.parseArrayLiteral() }),
+            .l_brace => return self.mkExpr(.{ .map = try self.parseMapLiteral() }),
             .l_paren => {
                 _ = self.advance();
                 const inner = try self.parseExpr();
@@ -738,6 +827,46 @@ const Parser = struct {
                 return error.ParseError;
             },
         }
+    }
+
+    /// `[e0, e1, ...]`. Newlines are suppressed inside `[`, so elements are
+    /// comma-separated; a trailing comma is allowed.
+    fn parseArrayLiteral(self: *Parser) Error!Expr.Array {
+        const lbracket = self.advance(); // '['
+        var elements: std.ArrayList(*Expr) = .empty;
+        if (!self.at(.r_bracket)) {
+            while (true) {
+                try elements.append(self.alloc, try self.parseExpr());
+                if (!self.eat(.comma)) break;
+                if (self.at(.r_bracket)) break; // trailing comma
+            }
+        }
+        const rbracket = try self.expect(.r_bracket, "expected ']' to close the array");
+        return .{
+            .elements = try elements.toOwnedSlice(self.alloc),
+            .span = spanFrom(lbracket, rbracket),
+        };
+    }
+
+    /// `{k0: v0, k1: v1}`. Newlines stay significant inside `{`, so entries may
+    /// be separated by commas, newlines, or both.
+    fn parseMapLiteral(self: *Parser) Error!Expr.Map {
+        const lbrace = self.advance(); // '{'
+        self.skipNewlines();
+        var entries: std.ArrayList(MapEntry) = .empty;
+        while (!self.at(.r_brace) and !self.atEnd()) {
+            const key = try self.parseExpr();
+            _ = try self.expect(.colon, "expected ':' between a map key and value");
+            const value = try self.parseExpr();
+            try entries.append(self.alloc, .{ .key = key, .value = value });
+            _ = self.eat(.comma);
+            self.skipNewlines();
+        }
+        const rbrace = try self.expect(.r_brace, "expected '}' to close the map");
+        return .{
+            .entries = try entries.toOwnedSlice(self.alloc),
+            .span = spanFrom(lbrace, rbrace),
+        };
     }
 
     fn parseMatch(self: *Parser) Error!Expr.Match {
@@ -976,4 +1105,126 @@ test "reports an error and recovers to the next declaration" {
         if (std.meta.activeTag(d) == .var_decl) var_decls += 1;
     }
     try testing.expectEqual(@as(usize, 2), var_decls);
+}
+
+test "logical operators nest by precedence" {
+    // a or b and c  ->  a or (b and c)
+    var tree = try parse(testing.allocator, "const r = a or b and c");
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const v = tree.module.decls[0].var_decl.value.?;
+    try testing.expect(std.meta.activeTag(v.*) == .binary);
+    try testing.expect(v.binary.op == .logical_or);
+    try testing.expect(std.meta.activeTag(v.binary.rhs.*) == .binary);
+    try testing.expect(v.binary.rhs.binary.op == .logical_and);
+}
+
+test "not binds looser than comparison" {
+    // not x == y  ->  not (x == y)
+    var tree = try parse(testing.allocator, "const r = not x == y");
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const v = tree.module.decls[0].var_decl.value.?;
+    try testing.expect(std.meta.activeTag(v.*) == .unary);
+    try testing.expect(v.unary.op == .not);
+    try testing.expect(std.meta.activeTag(v.unary.operand.*) == .binary);
+    try testing.expect(v.unary.operand.binary.op == .eq);
+}
+
+test "parses indexing" {
+    var tree = try parse(testing.allocator, "const x = items[0]");
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const v = tree.module.decls[0].var_decl.value.?;
+    try testing.expect(std.meta.activeTag(v.*) == .index);
+    try testing.expect(std.meta.activeTag(v.index.object.*) == .identifier);
+    try testing.expect(std.meta.activeTag(v.index.index.*) == .int_literal);
+}
+
+test "parses an array literal" {
+    var tree = try parse(testing.allocator, "const xs = [1, 2, 3]");
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const v = tree.module.decls[0].var_decl.value.?;
+    try testing.expect(std.meta.activeTag(v.*) == .array);
+    try testing.expectEqual(@as(usize, 3), v.array.elements.len);
+    try testing.expect(std.meta.activeTag(v.array.elements[0].*) == .int_literal);
+}
+
+test "parses a map literal" {
+    var tree = try parse(testing.allocator, "const m = {1: \"a\", 2: \"b\"}");
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const v = tree.module.decls[0].var_decl.value.?;
+    try testing.expect(std.meta.activeTag(v.*) == .map);
+    try testing.expectEqual(@as(usize, 2), v.map.entries.len);
+    try testing.expect(std.meta.activeTag(v.map.entries[0].key.*) == .int_literal);
+    try testing.expect(std.meta.activeTag(v.map.entries[0].value.*) == .string_literal);
+}
+
+test "parses enum members with values" {
+    const src =
+        \\enum Status {
+        \\    OK = 200
+        \\    NOT_FOUND = 404
+        \\}
+    ;
+    var tree = try parse(testing.allocator, src);
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const e = tree.module.decls[0].enum_decl;
+    try testing.expectEqual(@as(usize, 2), e.members.len);
+    try testing.expectEqualStrings("OK", e.members[0].name);
+    try testing.expect(e.members[0].value != null);
+    try testing.expect(std.meta.activeTag(e.members[0].value.?.*) == .int_literal);
+    try testing.expect(e.members[1].value != null);
+}
+
+test "enum members without values still parse" {
+    var tree = try parse(testing.allocator, "enum E {\n    A\n    B\n}");
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const e = tree.module.decls[0].enum_decl;
+    try testing.expectEqual(@as(usize, 2), e.members.len);
+    try testing.expect(e.members[0].value == null);
+}
+
+test "index and call chain in a for body" {
+    const src =
+        \\pub func run():
+        \\    for i in items {
+        \\        handlers[i].fire()
+        \\    }
+    ;
+    var tree = try parse(testing.allocator, src);
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const body = tree.module.decls[0].func.body;
+    try testing.expectEqual(@as(usize, 1), body.len);
+    const stmt = body[0].for_stmt.body[0];
+    // handlers[i].fire()  ->  call( member( index(handlers, i), fire ) )
+    try testing.expect(std.meta.activeTag(stmt.expr_stmt.*) == .call);
+    const callee = stmt.expr_stmt.call.callee;
+    try testing.expect(std.meta.activeTag(callee.*) == .member);
+    try testing.expect(std.meta.activeTag(callee.member.object.*) == .index);
+}
+
+test "enum members may be comma-separated on one line" {
+    var tree = try parse(testing.allocator, "enum Http { OK = 200, NOT_FOUND = 404 }");
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const e = tree.module.decls[0].enum_decl;
+    try testing.expectEqual(@as(usize, 2), e.members.len);
+    try testing.expectEqualStrings("OK", e.members[0].name);
+    try testing.expectEqualStrings("NOT_FOUND", e.members[1].name);
+    try testing.expect(e.members[1].value != null);
 }

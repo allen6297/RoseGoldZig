@@ -45,7 +45,9 @@ pub const TokenKind = enum {
     kw_static,
     kw_true,
     kw_false,
-    //kw_and,
+    kw_and,
+    kw_or,
+    kw_not,
     //kw_signal,
 
     // punctuation
@@ -108,8 +110,10 @@ const keywords = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "static", .kw_static },
     .{ "true", .kw_true },
     .{ "false", .kw_false },
+    .{ "and", .kw_and },
+    .{ "or", .kw_or },
+    .{ "not", .kw_not },
     // .{ "signal", .kw_signal },
-    // .{ "and", .kw_and },
 });
 
 /// Byte offsets plus line/col, threaded through every token so the parser and
@@ -973,6 +977,22 @@ test "double hash is a valid line comment" {
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.len);
     const expected = [_]TokenKind{
         .identifier, .assign, .int_literal, .newline, .eof,
+    };
+    try std.testing.expectEqual(expected.len, result.tokens.items.len);
+    for (expected, result.tokens.items) |kind, tok| {
+        try std.testing.expectEqual(kind, tok.kind);
+    }
+}
+
+test "logical keywords lex as keywords" {
+    const gpa = std.testing.allocator;
+    var result = try tokenize(gpa, "a and b or not c\n");
+    defer result.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.len);
+    const expected = [_]TokenKind{
+        .identifier, .kw_and, .identifier, .kw_or,
+        .kw_not,     .identifier, .newline, .eof,
     };
     try std.testing.expectEqual(expected.len, result.tokens.items.len);
     for (expected, result.tokens.items) |kind, tok| {
