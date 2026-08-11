@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Lexer = @import("fontend/lexer.zig");
+const Parser = @import("fontend/parser.zig");
 
 const RoseGold_Zig = @import("RoseGold_Zig");
 
@@ -30,8 +31,62 @@ pub fn main(init: std.process.Init) !void {
 
     try RoseGold_Zig.printAnotherMessage(stdout_writer);
 
+    try parserDemo(arena, stdout_writer);
+
     try stdout_writer.flush(); // Don't forget to flush!
 }
+
+/// A small program exercising the whole front end: it lexes and parses
+/// `demo_source`, then prints a summary of the top-level declarations and any
+/// diagnostics.
+fn parserDemo(gpa: std.mem.Allocator, out: *Io.Writer) !void {
+    var tree = try Parser.parse(gpa, demo_source);
+    defer tree.deinit();
+
+    try out.print("\n== parser demo ==\n", .{});
+    try out.print("module: {d} declaration(s)\n", .{tree.module.decls.len});
+    for (tree.module.decls) |decl| {
+        const kind = @tagName(std.meta.activeTag(decl));
+        switch (decl) {
+            .import => |x| try out.print("  {s:<10} {s}\n", .{ kind, x.name }),
+            .var_decl => |x| try out.print("  {s:<10} {s}\n", .{ kind, x.name }),
+            .func => |x| try out.print("  {s:<10} {s} ({d} param(s))\n", .{ kind, x.name, x.params.len }),
+            .class => |x| try out.print("  {s:<10} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
+            .enum_decl => |x| try out.print("  {s:<10} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
+        }
+    }
+
+    try out.print("diagnostics: {d}\n", .{tree.diagnostics.len});
+    for (tree.diagnostics) |diag| {
+        try out.print("  {d}:{d} {s}\n", .{ diag.line, diag.col, diag.message });
+    }
+}
+
+const demo_source =
+    \\import graphics
+    \\
+    \\const VERSION: str = "0.1"
+    \\
+    \\enum Status {
+    \\    OK
+    \\    NOT_FOUND
+    \\}
+    \\
+    \\pub func describe(code: int) -> str:
+    \\    return match code {
+    \\        200: "ok"
+    \\        _: "unknown"
+    \\    }
+    \\
+    \\pub class Player extends Entity uses Damageable:
+    \\    var health: int = 100
+    \\
+    \\    pub func take_damage(amount: int) -> bool:
+    \\        if health <= 0:
+    \\            return true
+    \\        else:
+    \\            return false
+;
 
 test "simple test" {
     const gpa = std.testing.allocator;
