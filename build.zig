@@ -135,12 +135,26 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // Frontend unit tests. The lexer and parser live in their own files under
+    // src/fontend and are not reachable from the executable's tests, so they get
+    // a dedicated test target. Rooting it at parser.zig also covers lexer.zig,
+    // since the parser imports it.
+    const frontend_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fontend/parser.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_frontend_tests = b.addRunArtifact(frontend_tests);
+
     // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
+    // times and since the run steps do not depend on one another, this will
+    // make them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_frontend_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
