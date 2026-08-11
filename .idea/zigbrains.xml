@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="BuildScanner">
+    <option name="projects">
+      <list><![CDATA[{
+  "name": "RoseGold_Zig",
+  "version": "0.0.0",
+  "path": "/Users/kalob/Documents/CODE/RoseGold_Zig",
+  "steps": [
+    {
+      "name": "install",
+      "description": "Copy build artifacts to prefix path",
+      "kind": "install_artifact"
+    },
+    {
+      "name": "uninstall",
+      "description": "Remove build artifacts from prefix path",
+      "kind": "uninstall"
+    },
+    {
+      "name": "run",
+      "description": "Run the app",
+      "kind": "run"
+    },
+    {
+      "name": "test",
+      "description": "Run tests",
+      "kind": "run"
+    }
+  ],
+  "modules": [
+    {
+      "root": "src/root.zig",
+      "public": true,
+      "imports": []
+    },
+    {
+      "root": "src/main.zig",
+      "public": false,
+      "imports": [
+        {
+          "name": "RoseGold_Zig",
+          "owner": 0,
+          "module": 0
+        }
+      ]
+    }
+  ],
+  "dependencies": []
+}]]></list>
+    </option>
+  </component>
+  <component name="ZigToolchain" toolchain="fd049fca-331f-41c3-80f9-76da8f47a82d" />
+</project>
