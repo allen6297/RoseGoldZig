@@ -8,6 +8,7 @@
 //!   * unknown types in annotations
 //!   * type compatibility: variable initializers, `return` values, operator
 //!     operands, `if`/`while` conditions, assignments, and call arguments/arity
+//!   * enum-case access (`Status.OK`) and `match` exhaustiveness
 //!
 //! Types are inferred bottom-up for every expression. `unknown` (unresolved)
 //! and `any` are compatible with everything, so an earlier error never
@@ -723,8 +724,26 @@ const Analyzer = struct {
     }
 
     fn typeMatch(self: *Analyzer, m: Expr.Match) Error!Type {
-        _ = try self.typeOf(m.subject.*);
+        const subject = try self.typeOf(m.subject.*);
+
+        // A `_` or binding pattern matches everything; otherwise the only way to
+        // be exhaustive is a bool subject with both `true` and `false` covered.
+        var has_catch_all = false;
+        var covers_true = false;
+        var covers_false = false;
+
         for (m.arms) |arm| {
+            if (has_catch_all) {
+                try self.report(arm.span, "unreachable match arm; an earlier '_' or binding already matches everything", .{});
+            }
+            switch (arm.pattern) {
+                .wildcard, .binding => has_catch_all = true,
+                .bool_literal => |b| {
+                    if (b.value) covers_true = true else covers_false = true;
+                },
+                else => {},
+            }
+
             const child = try self.newScope(self.current);
             switch (arm.pattern) {
                 .binding => |b| try self.declareIn(child, b.name, .binding, .unknown, b.span),
@@ -734,6 +753,11 @@ const Analyzer = struct {
             self.current = child;
             defer self.current = saved;
             _ = try self.typeOf(arm.body.*);
+        }
+
+        const bool_exhaustive = tagOf(subject) == .bool and covers_true and covers_false;
+        if (!has_catch_all and !bool_exhaustive) {
+            try self.report(m.span, "match is not exhaustive; add a '_' case", .{});
         }
         return .unknown; // arm types are not unified yet
     }
@@ -909,6 +933,70 @@ test "enum cases of an enum type compare cleanly" {
     var analysis = try analyzeSource(testing.allocator, src);
     defer analysis.deinit();
     try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a match without a catch-all is not exhaustive" {
+    const src =
+        \\func f(x: int) -> str:
+        \\    return match x {
+        \\        1: "one"
+        \\        2: "two"
+        \\    }
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "not exhaustive");
+}
+
+test "a wildcard makes a match exhaustive" {
+    const src =
+        \\func f(x: int) -> str:
+        \\    return match x {
+        \\        1: "one"
+        \\        _: "other"
+        \\    }
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a bool match covering both values is exhaustive" {
+    const src =
+        \\func f(b: bool) -> str:
+        \\    return match b {
+        \\        true: "yes"
+        \\        false: "no"
+        \\    }
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a bool match missing a value is not exhaustive" {
+    const src =
+        \\func f(b: bool) -> str:
+        \\    return match b {
+        \\        true: "yes"
+        \\    }
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "not exhaustive");
+}
+
+test "an arm after a catch-all is unreachable" {
+    const src =
+        \\func f(x: int) -> str:
+        \\    return match x {
+        \\        _: "any"
+        \\        5: "five"
+        \\    }
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "unreachable");
 }
 
 test "a declared struct is a valid type and its methods see fields" {
