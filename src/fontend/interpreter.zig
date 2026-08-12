@@ -8,9 +8,13 @@
 //! and `range` builtins. `for` iterates a list's elements, a string's
 //! characters, or a map's keys.
 //!
-//! Execution starts by binding the module's globals (functions and evaluated
-//! `const`/`var`), then calling `main()` if it exists. Program output is
-//! collected into a buffer rather than written directly, so it is easy to test.
+//! Execution binds each module's globals (functions and evaluated `const`/`var`)
+//! into its own environment, then calls the entry module's `main()`. A program
+//! is one or more modules in dependency order (`runProgram`); `run` is the
+//! single-module case. An imported module is a value whose members are its
+//! globals, and a function/method carries the globals of the module that defined
+//! it, so it always resolves names in its own module. Program output is collected
+//! into a buffer rather than written directly, so it is easy to test.
 //!
 //! Classes and structs execute: `Name(...)` constructs an instance (fields take
 //! their declared defaults; a method named `init` runs as the constructor),
@@ -62,6 +66,9 @@ const FieldDef = struct { name: []const u8, value: ?*const Expr };
 /// inherited field list.
 const TypeInfo = struct {
     name: []const u8,
+    /// The globals of the module that defines this type, so its methods and
+    /// field defaults resolve names in their own module (not the caller's).
+    module: *Env = undefined,
     own_fields: []const FieldDef,
     methods: std.StringHashMapUnmanaged(*const Decl.Func) = .{},
     super_names: []const []const u8 = &.{},
@@ -81,6 +88,10 @@ const Instance = struct {
 /// A method paired with the instance it was accessed on.
 const BoundMethod = struct { receiver: *Instance, func: *const Decl.Func };
 
+/// A function value: the declaration plus the globals of the module that
+/// defined it, so calling it resolves names in its home module.
+const FuncValue = struct { decl: *const Decl.Func, module: *Env };
+
 /// An enum type: its name and the set of member names it declares.
 const EnumType = struct {
     name: []const u8,
@@ -98,13 +109,15 @@ pub const Value = union(enum) {
     str: []const u8,
     list: *List,
     map: *Map,
-    func: *const Decl.Func,
+    func: *const FuncValue,
     builtin: Builtin,
     instance: *Instance,
     bound_method: *BoundMethod,
     type_ref: *const TypeInfo,
     enum_type: *const EnumType,
     enum_value: *const EnumValue,
+    /// An imported module, reached by its bound name; members are its globals.
+    module: *Env,
 };
 
 fn isTruthy(v: Value) bool {
@@ -152,6 +165,7 @@ fn valuesEqual(a: Value, b: Value) bool {
         .enum_value => |x| b == .enum_value and
             std.mem.eql(u8, x.type_name, b.enum_value.type_name) and
             std.mem.eql(u8, x.member, b.enum_value.member),
+        .module => |x| b == .module and x == b.module,
     };
 }
 
@@ -180,24 +194,40 @@ pub const RunResult = struct {
     }
 };
 
+/// One import edge for `runProgram`: the bound name and the index (into the
+/// `modules` slice) of the module it refers to.
+pub const ModuleImport = struct { name: []const u8, module_index: usize };
+
+/// A module plus its resolved imports, as consumed by `runProgram`.
+pub const ProgramModule = struct { module: Module, imports: []const ModuleImport };
+
 pub fn run(gpa: std.mem.Allocator, module: Module) Error!RunResult {
+    const one = [_]ProgramModule{.{ .module = module, .imports = &.{} }};
+    return runProgram(gpa, &one);
+}
+
+/// Execute a program of one or more modules given in dependency order (each
+/// module's imports refer to earlier entries; the last entry is the root whose
+/// `main()` runs). Every module gets its own globals; a module value exposes
+/// those globals, and functions/methods resolve names in their home module.
+pub fn runProgram(gpa: std.mem.Allocator, modules: []const ProgramModule) Error!RunResult {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const alloc = arena.allocator();
 
-    const globals = try alloc.create(Env);
-    globals.* = .{ .parent = null };
+    const placeholder = try alloc.create(Env);
+    placeholder.* = .{ .parent = null };
 
     var output: std.ArrayList(u8) = .empty;
 
     var interp = Interpreter{
         .arena = alloc,
-        .globals = globals,
-        .env = globals,
+        .globals = placeholder,
+        .env = placeholder,
         .output = &output,
     };
 
-    interp.execute(module) catch |e| switch (e) {
+    interp.runModules(modules) catch |e| switch (e) {
         error.Runtime => {
             return .{
                 .arena = arena,
@@ -317,6 +347,7 @@ const Interpreter = struct {
         const ti = try self.arena.create(TypeInfo);
         ti.* = .{
             .name = name,
+            .module = self.globals,
             .own_fields = own_fields,
             .methods = methods,
             .super_names = try supers.toOwnedSlice(self.arena),
@@ -387,10 +418,13 @@ const Interpreter = struct {
         inst.* = .{ .info = ti };
 
         // Evaluate field defaults with the fresh instance as the receiver, so a
-        // later field may reference an earlier one.
+        // later field may reference an earlier one. Defaults resolve names in the
+        // type's own module.
         const saved_env = self.env;
         const saved_recv = self.current_receiver;
-        self.env = self.globals;
+        const saved_globals = self.globals;
+        self.globals = ti.module;
+        self.env = ti.module;
         self.current_receiver = inst;
         for (ti.all_fields) |f| {
             const v = if (f.value) |val| try self.eval(val.*) else Value.nil;
@@ -398,6 +432,7 @@ const Interpreter = struct {
         }
         self.env = saved_env;
         self.current_receiver = saved_recv;
+        self.globals = saved_globals;
 
         // A method named `init` (inherited or own) acts as the constructor.
         if (self.findMethod(ti, "init")) |init_fn| {
@@ -410,8 +445,42 @@ const Interpreter = struct {
 
     // --- top level -----------------------------------------------------------
 
-    fn execute(self: *Interpreter, module: Module) Error!void {
+    /// Load every module into its own globals (dependencies first), then run the
+    /// root module's `main()`.
+    fn runModules(self: *Interpreter, modules: []const ProgramModule) Error!void {
+        if (modules.len == 0) return;
+        const envs = try self.arena.alloc(*Env, modules.len);
+        for (modules, 0..) |pm, i| {
+            const genv = try self.arena.create(Env);
+            genv.* = .{ .parent = null };
+            self.globals = genv;
+            self.env = genv;
+            self.current_receiver = null;
+            self.types = .{}; // each module has its own type table
+            try self.loadModule(pm, envs);
+            envs[i] = genv;
+        }
+
+        // Run the root module's main() in its own globals.
+        const entry = envs[modules.len - 1];
+        self.globals = entry;
+        self.env = entry;
+        if (entry.vars.get("main")) |m| {
+            if (m == .func) _ = try self.callFunction(m.func, &.{}, zero_span);
+        }
+    }
+
+    /// Bind everything a module declares into the current globals (`self.globals`,
+    /// set up by the caller): builtins, imported modules, types, functions, and
+    /// evaluated top-level `const`/`var`. Does not run `main`.
+    fn loadModule(self: *Interpreter, pm: ProgramModule, envs: []const *Env) Error!void {
+        const module = pm.module;
         try self.registerBuiltins();
+
+        // Bind each imported module to its (already-loaded) globals.
+        for (pm.imports) |imp| {
+            try self.define(self.globals, imp.name, .{ .module = envs[imp.module_index] });
+        }
 
         // Bind class/struct/enum names so `Name(...)` and `Enum.CASE` resolve.
         for (module.decls) |decl| switch (decl) {
@@ -429,7 +498,11 @@ const Interpreter = struct {
         };
         // Bind functions so globals and `main` can call any of them.
         for (module.decls, 0..) |decl, i| switch (decl) {
-            .func => try self.define(self.globals, decl.func.name, .{ .func = &module.decls[i].func }),
+            .func => {
+                const fv = try self.arena.create(FuncValue);
+                fv.* = .{ .decl = &module.decls[i].func, .module = self.globals };
+                try self.define(self.globals, decl.func.name, .{ .func = fv });
+            },
             else => {},
         };
         // Evaluate top-level const/var.
@@ -440,10 +513,6 @@ const Interpreter = struct {
             },
             else => {},
         };
-        // Run main() if present.
-        if (self.globals.vars.get("main")) |m| {
-            if (m == .func) _ = try self.callFunction(m.func, &.{}, zero_span);
-        }
     }
 
     fn registerBuiltins(self: *Interpreter) Error!void {
@@ -600,10 +669,15 @@ const Interpreter = struct {
 
     // --- calls ---------------------------------------------------------------
 
-    fn callFunction(self: *Interpreter, func: *const Decl.Func, args: []const Value, span: Span) Error!Value {
+    fn callFunction(self: *Interpreter, fv: *const FuncValue, args: []const Value, span: Span) Error!Value {
+        const func = fv.decl;
         if (args.len != func.params.len) {
             return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
         }
+        // Run in the function's home module, so its body sees that module's
+        // globals rather than the caller's.
+        const saved_globals = self.globals;
+        self.globals = fv.module;
         const call_env = try self.newEnv(self.globals);
         for (func.params, args) |p, arg| try self.define(call_env, p.name, arg);
 
@@ -614,6 +688,7 @@ const Interpreter = struct {
         defer {
             self.env = saved_env;
             self.ret_value = saved_ret;
+            self.globals = saved_globals;
         }
         const flow = try self.execBlock(func.body);
         return if (flow == .returned) self.ret_value else Value.nil;
@@ -623,6 +698,9 @@ const Interpreter = struct {
         if (args.len != func.params.len) {
             return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
         }
+        // The method runs in its defining type's module.
+        const saved_globals = self.globals;
+        self.globals = receiver.info.module;
         const call_env = try self.newEnv(self.globals);
         for (func.params, args) |p, arg| try self.define(call_env, p.name, arg);
 
@@ -636,6 +714,7 @@ const Interpreter = struct {
             self.env = saved_env;
             self.ret_value = saved_ret;
             self.current_receiver = saved_recv;
+            self.globals = saved_globals;
         }
         const flow = try self.execBlock(func.body);
         return if (flow == .returned) self.ret_value else Value.nil;
@@ -871,6 +950,10 @@ const Interpreter = struct {
                 ev.* = .{ .type_name = et.name, .member = m.name };
                 return .{ .enum_value = ev };
             },
+            .module => |menv| {
+                if (menv.vars.get(m.name)) |v| return v;
+                return self.fail(m.span, "module has no member '{s}'", .{m.name});
+            },
             else => return self.fail(m.span, "cannot access a member of {s}", .{@tagName(obj)}),
         }
     }
@@ -1004,6 +1087,7 @@ const Interpreter = struct {
                 try buf.append(self.arena, '}');
             },
             .func, .builtin, .bound_method => try buf.appendSlice(self.arena, "<function>"),
+            .module => try buf.appendSlice(self.arena, "<module>"),
             .type_ref => |ti| {
                 try buf.appendSlice(self.arena, "<type ");
                 try buf.appendSlice(self.arena, ti.name);
@@ -1576,4 +1660,72 @@ test "instances print inherited fields base-first" {
         \\    print(Sub())
     ;
     try expectOutput(src, "Sub { a: 1, b: 2 }\n");
+}
+
+// --- modules -----------------------------------------------------------------
+
+/// Run a two-module program: `dep_src` bound as `dep_name`, imported by
+/// `entry_src` whose `main()` runs.
+fn expectProgramOutput(dep_name: []const u8, dep_src: []const u8, entry_src: []const u8, expected: []const u8) !void {
+    const gpa = testing.allocator;
+    var dep_tree = try parser.parse(gpa, dep_src);
+    defer dep_tree.deinit();
+    var entry_tree = try parser.parse(gpa, entry_src);
+    defer entry_tree.deinit();
+
+    const imports = [_]ModuleImport{.{ .name = dep_name, .module_index = 0 }};
+    const modules = [_]ProgramModule{
+        .{ .module = dep_tree.module, .imports = &.{} },
+        .{ .module = entry_tree.module, .imports = &imports },
+    };
+    var result = try runProgram(gpa, &modules);
+    defer result.deinit();
+    try testing.expect(result.runtime_error == null);
+    try testing.expectEqualStrings(expected, result.output);
+}
+
+test "an imported function closes over its own module's globals" {
+    // `bump` references `BASE`, a global of the imported module, not the caller's.
+    try expectProgramOutput(
+        "mathutil",
+        "const BASE: int = 10\n\npub func bump(n: int) -> int:\n    return n + BASE",
+        "import mathutil\n\nfunc main():\n    print(mathutil.bump(5))",
+        "15\n",
+    );
+}
+
+test "an exported function may call a module-private sibling" {
+    try expectProgramOutput(
+        "util",
+        "func helper(n: int) -> int:\n    return n * 2\n\npub func doubleUp(n: int) -> int:\n    return helper(n) + helper(n)",
+        "import util\n\nfunc main():\n    print(util.doubleUp(3))",
+        "12\n",
+    );
+}
+
+test "an imported type constructs and its methods run in its module" {
+    try expectProgramOutput(
+        "shapes",
+        "pub struct Point:\n    var x: int = 0\n    var y: int = 0\n\n    func sum() -> int:\n        return x + y",
+        "import shapes\n\nfunc main():\n    var p = shapes.Point()\n    p.x = 3\n    p.y = 4\n    print(p.sum())",
+        "7\n",
+    );
+}
+
+test "reaching an undefined module member is a runtime error" {
+    const gpa = testing.allocator;
+    var dep_tree = try parser.parse(gpa, "pub func real() -> int:\n    return 1");
+    defer dep_tree.deinit();
+    var entry_tree = try parser.parse(gpa, "import util\n\nfunc main():\n    print(util.nope())");
+    defer entry_tree.deinit();
+
+    const imports = [_]ModuleImport{.{ .name = "util", .module_index = 0 }};
+    const modules = [_]ProgramModule{
+        .{ .module = dep_tree.module, .imports = &.{} },
+        .{ .module = entry_tree.module, .imports = &imports },
+    };
+    var result = try runProgram(gpa, &modules);
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "module has no member 'nope'") != null);
 }

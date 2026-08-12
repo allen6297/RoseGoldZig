@@ -87,6 +87,8 @@ const Type = union(enum) {
     nil,
     /// An optional type `?T`.
     optional: *const Optional,
+    /// An imported module; its exported members are looked up by `.`.
+    module: *const ModuleExports,
 };
 
 fn tagOf(t: Type) std.meta.Tag(Type) {
@@ -134,6 +136,7 @@ fn typeName(t: Type) []const u8 {
         .enum_ref => |n| n,
         .nil => "nil",
         .optional => |o| o.name,
+        .module => "module",
     };
 }
 
@@ -268,6 +271,19 @@ const Scope = struct {
     symbols: std.StringHashMapUnmanaged(Symbol) = .{},
 };
 
+/// A module's public surface: the `pub` top-level symbols other modules may
+/// reach with `.`. Lives in the exporting module's analysis arena.
+pub const ModuleExports = struct {
+    symbols: std.StringHashMapUnmanaged(Symbol) = .{},
+};
+
+/// One import made available to `analyzeModule`: the bound name and the exports
+/// of the module it refers to (already analyzed).
+pub const ModuleImport = struct { name: []const u8, exports: *const ModuleExports };
+
+/// Stand-in exports for an import that did not resolve, so analysis can proceed.
+const empty_exports: ModuleExports = .{};
+
 const NameSet = std.StringHashMapUnmanaged(void);
 
 // --- result ------------------------------------------------------------------
@@ -275,6 +291,8 @@ const NameSet = std.StringHashMapUnmanaged(void);
 pub const Analysis = struct {
     arena: std.heap.ArenaAllocator,
     diagnostics: []const Diagnostic,
+    /// This module's `pub` surface, for modules that import it.
+    exports: *const ModuleExports,
 
     pub fn deinit(self: *Analysis) void {
         self.arena.deinit();
@@ -282,6 +300,12 @@ pub const Analysis = struct {
 };
 
 pub fn analyze(gpa: std.mem.Allocator, module: Module) Error!Analysis {
+    return analyzeModule(gpa, module, &.{});
+}
+
+/// Analyze a module that may import others. `imports` supplies the exports of
+/// each imported module (already analyzed, in dependency order).
+pub fn analyzeModule(gpa: std.mem.Allocator, module: Module, imports: []const ModuleImport) Error!Analysis {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const alloc = arena.allocator();
@@ -296,11 +320,13 @@ pub fn analyze(gpa: std.mem.Allocator, module: Module) Error!Analysis {
         .diagnostics = &diagnostics,
         .current = module_scope,
         .module_scope = module_scope,
+        .imports = imports,
     };
     try analyzer.run(module);
+    const exports = try analyzer.buildExports(module);
 
     const diags = try diagnostics.toOwnedSlice(alloc);
-    return .{ .arena = arena, .diagnostics = diags };
+    return .{ .arena = arena, .diagnostics = diags, .exports = exports };
 }
 
 // --- analyzer ----------------------------------------------------------------
@@ -310,6 +336,8 @@ const Analyzer = struct {
     diagnostics: *std.ArrayList(Diagnostic),
     current: *Scope,
     module_scope: *Scope,
+    /// Imports available to this module (name -> exports), from `analyzeModule`.
+    imports: []const ModuleImport = &.{},
     current_ret: ?Type = null,
     /// The class/struct whose body is currently being analyzed, so `private`
     /// members are reachable from inside their own type.
@@ -445,6 +473,7 @@ const Analyzer = struct {
             .named => |n| tagOf(to) == .named and self.isSubtype(n, to.named),
             .any, .unknown, .enum_ref => true,
             .nil, .optional => false, // needs an optional target / must be unwrapped
+            .module => tagOf(to) == .module, // modules aren't really values
         };
     }
 
@@ -562,11 +591,12 @@ const Analyzer = struct {
 
     fn registerTopLevel(self: *Analyzer, decl: Decl) Error!void {
         switch (decl) {
-            // Imports are inert: with no module system there is nothing to bind
-            // at runtime, so binding a name here would let `check` pass on a
-            // reference that fails at run time. The import still parses and is
-            // validated for shape.
-            .import => {},
+            // Bind the import's leaf name to a module value whose members are the
+            // imported module's exports (empty if it did not resolve).
+            .import => |im| {
+                const exports = self.importExports(im.name);
+                try self.declareIn(self.module_scope, im.name, .import, .{ .module = exports }, im.span);
+            },
             .var_decl => |x| {
                 const ty: Type = if (x.type) |ann| try self.annotationType(ann) else .unknown;
                 try self.declareIn(self.module_scope, x.name, if (x.is_const) .constant else .variable, ty, x.span);
@@ -577,6 +607,57 @@ const Analyzer = struct {
             .enum_decl => |x| try self.declareIn(self.module_scope, x.name, .enum_type, .{ .enum_ref = x.name }, x.span),
             .signal => |x| try self.declareIn(self.module_scope, x.name, .signal, .unknown, x.span),
         }
+    }
+
+    /// The exports of the module bound to `name`, or an empty set if the import
+    /// did not resolve (the loader already reported that).
+    fn importExports(self: *Analyzer, name: []const u8) *const ModuleExports {
+        for (self.imports) |imp| {
+            if (std.mem.eql(u8, imp.name, name)) return imp.exports;
+        }
+        return &empty_exports;
+    }
+
+    /// Collect this module's `pub` top-level symbols into its export surface.
+    fn buildExports(self: *Analyzer, module: Module) Error!*const ModuleExports {
+        const exp = try self.arena.create(ModuleExports);
+        exp.* = .{};
+        for (module.decls) |decl| {
+            var name: []const u8 = undefined;
+            var vis: Visibility = .default;
+            switch (decl) {
+                .import => continue,
+                .var_decl => |x| {
+                    name = x.name;
+                    vis = x.visibility;
+                },
+                .func => |x| {
+                    name = x.name;
+                    vis = x.visibility;
+                },
+                .class => |x| {
+                    name = x.name;
+                    vis = x.visibility;
+                },
+                .struct_decl => |x| {
+                    name = x.name;
+                    vis = x.visibility;
+                },
+                .enum_decl => |x| {
+                    name = x.name;
+                    vis = x.visibility;
+                },
+                .signal => |x| {
+                    name = x.name;
+                    vis = x.visibility;
+                },
+            }
+            if (vis != .public) continue;
+            if (self.module_scope.symbols.get(name)) |sym| {
+                try exp.symbols.put(self.arena, name, sym);
+            }
+        }
+        return exp;
     }
 
     fn analyzeDecl(self: *Analyzer, decl: Decl) Error!void {
@@ -760,6 +841,11 @@ const Analyzer = struct {
                 const scope = self.enum_types.get(enum_name) orelse return .unknown;
                 if (scope.symbols.contains(name)) return .{ .named = enum_name };
                 try self.report(span, "enum '{s}' has no case '{s}'", .{ enum_name, name });
+                return .unknown;
+            },
+            .module => |exports| {
+                if (exports.symbols.get(name)) |sym| return sym.ty;
+                try self.report(span, "module has no exported member '{s}'", .{name});
                 return .unknown;
             },
             else => return .unknown,
@@ -2108,17 +2194,59 @@ test "an untyped parameter accepts any value" {
     try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
 }
 
-test "an import is valid on its own but binds no usable name" {
-    // The import parses and validates cleanly...
+test "an import binds a module namespace" {
+    // The import parses and binds its leaf name cleanly.
     var only = try analyzeSource(testing.allocator, "import engine.graphics.render");
     defer only.deinit();
     try testing.expectEqual(@as(usize, 0), only.diagnostics.len);
 
-    // ...but it does not introduce a value, so referencing it is undefined
-    // (which matches the interpreter, keeping `check` sound).
-    var used = try analyzeSource(testing.allocator, "import graphics\n\nfunc draw():\n    graphics()");
+    // With no module actually supplied, the namespace has no exports, so reaching
+    // into it is reported rather than silently accepted.
+    var used = try analyzeSource(testing.allocator, "import graphics\n\nfunc draw():\n    graphics.line()");
     defer used.deinit();
-    try expectMessageContains(used, "undefined name 'graphics'");
+    try expectMessageContains(used, "module has no exported member 'line'");
+}
+
+test "a module sees an imported module's exported members" {
+    const gpa = testing.allocator;
+
+    // Dependency: `square` is exported (pub), `secret` is module-private.
+    var dep_tree = try parser.parse(gpa, "pub func square(n: int) -> int:\n    return n * n\n\nfunc secret() -> int:\n    return 42");
+    defer dep_tree.deinit();
+    var dep = try analyze(gpa, dep_tree.module);
+    defer dep.deinit();
+    try testing.expectEqual(@as(usize, 0), dep.diagnostics.len);
+
+    const imports = [_]ModuleImport{.{ .name = "mathutil", .exports = dep.exports }};
+
+    // A call to the exported function type-checks cleanly.
+    var ok_tree = try parser.parse(gpa, "import mathutil\n\nfunc main():\n    print(mathutil.square(3))");
+    defer ok_tree.deinit();
+    var ok = try analyzeModule(gpa, ok_tree.module, &imports);
+    defer ok.deinit();
+    try testing.expectEqual(@as(usize, 0), ok.diagnostics.len);
+
+    // A module-private name is not reachable from the outside.
+    var bad_tree = try parser.parse(gpa, "import mathutil\n\nfunc main():\n    print(mathutil.secret())");
+    defer bad_tree.deinit();
+    var bad = try analyzeModule(gpa, bad_tree.module, &imports);
+    defer bad.deinit();
+    try expectMessageContains(bad, "module has no exported member 'secret'");
+}
+
+test "a cross-module call checks argument types" {
+    const gpa = testing.allocator;
+    var dep_tree = try parser.parse(gpa, "pub func square(n: int) -> int:\n    return n * n");
+    defer dep_tree.deinit();
+    var dep = try analyze(gpa, dep_tree.module);
+    defer dep.deinit();
+    const imports = [_]ModuleImport{.{ .name = "m", .exports = dep.exports }};
+
+    var bad_tree = try parser.parse(gpa, "import m\n\nfunc main():\n    print(m.square(\"x\"))");
+    defer bad_tree.deinit();
+    var bad = try analyzeModule(gpa, bad_tree.module, &imports);
+    defer bad.deinit();
+    try expectMessageContains(bad, "cannot pass str where int is expected");
 }
 
 test "signal names are declared and their params checked" {

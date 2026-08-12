@@ -9,11 +9,9 @@
 
 const std = @import("std");
 const Io = std.Io;
-const Parser = @import("fontend/parser.zig");
+const Loader = @import("fontend/loader.zig");
 const Analyzer = @import("fontend/analyzer.zig");
 const Interpreter = @import("fontend/interpreter.zig");
-
-const Diagnostic = @import("fontend/lexer.zig").Diagnostic;
 
 const usage =
     \\Usage: rosegold [run|check] <file.rg>
@@ -73,22 +71,35 @@ fn handle(
     }
     const path = args[arg_index];
 
-    const src = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 << 20)) catch |e| {
-        try err.print("error: could not read '{s}': {s}\n", .{ path, @errorName(e) });
-        return 1;
-    };
-
-    // Parse (which also lexes). Lexer + parser diagnostics come out together.
-    const tree = try Parser.parse(arena, src);
-    if (tree.diagnostics.len > 0) {
-        try renderAll(err, path, src, tree.diagnostics);
+    // Load the entry file and everything it imports (lex + parse each), in
+    // dependency order. Missing files, cycles, and parse errors surface here.
+    const graph = try Loader.load(arena, io, path);
+    if (graph.diagnostics.len > 0) {
+        for (graph.diagnostics) |ld| {
+            try render(err, "error", ld.path, ld.src, ld.diag.message, ld.diag.line, ld.diag.col);
+        }
+        try err.print("{d} error(s)\n", .{graph.diagnostics.len});
         return 1;
     }
 
-    // Analyze: name resolution and type checking.
-    const analysis = try Analyzer.analyze(arena, tree.module);
-    if (analysis.diagnostics.len > 0) {
-        try renderAll(err, path, src, analysis.diagnostics);
+    // Analyze every module in dependency order, giving each module the exports
+    // of the modules it imports.
+    const exports = try arena.alloc(*const Analyzer.ModuleExports, graph.units.len);
+    var error_count: usize = 0;
+    for (graph.units, 0..) |unit, i| {
+        const imports = try arena.alloc(Analyzer.ModuleImport, unit.imports.len);
+        for (unit.imports, 0..) |imp, j| {
+            imports[j] = .{ .name = imp.name, .exports = exports[imp.module_index] };
+        }
+        const analysis = try Analyzer.analyzeModule(arena, unit.module, imports);
+        exports[i] = analysis.exports;
+        for (analysis.diagnostics) |d| {
+            try render(err, "error", unit.path, unit.src, d.message, d.line, d.col);
+        }
+        error_count += analysis.diagnostics.len;
+    }
+    if (error_count > 0) {
+        try err.print("{d} error(s)\n", .{error_count});
         return 1;
     }
 
@@ -97,24 +108,28 @@ fn handle(
         return 0;
     }
 
-    // Execute.
-    const result = try Interpreter.run(arena, tree.module);
+    // Execute: hand the whole module set to the interpreter in dependency order.
+    const modules = try arena.alloc(Interpreter.ProgramModule, graph.units.len);
+    for (graph.units, 0..) |unit, i| {
+        const imps = try arena.alloc(Interpreter.ModuleImport, unit.imports.len);
+        for (unit.imports, 0..) |imp, j| {
+            imps[j] = .{ .name = imp.name, .module_index = imp.module_index };
+        }
+        modules[i] = .{ .module = unit.module, .imports = imps };
+    }
+    const result = try Interpreter.runProgram(arena, modules);
     try out.writeAll(result.output);
     if (result.runtime_error) |re| {
-        try render(err, "runtime error", path, src, re.message, re.line, re.col);
+        // Runtime errors carry a line/col but not their module; attribute them to
+        // the entry file, which is correct for the common single-file case.
+        const entry = graph.units[graph.units.len - 1];
+        try render(err, "runtime error", entry.path, entry.src, re.message, re.line, re.col);
         return 1;
     }
     return 0;
 }
 
 // --- diagnostic rendering ----------------------------------------------------
-
-fn renderAll(w: *Io.Writer, path: []const u8, src: []const u8, diagnostics: []const Diagnostic) !void {
-    for (diagnostics) |d| {
-        try render(w, "error", path, src, d.message, d.line, d.col);
-    }
-    try w.print("{d} error(s)\n", .{diagnostics.len});
-}
 
 /// Render one diagnostic in the style:
 ///

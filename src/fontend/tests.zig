@@ -6,4 +6,5 @@ test {
     _ = @import("parser.zig");
     _ = @import("analyzer.zig");
     _ = @import("interpreter.zig");
+    _ = @import("loader.zig");
 }

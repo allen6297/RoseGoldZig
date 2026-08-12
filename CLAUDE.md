@@ -4,11 +4,15 @@ A small statically-typed, indentation-based language, implemented in **Zig 0.16.
 The toolchain is a complete front end plus a tree-walking interpreter:
 
 ```
-source (.rg) → lexer → parser (AST) → analyzer (name res + types) → interpreter
+entry .rg → loader (parse it + its imports) → analyzer (per module) → interpreter
+             └ lexer → parser (AST) per file ┘
 ```
 
-Programs are driven through a CLI that reads a `.rg` file and runs the whole
-pipeline. See `examples/demo.rg` for a representative program.
+The **loader** turns an entry file into a dependency-ordered set of modules
+(each lexed + parsed); the analyzer and interpreter then process that whole set.
+A single file with no imports is just a one-module set, so the pipeline is
+uniform. See `examples/demo.rg` (single file) and `examples/app.rg` (imports
+`mathutil` and `geometry`) for representative programs.
 
 ## Commands
 
@@ -16,7 +20,7 @@ pipeline. See `examples/demo.rg` for a representative program.
 zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
-zig build test                  # run every test (123 as of writing)
+zig build test                  # run every test (184 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -37,15 +41,17 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/main.zig` | CLI driver: arg parsing, file read, pipeline, diagnostic rendering. Plus scaffold tests. |
 | `src/fontend/lexer.zig` | Lexer. Indentation → INDENT/DEDENT/NEWLINE layout tokens; comments; diagnostics. |
 | `src/fontend/parser.zig` | Recursive-descent parser → AST (all `pub`). Owns the AST node types. |
+| `src/fontend/loader.zig` | Module loader: reads + parses the entry file and its transitive imports into a dependency-ordered `Graph`; path resolution, dedup, cycle detection. |
 | `src/fontend/analyzer.zig` | Combined name resolution + type checking over the AST. |
 | `src/fontend/interpreter.zig` | Tree-walking evaluator. |
 | `src/fontend/tests.zig` | Test aggregator; the `zig build test` frontend target roots here. |
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
 | `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. |
-| `examples/demo.rg` | Sample program. |
+| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules). |
 
-Each layer imports the ones below it (`interpreter`/`analyzer` → `parser` → `lexer`);
-there are no upward dependencies.
+Each layer imports the ones below it (`interpreter`/`analyzer` → `parser` → `lexer`,
+and `loader` → `parser`); there are no upward dependencies. `main.zig` drives the
+loader, then the analyzer and interpreter over the loaded module set.
 
 ## Conventions & patterns
 
@@ -53,11 +59,14 @@ there are no upward dependencies.
   (messages are `allocPrint`ed into the owning arena), so a result can outlive the tree
   it came from. Spans (`lexer.Span { start, end, line, col }`) are threaded through every
   token and AST node.
-- **Arena ownership.** `parser.parse` → `Tree`, `analyzer.analyze` → `Analysis`,
-  `interpreter.run` → `RunResult` each own a `std.heap.ArenaAllocator` and expose
-  `deinit`. Build the result slice *before* the return literal so the moved arena
-  includes it. The interpreter/analyzer **borrow** the parse tree (function values and
-  member scopes point into it), so keep the `Tree` alive for the duration.
+- **Arena ownership.** `parser.parse` → `Tree`, `loader.load` → `Graph`,
+  `analyzer.analyze`/`analyzeModule` → `Analysis`, `interpreter.run`/`runProgram` →
+  `RunResult` each own a `std.heap.ArenaAllocator` and expose `deinit`. Build the
+  result slice *before* the return literal so the moved arena includes it. The
+  interpreter/analyzer **borrow** the parse tree (function values and member scopes
+  point into it), so keep the `Tree`/`Graph` alive for the duration. `Graph` owns the
+  parsed trees; a dependent module's `Analysis.exports` point into the *dependency's*
+  analysis arena, so keep every module's analysis alive while later ones use it.
 - **Two-phase registration.** Module- and class-level declarations are registered
   (names, signatures, member tables) *before* any body is analyzed/executed, so
   declarations may reference each other regardless of order.
@@ -77,8 +86,8 @@ there are no upward dependencies.
 
 ## Language reference (what's implemented)
 
-- **Declarations:** `import a.b.c` (dotted; parses and validates but is **inert** —
-  binds no name, since there is no module system yet), `const`/`var`
+- **Declarations:** `import a.b.c` (dotted; loads `a/b/c.rg` and binds the leaf name
+  `c` as a module namespace — see **Modules** below), `const`/`var`
   (optional `: type`), `func name(p: T, q) -> R:` (params may be untyped → `any`),
   `class` (with `extends` / `uses`), `struct` (no inheritance), `enum { A, B = 2 }`,
   `signal name(params)`. `pub`/`private`/`static` modifiers parse.
@@ -111,10 +120,30 @@ there are no upward dependencies.
   the analyzer): `print`, `echo`, `len`, `range`, `str`, `int`, `float`, `push`, `pop`,
   `keys`, `values`, `has`.
 
+### Modules
+- **A module is a `.rg` file.** `import a.b` loads `a/b.rg` **relative to the importing
+  file's directory** and binds the leaf name (`b`) as a namespace value. Reach its
+  exports with `b.name`.
+- **`pub` is the export boundary.** Only `pub` top-level declarations are visible to
+  importers; anything else is module-private (so top-level visibility is now enforced —
+  cross-module, by what a module exports). Class/struct *member* visibility is unchanged.
+- **The loader** (`loader.zig`) reads the entry file and everything it transitively
+  imports, normalizes paths lexically (so a file reached two ways loads once), detects
+  **circular imports**, and returns the modules in **dependency order**. `main.zig` then
+  analyzes each in that order (handing every module the exports of the ones it imports)
+  and runs them (dependencies first; the entry's `main()` last).
+- **Closures over the home module.** A function/method value carries the globals of the
+  module that defined it (`FuncValue.module`, `TypeInfo.module`), so when it's called
+  from another module its body still resolves names in *its own* module — it can use its
+  module's private helpers and consts. The analyzer mirrors this: an imported name has a
+  `module` type whose members are that module's exports.
+- **Limits (v1):** imports resolve relative to the importer's dir (no search path); type
+  *annotations* can't be module-qualified (`var x: mod.T` won't parse), so an imported
+  type is only used through the values a module's functions return; cross-module
+  inheritance isn't supported; a runtime error is attributed to the entry file.
+
 ### Known gaps / future work
-- **Top-level** `pub`/`private` isn't enforced (needs a module system); only
-  class/struct *member* visibility is checked. `static` still parses unused.
 - No **static** class members at runtime (only enum cases via `Enum.CASE`).
 - `list`/`map` are **untyped** (no element types tracked or checked).
-- `match` patterns can't match **enum cases** (`Status.OK` as a pattern) yet.
-- Small builtin set; no user-facing stdlib.
+- Module resolution has no **search path / package roots** and no cross-module type
+  annotations (see **Modules → Limits**). `static` still parses unused.
