@@ -1,172 +1,175 @@
+//! RoseGold CLI. Reads a `.rg` file and runs the full front end
+//! (lex -> parse -> analyze -> interpret), reporting diagnostics with source
+//! context. Usage:
+//!
+//!   rosegold [run|check] <file.rg>
+//!
+//!   run     parse, analyze, and execute (the default)
+//!   check   parse and analyze only, then report any problems
+
 const std = @import("std");
 const Io = std.Io;
-const Lexer = @import("fontend/lexer.zig");
 const Parser = @import("fontend/parser.zig");
 const Analyzer = @import("fontend/analyzer.zig");
 const Interpreter = @import("fontend/interpreter.zig");
 
-const RoseGold_Zig = @import("RoseGold_Zig");
+const Diagnostic = @import("fontend/lexer.zig").Diagnostic;
+
+const usage =
+    \\Usage: rosegold [run|check] <file.rg>
+    \\
+    \\  run     parse, analyze, and execute the program (the default)
+    \\  check   parse and analyze only, then report any problems
+    \\
+;
+
+const Mode = enum { run, check };
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    //std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
-
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
-    }
-
-    // In order to do I/O operations need an `Io` instance.
+    const arena = init.arena.allocator();
     const io = init.io;
+    const args = try init.minimal.args.toSlice(arena);
 
-    try Lexer.main();
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    var out_buf: [4096]u8 = undefined;
+    var out_fw: Io.File.Writer = .init(.stdout(), io, &out_buf);
+    const out = &out_fw.interface;
 
-    try RoseGold_Zig.printAnotherMessage(stdout_writer);
+    var err_buf: [4096]u8 = undefined;
+    var err_fw: Io.File.Writer = .init(.stderr(), io, &err_buf);
+    const err = &err_fw.interface;
 
-    try parserDemo(arena, stdout_writer);
-    try analyzerDemo(arena, stdout_writer);
-    try interpreterDemo(arena, stdout_writer);
+    const code: u8 = handle(arena, io, out, err, args) catch |e| blk: {
+        err.print("error: {s}\n", .{@errorName(e)}) catch {};
+        break :blk 1;
+    };
 
-    try stdout_writer.flush(); // Don't forget to flush!
+    out.flush() catch {};
+    err.flush() catch {};
+    if (code != 0) std.process.exit(code);
 }
 
-/// Executes a small program and prints whatever it produces.
-fn interpreterDemo(gpa: std.mem.Allocator, out: *Io.Writer) !void {
-    var tree = try Parser.parse(gpa, interpreter_demo_source);
-    defer tree.deinit();
-    var result = try Interpreter.run(gpa, tree.module);
-    defer result.deinit();
-
-    try out.print("\n== interpreter demo ==\n", .{});
-    if (result.runtime_error) |e| {
-        try out.print("runtime error {d}:{d}: {s}\n", .{ e.line, e.col, e.message });
-    }
-    try out.print("{s}", .{result.output});
-}
-
-const interpreter_demo_source =
-    \\struct Point:
-    \\    var x: int = 0
-    \\    var y: int = 0
-    \\
-    \\    func manhattan() -> int:
-    \\        return x + y
-    \\
-    \\func fib(n: int) -> int:
-    \\    if n < 2:
-    \\        return n
-    \\    return fib(n - 1) + fib(n - 2)
-    \\
-    \\func main():
-    \\    print("fib(10) =", fib(10))
-    \\    var p: Point = Point()
-    \\    p.x = 3
-    \\    p.y = 4
-    \\    print("point:", p)
-    \\    print("manhattan:", p.manhattan())
-;
-
-/// Runs the semantic analyzer over a small program with two deliberate mistakes
-/// — a type mismatch and an undefined reference — to show name resolution and
-/// type checking catching them.
-fn analyzerDemo(gpa: std.mem.Allocator, out: *Io.Writer) !void {
-    var tree = try Parser.parse(gpa, analyzer_demo_source);
-    defer tree.deinit();
-    var analysis = try Analyzer.analyze(gpa, tree.module);
-    defer analysis.deinit();
-
-    try out.print("\n== analyzer demo ==\n", .{});
-    try out.print("diagnostics: {d}\n", .{analysis.diagnostics.len});
-    for (analysis.diagnostics) |diag| {
-        try out.print("  {d}:{d} {s}\n", .{ diag.line, diag.col, diag.message });
-    }
-}
-
-const analyzer_demo_source =
-    \\const LIMIT: int = 10
-    \\
-    \\pub func clamp(value: int) -> int:
-    \\    if value > LIMIT:
-    \\        return "too big"
-    \\    return valve
-;
-
-/// A small program exercising the whole front end: it lexes and parses
-/// `demo_source`, then prints a summary of the top-level declarations and any
-/// diagnostics.
-fn parserDemo(gpa: std.mem.Allocator, out: *Io.Writer) !void {
-    var tree = try Parser.parse(gpa, demo_source);
-    defer tree.deinit();
-
-    try out.print("\n== parser demo ==\n", .{});
-    try out.print("module: {d} declaration(s)\n", .{tree.module.decls.len});
-    for (tree.module.decls) |decl| {
-        const kind = @tagName(std.meta.activeTag(decl));
-        switch (decl) {
-            .import => |x| {
-                try out.print("  {s:<11} ", .{kind});
-                for (x.path, 0..) |seg, i| {
-                    if (i > 0) try out.print(".", .{});
-                    try out.print("{s}", .{seg});
-                }
-                try out.print("\n", .{});
-            },
-            .var_decl => |x| try out.print("  {s:<11} {s}\n", .{ kind, x.name }),
-            .func => |x| try out.print("  {s:<11} {s} ({d} param(s))\n", .{ kind, x.name, x.params.len }),
-            .class => |x| try out.print("  {s:<11} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
-            .struct_decl => |x| try out.print("  {s:<11} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
-            .enum_decl => |x| try out.print("  {s:<11} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
-            .signal => |x| try out.print("  {s:<11} {s} ({d} param(s))\n", .{ kind, x.name, x.params.len }),
+fn handle(
+    arena: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    err: *Io.Writer,
+    args: []const [:0]const u8,
+) !u8 {
+    // Parse arguments: an optional subcommand followed by a file path.
+    var mode: Mode = .run;
+    var arg_index: usize = 1;
+    if (args.len > 1) {
+        if (std.mem.eql(u8, args[1], "run")) {
+            mode = .run;
+            arg_index = 2;
+        } else if (std.mem.eql(u8, args[1], "check")) {
+            mode = .check;
+            arg_index = 2;
         }
     }
-
-    try out.print("diagnostics: {d}\n", .{tree.diagnostics.len});
-    for (tree.diagnostics) |diag| {
-        try out.print("  {d}:{d} {s}\n", .{ diag.line, diag.col, diag.message });
+    if (arg_index >= args.len) {
+        try err.writeAll(usage);
+        return 1;
     }
+    const path = args[arg_index];
+
+    const src = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 << 20)) catch |e| {
+        try err.print("error: could not read '{s}': {s}\n", .{ path, @errorName(e) });
+        return 1;
+    };
+
+    // Parse (which also lexes). Lexer + parser diagnostics come out together.
+    const tree = try Parser.parse(arena, src);
+    if (tree.diagnostics.len > 0) {
+        try renderAll(err, path, src, tree.diagnostics);
+        return 1;
+    }
+
+    // Analyze: name resolution and type checking.
+    const analysis = try Analyzer.analyze(arena, tree.module);
+    if (analysis.diagnostics.len > 0) {
+        try renderAll(err, path, src, analysis.diagnostics);
+        return 1;
+    }
+
+    if (mode == .check) {
+        try out.print("{s}: no problems found\n", .{path});
+        return 0;
+    }
+
+    // Execute.
+    const result = try Interpreter.run(arena, tree.module);
+    try out.writeAll(result.output);
+    if (result.runtime_error) |re| {
+        try render(err, "runtime error", path, src, re.message, re.line, re.col);
+        return 1;
+    }
+    return 0;
 }
 
-const demo_source =
-    \\import engine.graphics.render
-    \\
-    \\signal frame_ready(delta: int)
-    \\
-    \\const VERSION: str = "0.1"
-    \\
-    \\enum Status {
-    \\    OK
-    \\    NOT_FOUND
-    \\}
-    \\
-    \\struct Vec2:
-    \\    var x: int = 0
-    \\    var y: int = 0
-    \\
-    \\pub func describe(code: int) -> str:
-    \\    return match code {
-    \\        200: "ok"
-    \\        _: "unknown"
-    \\    }
-    \\
-    \\pub class Player extends Entity uses Damageable:
-    \\    var health: int = 100
-    \\
-    \\    pub func take_damage(amount: int) -> bool:
-    \\        if health <= 0:
-    \\            return true
-    \\        else:
-    \\            return false
-;
+// --- diagnostic rendering ----------------------------------------------------
+
+fn renderAll(w: *Io.Writer, path: []const u8, src: []const u8, diagnostics: []const Diagnostic) !void {
+    for (diagnostics) |d| {
+        try render(w, "error", path, src, d.message, d.line, d.col);
+    }
+    try w.print("{d} error(s)\n", .{diagnostics.len});
+}
+
+/// Render one diagnostic in the style:
+///
+///   error: <message>
+///     --> <path>:<line>:<col>
+///      |
+///    N | <source line>
+///      |     ^
+fn render(
+    w: *Io.Writer,
+    label: []const u8,
+    path: []const u8,
+    src: []const u8,
+    message: []const u8,
+    line: u32,
+    col: u32,
+) !void {
+    var num_buf: [20]u8 = undefined;
+    const num = std.fmt.bufPrint(&num_buf, "{d}", .{line}) catch "?";
+
+    try w.print("{s}: {s}\n", .{ label, message });
+    try w.print("  --> {s}:{d}:{d}\n", .{ path, line, col });
+    try writeSpaces(w, num.len);
+    try w.writeAll(" |\n");
+    try w.print("{s} | {s}\n", .{ num, lineText(src, line) });
+    try writeSpaces(w, num.len);
+    try w.writeAll(" | ");
+    if (col > 0) try writeSpaces(w, col - 1);
+    try w.writeAll("^\n\n");
+}
+
+fn writeSpaces(w: *Io.Writer, n: usize) !void {
+    var i: usize = 0;
+    while (i < n) : (i += 1) try w.writeByte(' ');
+}
+
+/// The 1-based `line`-th line of `src`, without its trailing newline (or CR).
+fn lineText(src: []const u8, line: u32) []const u8 {
+    var current: u32 = 1;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        if (src[i] == '\n') {
+            if (current == line) return trimCr(src[start..i]);
+            current += 1;
+            start = i + 1;
+        }
+    }
+    if (current == line) return trimCr(src[start..]);
+    return "";
+}
+
+fn trimCr(s: []const u8) []const u8 {
+    return if (s.len > 0 and s[s.len - 1] == '\r') s[0 .. s.len - 1] else s;
+}
 
 test "simple test" {
     const gpa = std.testing.allocator;
