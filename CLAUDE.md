@@ -86,12 +86,15 @@ there are no upward dependencies.
   `break`, `continue`, `pass`, assignment, expression statements. All statement
   blocks are colon-blocks (indentation); braces `{ }` are only for `enum`/`match`
   bodies.
-- **Expressions:** literals, identifiers, `and`/`or`/`not`, arithmetic/comparison with
-  precedence, calls, indexing `a[i]`, member access `x.f`, array `[...]` and map `{k: v}`
-  literals, and `match subj { pattern: body, ... }` (patterns: literals, `_`, binding).
+- **Expressions:** literals (incl. `nil`), identifiers, `and`/`or`/`not`,
+  arithmetic/comparison with precedence, calls, indexing `a[i]`, member access `x.f`,
+  array `[...]` and map `{k: v}` literals, and `match subj { pattern: body, ... }`
+  (patterns: literals, `_`, binding).
 - **Types:** `int`, `float`, `str`, `bool`, `void`, `any`, `list`, `map`, plus user
-  classes/structs/enums. `int` widens to `float`. A subclass is assignable to its bases
-  (via `extends`/`uses`, transitively).
+  classes/structs/enums, and optionals `?T` (hold `T` or `nil`). `int` widens to `float`.
+  A subclass is assignable to its bases (via `extends`/`uses`, transitively). `nil` and a
+  value both fit `?T`; a `?T` must be unwrapped (e.g. narrowed via `if v != nil:`) before
+  it's usable as `T`. `?T`-returning functions may fall off the end (yielding `nil`).
 - **Analyzer checks:** undefined names, duplicate declarations, unknown types,
   init/return/operator/condition/assignment/call type compatibility, member access,
   enum-case validity (`Status.OK`), `match` exhaustiveness + unreachable arms,

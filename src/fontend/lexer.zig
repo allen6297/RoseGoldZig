@@ -43,6 +43,7 @@ pub const TokenKind = enum {
     kw_continue,
     kw_return,
     kw_pass,
+    kw_nil,
     kw_pub,
     kw_private,
     kw_static,
@@ -66,6 +67,7 @@ pub const TokenKind = enum {
     r_brace,
     l_bracket,
     r_bracket,
+    question,
 
     // operators
     plus,
@@ -111,6 +113,7 @@ const keywords = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "continue", .kw_continue },
     .{ "return", .kw_return },
     .{ "pass", .kw_pass },
+    .{ "nil", .kw_nil },
     .{ "pub", .kw_pub },
     .{ "private", .kw_private },
     .{ "static", .kw_static },
@@ -415,6 +418,7 @@ pub const Lexer = struct {
             ':' => .colon,
             ',' => .comma,
             '.' => .dot,
+            '?' => .question,
             '+' => .plus,
             '*' => .star,
             '/' => .slash,
@@ -1004,6 +1008,17 @@ test "logical keywords lex as keywords" {
     for (expected, result.tokens.items) |kind, tok| {
         try std.testing.expectEqual(kind, tok.kind);
     }
+}
+
+test "nil keyword and ? token" {
+    const gpa = std.testing.allocator;
+    var result = try tokenize(gpa, "var x: ?int = nil\n");
+    defer result.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.len);
+    const kinds = [_]TokenKind{ .kw_var, .identifier, .colon, .question, .identifier, .assign, .kw_nil, .newline, .eof };
+    try std.testing.expectEqual(kinds.len, result.tokens.items.len);
+    for (kinds, result.tokens.items) |k, tok| try std.testing.expectEqual(k, tok.kind);
 }
 
 test "break and continue are keywords" {

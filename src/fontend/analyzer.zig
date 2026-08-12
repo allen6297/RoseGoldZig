@@ -55,6 +55,13 @@ const FuncSig = struct {
     ret: Type,
 };
 
+/// An optional type `?T`, carrying the wrapped type and a pre-formatted name
+/// (so `typeName` stays allocation-free).
+const Optional = struct {
+    inner: Type,
+    name: []const u8,
+};
+
 /// An inferred type. `unknown` marks something we couldn't determine (usually
 /// downstream of another error) and `any` is an explicit escape hatch; both are
 /// compatible with everything so they suppress cascading diagnostics. Lists and
@@ -74,6 +81,10 @@ const Type = union(enum) {
     /// A reference to an enum type itself (e.g. `Status` in `Status.OK`), as
     /// opposed to `named` which is a value of that type.
     enum_ref: []const u8,
+    /// The type of the `nil` literal; assignable to any optional.
+    nil,
+    /// An optional type `?T`.
+    optional: *const Optional,
 };
 
 fn tagOf(t: Type) std.meta.Tag(Type) {
@@ -119,6 +130,8 @@ fn typeName(t: Type) []const u8 {
         .named => |n| n,
         .func => "function",
         .enum_ref => |n| n,
+        .nil => "nil",
+        .optional => |o| o.name,
     };
 }
 
@@ -152,6 +165,13 @@ fn isBuiltinType(name: []const u8) bool {
         if (std.mem.eql(u8, t, name)) return true;
     }
     return false;
+}
+
+/// If `a` is an identifier and `b` is the `nil` literal, return the name.
+fn nilCheckIdent(a: Expr, b: Expr) ?[]const u8 {
+    if (a != .identifier) return null;
+    if (b != .nil_literal) return null;
+    return a.identifier.name;
 }
 
 // --- control flow ------------------------------------------------------------
@@ -348,9 +368,17 @@ const Analyzer = struct {
     }
 
     /// Map a type annotation to an inferred type (without reporting; use
-    /// `checkType` for the existence error).
-    fn annotationType(self: *Analyzer, t: TypeRef) Type {
-        const n = t.name;
+    /// `checkType` for the existence error). Wraps the type in an optional when
+    /// the annotation is `?T`.
+    fn annotationType(self: *Analyzer, t: TypeRef) Error!Type {
+        const base = self.annotationBase(t.name);
+        if (!t.optional) return base;
+        const opt = try self.arena.create(Optional);
+        opt.* = .{ .inner = base, .name = try std.fmt.allocPrint(self.arena, "?{s}", .{typeName(base)}) };
+        return .{ .optional = opt };
+    }
+
+    fn annotationBase(self: *Analyzer, n: []const u8) Type {
         if (std.mem.eql(u8, n, "int")) return .int;
         if (std.mem.eql(u8, n, "float")) return .float;
         if (std.mem.eql(u8, n, "str")) return .str;
@@ -367,8 +395,8 @@ const Analyzer = struct {
 
     fn funcSig(self: *Analyzer, f: Decl.Func) Error!*const FuncSig {
         const params = try self.arena.alloc(Type, f.params.len);
-        for (f.params, 0..) |p, i| params[i] = if (p.type) |ann| self.annotationType(ann) else .any;
-        const ret: Type = if (f.return_type) |rt| self.annotationType(rt) else .any;
+        for (f.params, 0..) |p, i| params[i] = if (p.type) |ann| try self.annotationType(ann) else .any;
+        const ret: Type = if (f.return_type) |rt| try self.annotationType(rt) else .any;
         const sig = try self.arena.create(FuncSig);
         sig.* = .{ .params = params, .ret = ret };
         return sig;
@@ -388,10 +416,21 @@ const Analyzer = struct {
 
     /// Whether a value of type `from` may be used where `to` is expected.
     /// `named` types honor inheritance: a subclass is assignable to its bases.
+    /// `nil` and a value both fit an optional target; an optional does not fit a
+    /// non-optional target (it must be unwrapped first).
     fn assignable(self: *Analyzer, from: Type, to: Type) bool {
         if (isAnyish(from) or isAnyish(to)) return true;
         // A bare type reference used as a value is unusual; stay lenient.
         if (tagOf(from) == .enum_ref or tagOf(to) == .enum_ref) return true;
+        if (tagOf(to) == .optional) {
+            const inner = to.optional.inner;
+            return switch (from) {
+                .nil => true,
+                .optional => |a| self.assignable(a.inner, inner),
+                else => self.assignable(from, inner),
+            };
+        }
+        // `to` is a non-optional concrete type.
         return switch (from) {
             .int => tagOf(to) == .int or tagOf(to) == .float, // int widens to float
             .float => tagOf(to) == .float,
@@ -403,6 +442,7 @@ const Analyzer = struct {
             .func => tagOf(to) == .func,
             .named => |n| tagOf(to) == .named and self.isSubtype(n, to.named),
             .any, .unknown, .enum_ref => true,
+            .nil, .optional => false, // needs an optional target / must be unwrapped
         };
     }
 
@@ -496,7 +536,7 @@ const Analyzer = struct {
             // validated for shape.
             .import => {},
             .var_decl => |x| {
-                const ty: Type = if (x.type) |ann| self.annotationType(ann) else .unknown;
+                const ty: Type = if (x.type) |ann| try self.annotationType(ann) else .unknown;
                 try self.declareIn(self.module_scope, x.name, if (x.is_const) .constant else .variable, ty, x.span);
             },
             .func => |x| try self.declareIn(self.module_scope, x.name, .function, .unknown, x.span),
@@ -541,7 +581,7 @@ const Analyzer = struct {
         var declared: ?Type = null;
         if (x.type) |ann| {
             try self.checkType(ann);
-            declared = self.annotationType(ann);
+            declared = try self.annotationType(ann);
         }
         var value_ty: ?Type = null;
         if (x.value) |v| value_ty = try self.typeOf(v.*);
@@ -562,7 +602,7 @@ const Analyzer = struct {
         for (f.params) |p| {
             const pty: Type = if (p.type) |ann| blk: {
                 try self.checkType(ann);
-                break :blk self.annotationType(ann);
+                break :blk try self.annotationType(ann);
             } else .any;
             try self.declareIn(fn_scope, p.name, .parameter, pty, p.span);
         }
@@ -571,7 +611,7 @@ const Analyzer = struct {
         const saved_scope = self.current;
         const saved_ret = self.current_ret;
         self.current = fn_scope;
-        self.current_ret = if (f.return_type) |rt| self.annotationType(rt) else null;
+        self.current_ret = if (f.return_type) |rt| try self.annotationType(rt) else null;
         defer {
             self.current = saved_scope;
             self.current_ret = saved_ret;
@@ -579,8 +619,9 @@ const Analyzer = struct {
         try self.analyzeStmts(f.body);
 
         // A function with a concrete return type must return on every path.
+        // A `void` or optional (`?T`) return may legitimately fall off the end.
         if (self.current_ret) |rt| {
-            if (!isAnyish(rt) and tagOf(rt) != .void and !alwaysReturns(f.body)) {
+            if (!isAnyish(rt) and tagOf(rt) != .void and tagOf(rt) != .optional and !alwaysReturns(f.body)) {
                 try self.report(f.span, "'{s}' must return {s} on all paths", .{ f.name, typeName(rt) });
             }
         }
@@ -593,7 +634,7 @@ const Analyzer = struct {
         const scope = try self.newScope(self.module_scope);
         for (members) |m| switch (m) {
             .var_decl => |x| {
-                const ty: Type = if (x.type) |ann| self.annotationType(ann) else .unknown;
+                const ty: Type = if (x.type) |ann| try self.annotationType(ann) else .unknown;
                 try self.declareIn(scope, x.name, .field, ty, x.span);
                 self.setMemberInfo(scope, x.name, x.visibility, name);
             },
@@ -723,6 +764,40 @@ const Analyzer = struct {
         try self.analyzeStmts(stmts);
     }
 
+    const Narrow = struct { name: []const u8, inner: Type, in_then: bool };
+
+    /// Recognize `v != nil` / `nil != v` (narrow in the then-branch) and
+    /// `v == nil` / `nil == v` (narrow in the else-branch), where `v` is an
+    /// optional variable, so its inner type can be assumed inside the branch.
+    fn detectNilNarrow(self: *Analyzer, cond: Expr) ?Narrow {
+        const b = switch (cond) {
+            .binary => |b| b,
+            else => return null,
+        };
+        if (b.op != .eq and b.op != .ne) return null;
+        const name = nilCheckIdent(b.lhs.*, b.rhs.*) orelse nilCheckIdent(b.rhs.*, b.lhs.*) orelse return null;
+        const sym = self.resolve(name) orelse return null;
+        const inner = switch (sym.ty) {
+            .optional => |o| o.inner,
+            else => return null,
+        };
+        return .{ .name = name, .inner = inner, .in_then = b.op == .ne };
+    }
+
+    fn analyzeNarrowedBlock(self: *Analyzer, stmts: []const Stmt, narrow: Narrow) Error!void {
+        const child = try self.newScope(self.current);
+        // Shadow the optional with its unwrapped type for this block.
+        try child.symbols.put(self.arena, narrow.name, .{
+            .kind = .variable,
+            .ty = narrow.inner,
+            .span = .{ .start = 0, .end = 0, .line = 0, .col = 0 },
+        });
+        const saved = self.current;
+        self.current = child;
+        defer self.current = saved;
+        try self.analyzeStmts(stmts);
+    }
+
     fn checkCondition(self: *Analyzer, cond: *const Expr) Error!void {
         const ct = try self.typeOf(cond.*);
         if (!isBoolish(ct)) {
@@ -741,12 +816,25 @@ const Analyzer = struct {
             .return_stmt => |x| try self.checkReturn(x),
             .if_stmt => |x| {
                 try self.checkCondition(x.cond);
-                try self.analyzeChildBlock(x.then_body);
+                // `if v != nil:` narrows `v` to its inner type in the then-body;
+                // `if v == nil:` narrows it in the else-body.
+                const narrow = self.detectNilNarrow(x.cond.*);
+                if (narrow != null and narrow.?.in_then) {
+                    try self.analyzeNarrowedBlock(x.then_body, narrow.?);
+                } else {
+                    try self.analyzeChildBlock(x.then_body);
+                }
                 for (x.elifs) |e| {
                     try self.checkCondition(e.cond);
                     try self.analyzeChildBlock(e.body);
                 }
-                if (x.else_body) |eb| try self.analyzeChildBlock(eb);
+                if (x.else_body) |eb| {
+                    if (narrow != null and !narrow.?.in_then) {
+                        try self.analyzeNarrowedBlock(eb, narrow.?);
+                    } else {
+                        try self.analyzeChildBlock(eb);
+                    }
+                }
             },
             .while_stmt => |x| {
                 try self.checkCondition(x.cond);
@@ -798,7 +886,8 @@ const Analyzer = struct {
             } else if (!self.assignable(vt, ret)) {
                 try self.report(r.span, "cannot return {s} from a function returning {s}", .{ typeName(vt), typeName(ret) });
             }
-        } else if (!isAnyish(ret) and tagOf(ret) != .void) {
+        } else if (!isAnyish(ret) and tagOf(ret) != .void and tagOf(ret) != .optional) {
+            // A bare `return` in a `?T` function yields nil, which is valid.
             try self.report(r.span, "expected a return value of type {s}", .{typeName(ret)});
         }
     }
@@ -811,6 +900,7 @@ const Analyzer = struct {
             .float_literal => .float,
             .string_literal => .str,
             .bool_literal => .bool,
+            .nil_literal => .nil,
             .identifier => |id| blk: {
                 if (self.resolve(id.name)) |sym| break :blk sym.ty;
                 try self.report(id.span, "undefined name '{s}'", .{id.name});
@@ -1340,6 +1430,63 @@ test "while true with a break no longer guarantees a return" {
     var analysis = try analyzeSource(testing.allocator, "func f() -> int:\n    while true:\n        break");
     defer analysis.deinit();
     try expectMessageContains(analysis, "must return int on all paths");
+}
+
+// optionals
+
+test "nil and a value both fit an optional" {
+    var a = try analyzeSource(testing.allocator, "const x: ?int = nil\nconst y: ?int = 5");
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 0), a.diagnostics.len);
+}
+
+test "nil does not fit a non-optional" {
+    var a = try analyzeSource(testing.allocator, "const x: int = nil");
+    defer a.deinit();
+    try expectMessageContains(a, "cannot assign nil to int");
+}
+
+test "an optional cannot be used where the bare type is expected" {
+    var a = try analyzeSource(testing.allocator, "func f(x: ?int) -> int:\n    return x");
+    defer a.deinit();
+    try expectMessageContains(a, "cannot return ?int from a function returning int");
+}
+
+test "an optional-returning function may fall off the end" {
+    var a = try analyzeSource(testing.allocator, "func find() -> ?int:\n    pass");
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 0), a.diagnostics.len);
+}
+
+test "a bare return in an optional function is allowed" {
+    var a = try analyzeSource(testing.allocator, "func find(n: int) -> ?int:\n    if n > 0:\n        return n\n    return");
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 0), a.diagnostics.len);
+}
+
+test "a nil check narrows the optional in the then-branch" {
+    const src =
+        \\func unwrap(x: ?int) -> int:
+        \\    if x != nil:
+        \\        return x
+        \\    return 0
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 0), a.diagnostics.len);
+}
+
+test "a nil check narrows the optional in the else-branch" {
+    const src =
+        \\func unwrap(x: ?int) -> int:
+        \\    if x == nil:
+        \\        return 0
+        \\    else:
+        \\        return x
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 0), a.diagnostics.len);
 }
 
 // type checking

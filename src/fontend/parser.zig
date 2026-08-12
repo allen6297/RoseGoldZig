@@ -8,9 +8,10 @@
 //!   * statements: `return`, `if`/`elif`/`else`, `while`, `for`, `break`,
 //!     `continue`, `pass`, local `var`/`const`, assignments, and expression
 //!     statements
-//!   * expressions: literals, identifiers, member access, calls, indexing,
-//!     array/map literals, unary `-`/`not`, arithmetic/comparison/logical
-//!     operators with precedence, and `match`
+//!   * expressions: literals (incl. `nil`), identifiers, member access, calls,
+//!     indexing, array/map literals, unary `-`/`not`, arithmetic/comparison/
+//!     logical operators with precedence, and `match`
+//!   * types may be optional: `?T` holds a value of type `T` or `nil`
 //!
 //! Layout: colon-blocks are delimited by INDENT/DEDENT, brace-blocks by
 //! `{`/`}`, and statements are separated by NEWLINE. Errors are reported as
@@ -35,6 +36,8 @@ pub const Visibility = enum { default, public, private };
 pub const TypeRef = struct {
     name: []const u8,
     span: Span,
+    /// A leading `?` makes the type optional (may hold `nil`).
+    optional: bool = false,
 };
 
 pub const Param = struct {
@@ -66,6 +69,7 @@ pub const Expr = union(enum) {
     float_literal: Literal,
     string_literal: Literal,
     bool_literal: Bool,
+    nil_literal: Span,
     identifier: Ident,
     unary: Unary,
     binary: Binary,
@@ -220,6 +224,7 @@ pub fn exprSpan(e: Expr) Span {
     return switch (e) {
         .int_literal, .float_literal, .string_literal => |lit| lit.span,
         .bool_literal => |b| b.span,
+        .nil_literal => |s| s,
         .identifier => |id| id.span,
         .unary => |u| u.span,
         .binary => |b| b.span,
@@ -434,8 +439,9 @@ const Parser = struct {
     }
 
     fn parseType(self: *Parser) Error!TypeRef {
+        const optional = self.eat(.question);
         const t = try self.expect(.identifier, "expected a type name");
-        return .{ .name = t.text, .span = t.span };
+        return .{ .name = t.text, .span = t.span, .optional = optional };
     }
 
     fn parseVarDecl(self: *Parser, visibility: Visibility) Error!VarDecl {
@@ -860,6 +866,10 @@ const Parser = struct {
                 _ = self.advance();
                 return self.mkExpr(.{ .bool_literal = .{ .value = false, .span = t.span } });
             },
+            .kw_nil => {
+                _ = self.advance();
+                return self.mkExpr(.{ .nil_literal = t.span });
+            },
             .identifier => {
                 _ = self.advance();
                 return self.mkExpr(.{ .identifier = .{ .name = t.text, .span = t.span } });
@@ -1070,6 +1080,17 @@ test "parses signals with and without parameters" {
     try testing.expectEqual(@as(usize, 2), b.params.len);
     try testing.expectEqualStrings("amount", b.params[0].name);
     try testing.expect(b.params[1].type == null); // source is untyped
+}
+
+test "parses optional types and the nil literal" {
+    var tree = try parse(testing.allocator, "const x: ?int = nil");
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const d = tree.module.decls[0].var_decl;
+    try testing.expectEqualStrings("int", d.type.?.name);
+    try testing.expect(d.type.?.optional);
+    try testing.expect(std.meta.activeTag(d.value.?.*) == .nil_literal);
 }
 
 test "parses a typed const with a string value" {

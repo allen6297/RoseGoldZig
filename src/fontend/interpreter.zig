@@ -675,6 +675,7 @@ const Interpreter = struct {
             .float_literal => |lit| .{ .float = std.fmt.parseFloat(f64, lit.text) catch return self.fail(lit.span, "invalid float '{s}'", .{lit.text}) },
             .string_literal => |lit| .{ .str = try self.unquote(lit.text) },
             .bool_literal => |b| .{ .bool = b.value },
+            .nil_literal => .nil,
             .identifier => |id| try self.resolveName(id.name, id.span),
             .unary => |u| try self.evalUnary(u),
             .binary => |b| try self.evalBinary(b),
@@ -1117,6 +1118,28 @@ test "break affects only the innermost loop" {
         \\    print(count)
     ;
     try expectOutput(src, "3\n"); // inner runs once (b=0) per outer iteration
+}
+
+test "nil prints as nil" {
+    try expectOutput("func main():\n    print(nil)", "nil\n");
+}
+
+test "an optional-returning function and nil checks" {
+    const src =
+        \\func find(n: int) -> ?int:
+        \\    if n > 0:
+        \\        return n
+        \\    return nil
+        \\
+        \\func main():
+        \\    var a = find(5)
+        \\    if a != nil:
+        \\        print("found", a)
+        \\    var b = find(-1)
+        \\    if b == nil:
+        \\        print("none")
+    ;
+    try expectOutput(src, "found 5\nnone\n");
 }
 
 test "match expression selects the right arm" {
