@@ -65,6 +65,9 @@ const Type = union(enum) {
     map,
     named: []const u8,
     func: *const FuncSig,
+    /// A reference to an enum type itself (e.g. `Status` in `Status.OK`), as
+    /// opposed to `named` which is a value of that type.
+    enum_ref: []const u8,
 };
 
 fn tagOf(t: Type) std.meta.Tag(Type) {
@@ -95,6 +98,8 @@ fn isBoolish(t: Type) bool {
 /// Whether a value of type `from` may be used where `to` is expected.
 fn assignable(from: Type, to: Type) bool {
     if (isAnyish(from) or isAnyish(to)) return true;
+    // A bare type reference used as a value is unusual; stay lenient.
+    if (tagOf(from) == .enum_ref or tagOf(to) == .enum_ref) return true;
     return switch (from) {
         .int => tagOf(to) == .int or tagOf(to) == .float, // int widens to float
         .float => tagOf(to) == .float,
@@ -105,7 +110,7 @@ fn assignable(from: Type, to: Type) bool {
         .map => tagOf(to) == .map,
         .func => tagOf(to) == .func,
         .named => |n| tagOf(to) == .named and std.mem.eql(u8, n, to.named),
-        .any, .unknown => true,
+        .any, .unknown, .enum_ref => true,
     };
 }
 
@@ -122,6 +127,7 @@ fn typeName(t: Type) []const u8 {
         .map => "map",
         .named => |n| n,
         .func => "function",
+        .enum_ref => |n| n,
     };
 }
 
@@ -172,6 +178,7 @@ const SymbolKind = enum {
     method,
     binding,
     signal,
+    enum_member,
 };
 
 fn isUserType(kind: SymbolKind) bool {
@@ -233,6 +240,9 @@ const Analyzer = struct {
     /// Member scope of each class/struct, keyed by type name, so `x.member` can
     /// be resolved from anywhere. Built before any body is analyzed.
     user_types: std.StringHashMapUnmanaged(*Scope) = .{},
+    /// Case scope of each enum, keyed by enum name, so `Enum.CASE` can be
+    /// validated. Built before any body is analyzed.
+    enum_types: std.StringHashMapUnmanaged(*Scope) = .{},
 
     fn report(self: *Analyzer, span: Span, comptime fmt: []const u8, args: anytype) Error!void {
         const msg = try std.fmt.allocPrint(self.arena, fmt, args);
@@ -325,6 +335,7 @@ const Analyzer = struct {
             },
             .class => |c| try self.buildUserType(c.name, c.members),
             .struct_decl => |s| try self.buildUserType(s.name, s.members),
+            .enum_decl => |en| try self.buildEnumType(en.name, en.members),
             else => {},
         };
         // Phase 2: analyze bodies.
@@ -341,7 +352,7 @@ const Analyzer = struct {
             .func => |x| try self.declareIn(self.module_scope, x.name, .function, .unknown, x.span),
             .class => |x| try self.declareIn(self.module_scope, x.name, .class, .unknown, x.span),
             .struct_decl => |x| try self.declareIn(self.module_scope, x.name, .struct_type, .unknown, x.span),
-            .enum_decl => |x| try self.declareIn(self.module_scope, x.name, .enum_type, .unknown, x.span),
+            .enum_decl => |x| try self.declareIn(self.module_scope, x.name, .enum_type, .{ .enum_ref = x.name }, x.span),
             .signal => |x| try self.declareIn(self.module_scope, x.name, .signal, .unknown, x.span),
         }
     }
@@ -464,17 +475,28 @@ const Analyzer = struct {
                 try self.report(span, "type '{s}' has no member '{s}'", .{ type_name, name });
                 return .unknown;
             },
+            .enum_ref => |enum_name| {
+                const scope = self.enum_types.get(enum_name) orelse return .unknown;
+                if (scope.symbols.contains(name)) return .{ .named = enum_name };
+                try self.report(span, "enum '{s}' has no case '{s}'", .{ enum_name, name });
+                return .unknown;
+            },
             else => return .unknown,
         }
     }
 
+    /// Record an enum's cases in a scope keyed by its name (duplicates reported
+    /// here), so `Enum.CASE` can be validated from any body.
+    fn buildEnumType(self: *Analyzer, name: []const u8, members: []const parser.EnumMember) Error!void {
+        const scope = try self.newScope(self.module_scope);
+        for (members) |m| {
+            try self.declareIn(scope, m.name, .enum_member, .{ .named = name }, m.span);
+        }
+        try self.enum_types.put(self.arena, name, scope);
+    }
+
     fn analyzeEnum(self: *Analyzer, e: Decl.Enum) Error!void {
-        var seen: std.StringHashMapUnmanaged(void) = .{};
         for (e.members) |m| {
-            const gop = try seen.getOrPut(self.arena, m.name);
-            if (gop.found_existing) {
-                try self.report(m.span, "duplicate enum member '{s}'", .{m.name});
-            }
             if (m.value) |v| _ = try self.typeOf(v.*);
         }
     }
@@ -851,6 +873,42 @@ test "duplicate enum member is reported" {
     var analysis = try analyzeSource(testing.allocator, "enum E { A, B, A }");
     defer analysis.deinit();
     try expectMessageContains(analysis, "A");
+}
+
+test "a valid enum case resolves" {
+    const src =
+        \\enum Status { OK, NOT_FOUND }
+        \\
+        \\func best() -> Status:
+        \\    return Status.OK
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "an unknown enum case is reported" {
+    const src =
+        \\enum Status { OK, NOT_FOUND }
+        \\
+        \\func f():
+        \\    var s = Status.MISSING
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "enum 'Status' has no case 'MISSING'");
+}
+
+test "enum cases of an enum type compare cleanly" {
+    const src =
+        \\enum Color { RED, GREEN }
+        \\
+        \\func is_red(c: Color) -> bool:
+        \\    return c == Color.RED
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
 }
 
 test "a declared struct is a valid type and its methods see fields" {
