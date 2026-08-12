@@ -171,6 +171,7 @@ const SymbolKind = enum {
     field,
     method,
     binding,
+    signal,
 };
 
 fn isUserType(kind: SymbolKind) bool {
@@ -294,7 +295,7 @@ const Analyzer = struct {
 
     fn funcSig(self: *Analyzer, f: Decl.Func) Error!*const FuncSig {
         const params = try self.arena.alloc(Type, f.params.len);
-        for (f.params, 0..) |p, i| params[i] = self.annotationType(p.type);
+        for (f.params, 0..) |p, i| params[i] = if (p.type) |ann| self.annotationType(ann) else .any;
         const ret: Type = if (f.return_type) |rt| self.annotationType(rt) else .any;
         const sig = try self.arena.create(FuncSig);
         sig.* = .{ .params = params, .ret = ret };
@@ -335,6 +336,7 @@ const Analyzer = struct {
             .class => |x| try self.declareIn(self.module_scope, x.name, .class, .unknown, x.span),
             .struct_decl => |x| try self.declareIn(self.module_scope, x.name, .struct_type, .unknown, x.span),
             .enum_decl => |x| try self.declareIn(self.module_scope, x.name, .enum_type, .unknown, x.span),
+            .signal => |x| try self.declareIn(self.module_scope, x.name, .signal, .unknown, x.span),
         }
     }
 
@@ -349,6 +351,20 @@ const Analyzer = struct {
             .class => |x| try self.analyzeAggregate(x.name, x.members),
             .struct_decl => |x| try self.analyzeAggregate(x.name, x.members),
             .enum_decl => |x| try self.analyzeEnum(x),
+            .signal => |x| try self.analyzeSignal(x),
+        }
+    }
+
+    /// Signals introduce no values; just validate parameter types and flag
+    /// duplicate parameter names.
+    fn analyzeSignal(self: *Analyzer, s: Decl.Signal) Error!void {
+        var seen: std.StringHashMapUnmanaged(void) = .{};
+        for (s.params) |p| {
+            if (p.type) |ann| try self.checkType(ann);
+            const gop = try seen.getOrPut(self.arena, p.name);
+            if (gop.found_existing) {
+                try self.report(p.span, "'{s}' is already declared", .{p.name});
+            }
         }
     }
 
@@ -377,8 +393,11 @@ const Analyzer = struct {
     fn analyzeFunc(self: *Analyzer, f: Decl.Func) Error!void {
         const fn_scope = try self.newScope(self.current);
         for (f.params) |p| {
-            try self.checkType(p.type);
-            try self.declareIn(fn_scope, p.name, .parameter, self.annotationType(p.type), p.span);
+            const pty: Type = if (p.type) |ann| blk: {
+                try self.checkType(ann);
+                break :blk self.annotationType(ann);
+            } else .any;
+            try self.declareIn(fn_scope, p.name, .parameter, pty, p.span);
         }
         if (f.return_type) |rt| try self.checkType(rt);
 
@@ -404,6 +423,7 @@ const Analyzer = struct {
                 try self.declareIn(scope, x.name, .field, ty, x.span);
             },
             .func => |x| try self.declareIn(scope, x.name, .method, .{ .func = try self.funcSig(x) }, x.span),
+            .signal => |x| try self.declareIn(scope, x.name, .signal, .unknown, x.span),
             else => {},
         };
         try self.user_types.put(self.arena, name, scope);
@@ -422,6 +442,7 @@ const Analyzer = struct {
                 if (scope.symbols.getPtr(x.name)) |sym| sym.ty = ty;
             },
             .func => |x| try self.analyzeFunc(x),
+            .signal => |x| try self.analyzeSignal(x),
             else => {},
         };
     }
@@ -1011,4 +1032,52 @@ test "member access on a class instance is typed" {
     var analysis = try analyzeSource(testing.allocator, src);
     defer analysis.deinit();
     try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+// grammar-gap features
+
+test "an untyped parameter accepts any value" {
+    const src =
+        \\func log(msg):
+        \\    pass
+        \\
+        \\func run():
+        \\    log(1)
+        \\    log("hi")
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a dotted import binds its last segment" {
+    const src =
+        \\import engine.graphics.render
+        \\
+        \\func draw():
+        \\    render()
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    // `render` resolves (bound name); it is not undefined.
+    for (analysis.diagnostics) |d| {
+        try testing.expect(std.mem.indexOf(u8, d.message, "render") == null);
+    }
+}
+
+test "signal names are declared and their params checked" {
+    const src =
+        \\signal ready
+        \\signal damaged(amount: Nope)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    // `Nope` is an unknown type; `ready` and `damaged` register cleanly.
+    try expectMessageContains(analysis, "Nope");
+}
+
+test "a duplicate signal name is reported" {
+    var analysis = try analyzeSource(testing.allocator, "signal ping\nsignal ping");
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "already declared");
 }

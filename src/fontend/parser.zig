@@ -3,8 +3,8 @@
 //!
 //! A recursive-descent parser over the token stream produced by `lexer.zig`.
 //! It covers the subset the language currently exercises:
-//!   * top-level declarations: `import`, `const`/`var`, `enum`, `func`, `class`,
-//!     `struct`
+//!   * top-level declarations: `import` (dotted paths), `const`/`var`, `enum`,
+//!     `func` (with optional parameter types), `class`, `struct`, `signal`
 //!   * statements: `return`, `if`/`elif`/`else`, `while`, `for`, `pass`,
 //!     local `var`/`const`, assignments, and expression statements
 //!   * expressions: literals, identifiers, member access, calls, indexing,
@@ -38,7 +38,7 @@ pub const TypeRef = struct {
 
 pub const Param = struct {
     name: []const u8,
-    type: TypeRef,
+    type: ?TypeRef,
     span: Span,
 };
 
@@ -155,8 +155,18 @@ pub const Decl = union(enum) {
     class: Class,
     struct_decl: Struct,
     enum_decl: Enum,
+    signal: Signal,
 
-    pub const Import = struct { name: []const u8, span: Span };
+    /// A dotted module path. `name` is the last segment (the bound name); `path`
+    /// holds every segment, e.g. `import a.b.c` → path `{a, b, c}`, name `c`.
+    pub const Import = struct { path: []const []const u8, name: []const u8, span: Span };
+    /// An event declaration: `signal name` or `signal name(params)`.
+    pub const Signal = struct {
+        visibility: Visibility,
+        name: []const u8,
+        params: []const Param,
+        span: Span,
+    };
     pub const Func = struct {
         visibility: Visibility,
         is_static: bool,
@@ -398,6 +408,7 @@ const Parser = struct {
             .kw_class => return .{ .class = try self.parseClass(visibility) },
             .kw_struct => return .{ .struct_decl = try self.parseStruct(visibility) },
             .kw_enum => return .{ .enum_decl = try self.parseEnum(visibility) },
+            .kw_signal => return .{ .signal = try self.parseSignal(visibility) },
             else => {
                 try self.err("expected a declaration");
                 return error.ParseError;
@@ -407,8 +418,16 @@ const Parser = struct {
 
     fn parseImport(self: *Parser) Error!Decl.Import {
         const kw = try self.expect(.kw_import, "expected 'import'");
-        const name = try self.expect(.identifier, "expected a module name after 'import'");
-        return .{ .name = name.text, .span = spanFrom(kw, name) };
+        var segments: std.ArrayList([]const u8) = .empty;
+        const first = try self.expect(.identifier, "expected a module name after 'import'");
+        try segments.append(self.alloc, first.text);
+        var last = first;
+        while (self.eat(.dot)) {
+            last = try self.expect(.identifier, "expected a name after '.'");
+            try segments.append(self.alloc, last.text);
+        }
+        const path = try segments.toOwnedSlice(self.alloc);
+        return .{ .path = path, .name = path[path.len - 1], .span = spanFrom(kw, last) };
     }
 
     fn parseType(self: *Parser) Error!TypeRef {
@@ -434,16 +453,15 @@ const Parser = struct {
         };
     }
 
-    fn parseFunc(self: *Parser, visibility: Visibility, is_static: bool) Error!Decl.Func {
-        const kw = try self.expect(.kw_func, "expected 'func'");
-        const name = try self.expect(.identifier, "expected a function name");
-        _ = try self.expect(.l_paren, "expected '(' after the function name");
+    /// Parse `( name[: type], ... )`. Parameter types are optional.
+    fn parseParamList(self: *Parser) Error![]const Param {
+        _ = try self.expect(.l_paren, "expected '('");
         var params: std.ArrayList(Param) = .empty;
         if (!self.at(.r_paren)) {
             while (true) {
                 const pname = try self.expect(.identifier, "expected a parameter name");
-                _ = try self.expect(.colon, "expected ':' after the parameter name");
-                const ptype = try self.parseType();
+                var ptype: ?TypeRef = null;
+                if (self.eat(.colon)) ptype = try self.parseType();
                 try params.append(self.alloc, .{
                     .name = pname.text,
                     .type = ptype,
@@ -453,6 +471,13 @@ const Parser = struct {
             }
         }
         _ = try self.expect(.r_paren, "expected ')' after the parameters");
+        return params.toOwnedSlice(self.alloc);
+    }
+
+    fn parseFunc(self: *Parser, visibility: Visibility, is_static: bool) Error!Decl.Func {
+        const kw = try self.expect(.kw_func, "expected 'func'");
+        const name = try self.expect(.identifier, "expected a function name");
+        const params = try self.parseParamList();
         var return_type: ?TypeRef = null;
         if (self.eat(.arrow)) return_type = try self.parseType();
         const body = try self.parseColonStmtBlock();
@@ -460,9 +485,21 @@ const Parser = struct {
             .visibility = visibility,
             .is_static = is_static,
             .name = name.text,
-            .params = try params.toOwnedSlice(self.alloc),
+            .params = params,
             .return_type = return_type,
             .body = body,
+            .span = spanFrom(kw, self.prev()),
+        };
+    }
+
+    fn parseSignal(self: *Parser, visibility: Visibility) Error!Decl.Signal {
+        const kw = try self.expect(.kw_signal, "expected 'signal'");
+        const name = try self.expect(.identifier, "expected a signal name");
+        const params: []const Param = if (self.at(.l_paren)) try self.parseParamList() else &.{};
+        return .{
+            .visibility = visibility,
+            .name = name.text,
+            .params = params,
             .span = spanFrom(kw, self.prev()),
         };
     }
@@ -996,6 +1033,53 @@ test "parses an import" {
     try testing.expectEqualStrings("graphics", tree.module.decls[0].import.name);
 }
 
+test "parses a dotted import path" {
+    var tree = try parse(testing.allocator, "import engine.graphics.render");
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const imp = tree.module.decls[0].import;
+    try testing.expectEqual(@as(usize, 3), imp.path.len);
+    try testing.expectEqualStrings("engine", imp.path[0]);
+    try testing.expectEqualStrings("graphics", imp.path[1]);
+    try testing.expectEqualStrings("render", imp.path[2]);
+    try testing.expectEqualStrings("render", imp.name); // bound name is the last segment
+}
+
+test "parameter types are optional" {
+    var tree = try parse(testing.allocator, "func log(msg, level: int):\n    pass");
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const f = tree.module.decls[0].func;
+    try testing.expectEqual(@as(usize, 2), f.params.len);
+    try testing.expect(f.params[0].type == null); // msg is untyped
+    try testing.expectEqualStrings("int", f.params[1].type.?.name);
+}
+
+test "parses signals with and without parameters" {
+    const src =
+        \\signal started
+        \\signal damaged(amount: int, source)
+    ;
+    var tree = try parse(testing.allocator, src);
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    try testing.expectEqual(@as(usize, 2), tree.module.decls.len);
+
+    const a = tree.module.decls[0];
+    try testing.expect(std.meta.activeTag(a) == .signal);
+    try testing.expectEqualStrings("started", a.signal.name);
+    try testing.expectEqual(@as(usize, 0), a.signal.params.len);
+
+    const b = tree.module.decls[1].signal;
+    try testing.expectEqualStrings("damaged", b.name);
+    try testing.expectEqual(@as(usize, 2), b.params.len);
+    try testing.expectEqualStrings("amount", b.params[0].name);
+    try testing.expect(b.params[1].type == null); // source is untyped
+}
+
 test "parses a typed const with a string value" {
     var tree = try parse(testing.allocator, "const VERSION: str = \"0.1\"");
     defer tree.deinit();
@@ -1062,7 +1146,7 @@ test "parses a function with a match expression" {
     try testing.expectEqualStrings("describe", f.name);
     try testing.expectEqual(@as(usize, 1), f.params.len);
     try testing.expectEqualStrings("code", f.params[0].name);
-    try testing.expectEqualStrings("int", f.params[0].type.name);
+    try testing.expectEqualStrings("int", f.params[0].type.?.name);
     try testing.expectEqualStrings("str", f.return_type.?.name);
     try testing.expectEqual(@as(usize, 1), f.body.len);
 

@@ -75,12 +75,20 @@ fn parserDemo(gpa: std.mem.Allocator, out: *Io.Writer) !void {
     for (tree.module.decls) |decl| {
         const kind = @tagName(std.meta.activeTag(decl));
         switch (decl) {
-            .import => |x| try out.print("  {s:<10} {s}\n", .{ kind, x.name }),
-            .var_decl => |x| try out.print("  {s:<10} {s}\n", .{ kind, x.name }),
-            .func => |x| try out.print("  {s:<10} {s} ({d} param(s))\n", .{ kind, x.name, x.params.len }),
-            .class => |x| try out.print("  {s:<10} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
-            .struct_decl => |x| try out.print("  {s:<10} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
-            .enum_decl => |x| try out.print("  {s:<10} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
+            .import => |x| {
+                try out.print("  {s:<11} ", .{kind});
+                for (x.path, 0..) |seg, i| {
+                    if (i > 0) try out.print(".", .{});
+                    try out.print("{s}", .{seg});
+                }
+                try out.print("\n", .{});
+            },
+            .var_decl => |x| try out.print("  {s:<11} {s}\n", .{ kind, x.name }),
+            .func => |x| try out.print("  {s:<11} {s} ({d} param(s))\n", .{ kind, x.name, x.params.len }),
+            .class => |x| try out.print("  {s:<11} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
+            .struct_decl => |x| try out.print("  {s:<11} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
+            .enum_decl => |x| try out.print("  {s:<11} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
+            .signal => |x| try out.print("  {s:<11} {s} ({d} param(s))\n", .{ kind, x.name, x.params.len }),
         }
     }
 
@@ -91,7 +99,9 @@ fn parserDemo(gpa: std.mem.Allocator, out: *Io.Writer) !void {
 }
 
 const demo_source =
-    \\import graphics
+    \\import engine.graphics.render
+    \\
+    \\signal frame_ready(delta: int)
     \\
     \\const VERSION: str = "0.1"
     \\

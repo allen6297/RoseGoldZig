@@ -49,7 +49,7 @@ pub const TokenKind = enum {
     kw_and,
     kw_or,
     kw_not,
-    //kw_signal,
+    kw_signal,
 
     // punctuation
     colon,
@@ -115,7 +115,7 @@ const keywords = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "and", .kw_and },
     .{ "or", .kw_or },
     .{ "not", .kw_not },
-    // .{ "signal", .kw_signal },
+    .{ "signal", .kw_signal },
 });
 
 /// Byte offsets plus line/col, threaded through every token so the parser and
@@ -1000,6 +1000,16 @@ test "logical keywords lex as keywords" {
     for (expected, result.tokens.items) |kind, tok| {
         try std.testing.expectEqual(kind, tok.kind);
     }
+}
+
+test "signal is a keyword" {
+    const gpa = std.testing.allocator;
+    var result = try tokenize(gpa, "signal health_changed\n");
+    defer result.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.len);
+    try std.testing.expectEqual(TokenKind.kw_signal, result.tokens.items[0].kind);
+    try std.testing.expectEqual(TokenKind.identifier, result.tokens.items[1].kind);
 }
 
 test "struct is a keyword" {
