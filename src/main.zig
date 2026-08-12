@@ -55,6 +55,13 @@ fn interpreterDemo(gpa: std.mem.Allocator, out: *Io.Writer) !void {
 }
 
 const interpreter_demo_source =
+    \\struct Point:
+    \\    var x: int = 0
+    \\    var y: int = 0
+    \\
+    \\    func manhattan() -> int:
+    \\        return x + y
+    \\
     \\func fib(n: int) -> int:
     \\    if n < 2:
     \\        return n
@@ -62,11 +69,11 @@ const interpreter_demo_source =
     \\
     \\func main():
     \\    print("fib(10) =", fib(10))
-    \\    var total: int = 0
-    \\    for i in range(5) {
-    \\        total = total + i
-    \\    }
-    \\    print("sum(0..4) =", total)
+    \\    var p: Point = Point()
+    \\    p.x = 3
+    \\    p.y = 4
+    \\    print("point:", p)
+    \\    print("manhattan:", p.manhattan())
 ;
 
 /// Runs the semantic analyzer over a small program with two deliberate mistakes

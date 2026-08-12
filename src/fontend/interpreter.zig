@@ -11,8 +11,12 @@
 //! `const`/`var`), then calling `main()` if it exists. Program output is
 //! collected into a buffer rather than written directly, so it is easy to test.
 //!
-//! Not yet executable (future work): classes/structs/instances, methods and
-//! member access, and enum values. Reaching one raises a clear runtime error.
+//! Classes and structs execute: `Name(...)` constructs an instance (fields take
+//! their declared defaults; a method named `init` runs as the constructor),
+//! fields and methods are reached with `.`, and a method's body sees its own
+//! instance's fields and methods by bare name.
+//!
+//! Not yet executable (future work): enum values.
 //!
 //! All runtime data lives in an arena owned by the returned `RunResult`. The
 //! AST (and its source) must outlive the run, since function values borrow it.
@@ -41,6 +45,26 @@ const Map = struct { entries: std.ArrayList(MapEntry) = .empty };
 
 const Builtin = enum { print, echo, len, range };
 
+/// A field declared on a class/struct, with its default-value expression.
+const FieldDef = struct { name: []const u8, value: ?*const Expr };
+
+/// The runtime shape of a class or struct: its ordered fields (for default
+/// construction) and its methods.
+const TypeInfo = struct {
+    name: []const u8,
+    fields: []const FieldDef,
+    methods: std.StringHashMapUnmanaged(*const Decl.Func),
+};
+
+/// A live class/struct instance.
+const Instance = struct {
+    info: *const TypeInfo,
+    fields: std.StringHashMapUnmanaged(Value) = .{},
+};
+
+/// A method paired with the instance it was accessed on.
+const BoundMethod = struct { receiver: *Instance, func: *const Decl.Func };
+
 pub const Value = union(enum) {
     nil,
     int: i64,
@@ -51,6 +75,9 @@ pub const Value = union(enum) {
     map: *Map,
     func: *const Decl.Func,
     builtin: Builtin,
+    instance: *Instance,
+    bound_method: *BoundMethod,
+    type_ref: *const TypeInfo,
 };
 
 fn isTruthy(v: Value) bool {
@@ -91,6 +118,9 @@ fn valuesEqual(a: Value, b: Value) bool {
         .map => |x| b == .map and x == b.map,
         .func => |x| b == .func and x == b.func,
         .builtin => |x| b == .builtin and x == b.builtin,
+        .instance => |x| b == .instance and x == b.instance,
+        .bound_method => |x| b == .bound_method and x == b.bound_method,
+        .type_ref => |x| b == .type_ref and x == b.type_ref,
     };
 }
 
@@ -165,6 +195,9 @@ const Interpreter = struct {
     output: *std.ArrayList(u8),
     ret_value: Value = .nil,
     runtime_error: ?RuntimeError = null,
+    /// The instance whose method is currently executing, so bare `field` names
+    /// inside a method resolve to (and assign to) that instance.
+    current_receiver: ?*Instance = null,
 
     fn fail(self: *Interpreter, span: Span, comptime fmt: []const u8, args: anytype) Error {
         self.runtime_error = .{
@@ -185,23 +218,87 @@ const Interpreter = struct {
         try env.vars.put(self.arena, name, value);
     }
 
-    fn lookup(self: *Interpreter, name: []const u8) ?Value {
+    /// Resolve a name for reading: local scopes, then (inside a method) the
+    /// receiver's fields and methods, then globals.
+    fn resolveName(self: *Interpreter, name: []const u8, span: Span) Error!Value {
         var env: ?*Env = self.env;
         while (env) |e| : (env = e.parent) {
+            if (e == self.globals) break;
             if (e.vars.get(name)) |v| return v;
         }
-        return null;
+        if (self.current_receiver) |recv| {
+            if (recv.fields.get(name)) |v| return v;
+            if (recv.info.methods.get(name)) |func| {
+                const bm = try self.arena.create(BoundMethod);
+                bm.* = .{ .receiver = recv, .func = func };
+                return .{ .bound_method = bm };
+            }
+        }
+        if (self.globals.vars.get(name)) |v| return v;
+        return self.fail(span, "undefined name '{s}'", .{name});
     }
 
+    /// Resolve a name for writing: local scopes, then the receiver's fields,
+    /// then globals. Returns false if the name is not bound anywhere.
     fn assignVar(self: *Interpreter, name: []const u8, value: Value) bool {
         var env: ?*Env = self.env;
         while (env) |e| : (env = e.parent) {
+            if (e == self.globals) break;
             if (e.vars.getPtr(name)) |slot| {
                 slot.* = value;
                 return true;
             }
         }
+        if (self.current_receiver) |recv| {
+            if (recv.fields.getPtr(name)) |slot| {
+                slot.* = value;
+                return true;
+            }
+        }
+        if (self.globals.vars.getPtr(name)) |slot| {
+            slot.* = value;
+            return true;
+        }
         return false;
+    }
+
+    fn registerType(self: *Interpreter, name: []const u8, members: []const Decl) Error!void {
+        var fields: std.ArrayList(FieldDef) = .empty;
+        var methods: std.StringHashMapUnmanaged(*const Decl.Func) = .{};
+        for (members, 0..) |m, j| switch (m) {
+            .var_decl => |v| try fields.append(self.arena, .{ .name = v.name, .value = v.value }),
+            .func => try methods.put(self.arena, members[j].func.name, &members[j].func),
+            else => {},
+        };
+        const ti = try self.arena.create(TypeInfo);
+        ti.* = .{ .name = name, .fields = try fields.toOwnedSlice(self.arena), .methods = methods };
+        try self.define(self.globals, name, .{ .type_ref = ti });
+    }
+
+    fn construct(self: *Interpreter, ti: *const TypeInfo, args: []const Value, span: Span) Error!Value {
+        const inst = try self.arena.create(Instance);
+        inst.* = .{ .info = ti };
+
+        // Evaluate field defaults with the fresh instance as the receiver, so a
+        // later field may reference an earlier one.
+        const saved_env = self.env;
+        const saved_recv = self.current_receiver;
+        self.env = self.globals;
+        self.current_receiver = inst;
+        for (ti.fields) |f| {
+            const v = if (f.value) |val| try self.eval(val.*) else Value.nil;
+            try inst.fields.put(self.arena, f.name, v);
+        }
+        self.env = saved_env;
+        self.current_receiver = saved_recv;
+
+        // A method named `init` acts as the constructor.
+        if (ti.methods.get("init")) |init_fn| {
+            _ = try self.callMethod(init_fn, inst, args, span);
+        } else if (args.len != 0) {
+            return self.fail(span, "{s} takes no constructor arguments", .{ti.name});
+        }
+        return .{ .instance = inst };
     }
 
     // --- top level -----------------------------------------------------------
@@ -209,7 +306,13 @@ const Interpreter = struct {
     fn execute(self: *Interpreter, module: Module) Error!void {
         try self.registerBuiltins();
 
-        // Bind functions first so globals and `main` can call any of them.
+        // Bind class/struct names to type values so `Name(...)` constructs them.
+        for (module.decls) |decl| switch (decl) {
+            .class => |c| try self.registerType(c.name, c.members),
+            .struct_decl => |s| try self.registerType(s.name, s.members),
+            else => {},
+        };
+        // Bind functions so globals and `main` can call any of them.
         for (module.decls, 0..) |decl, i| switch (decl) {
             .func => try self.define(self.globals, decl.func.name, .{ .func = &module.decls[i].func }),
             else => {},
@@ -314,6 +417,19 @@ const Interpreter = struct {
                 const key = try self.eval(idx.index.*);
                 try self.setIndex(container, key, value, a.span);
             },
+            .member => |mem| {
+                const obj = try self.eval(mem.object.*);
+                switch (obj) {
+                    .instance => |inst| {
+                        if (inst.fields.getPtr(mem.name)) |slot| {
+                            slot.* = value;
+                        } else {
+                            return self.fail(mem.span, "type '{s}' has no field '{s}'", .{ inst.info.name, mem.name });
+                        }
+                    },
+                    else => return self.fail(mem.span, "cannot assign a member of {s}", .{@tagName(obj)}),
+                }
+            },
             else => return self.fail(a.span, "invalid assignment target", .{}),
         }
     }
@@ -367,6 +483,28 @@ const Interpreter = struct {
         return if (flow == .returned) self.ret_value else Value.nil;
     }
 
+    fn callMethod(self: *Interpreter, func: *const Decl.Func, receiver: *Instance, args: []const Value, span: Span) Error!Value {
+        if (args.len != func.params.len) {
+            return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
+        }
+        const call_env = try self.newEnv(self.globals);
+        for (func.params, args) |p, arg| try self.define(call_env, p.name, arg);
+
+        const saved_env = self.env;
+        const saved_ret = self.ret_value;
+        const saved_recv = self.current_receiver;
+        self.env = call_env;
+        self.ret_value = .nil;
+        self.current_receiver = receiver;
+        defer {
+            self.env = saved_env;
+            self.ret_value = saved_ret;
+            self.current_receiver = saved_recv;
+        }
+        const flow = try self.execBlock(func.body);
+        return if (flow == .returned) self.ret_value else Value.nil;
+    }
+
     fn callBuiltin(self: *Interpreter, b: Builtin, args: []const Value, span: Span) Error!Value {
         switch (b) {
             .print, .echo => {
@@ -406,7 +544,7 @@ const Interpreter = struct {
             .float_literal => |lit| .{ .float = std.fmt.parseFloat(f64, lit.text) catch return self.fail(lit.span, "invalid float '{s}'", .{lit.text}) },
             .string_literal => |lit| .{ .str = try self.unquote(lit.text) },
             .bool_literal => |b| .{ .bool = b.value },
-            .identifier => |id| self.lookup(id.name) orelse return self.fail(id.span, "undefined name '{s}'", .{id.name}),
+            .identifier => |id| try self.resolveName(id.name, id.span),
             .unary => |u| try self.evalUnary(u),
             .binary => |b| try self.evalBinary(b),
             .call => |c| try self.evalCall(c),
@@ -414,7 +552,7 @@ const Interpreter = struct {
             .array => |a| try self.evalArray(a),
             .map => |m| try self.evalMap(m),
             .match => |m| try self.evalMatch(m),
-            .member => |m| return self.fail(m.span, "member access is not executable yet", .{}),
+            .member => |m| try self.evalMember(m),
         };
     }
 
@@ -515,8 +653,26 @@ const Interpreter = struct {
         return switch (callee) {
             .func => |f| try self.callFunction(f, args, c.span),
             .builtin => |b| try self.callBuiltin(b, args, c.span),
+            .bound_method => |bm| try self.callMethod(bm.func, bm.receiver, args, c.span),
+            .type_ref => |ti| try self.construct(ti, args, c.span),
             else => self.fail(c.span, "{s} is not callable", .{@tagName(callee)}),
         };
+    }
+
+    fn evalMember(self: *Interpreter, m: Expr.MemberAccess) Error!Value {
+        const obj = try self.eval(m.object.*);
+        switch (obj) {
+            .instance => |inst| {
+                if (inst.fields.get(m.name)) |v| return v;
+                if (inst.info.methods.get(m.name)) |func| {
+                    const bm = try self.arena.create(BoundMethod);
+                    bm.* = .{ .receiver = inst, .func = func };
+                    return .{ .bound_method = bm };
+                }
+                return self.fail(m.span, "type '{s}' has no member '{s}'", .{ inst.info.name, m.name });
+            },
+            else => return self.fail(m.span, "cannot access a member of {s}", .{@tagName(obj)}),
+        }
     }
 
     fn evalIndex(self: *Interpreter, idx: Expr.Index) Error!Value {
@@ -642,7 +798,23 @@ const Interpreter = struct {
                 }
                 try buf.append(self.arena, '}');
             },
-            .func, .builtin => try buf.appendSlice(self.arena, "<function>"),
+            .func, .builtin, .bound_method => try buf.appendSlice(self.arena, "<function>"),
+            .type_ref => |ti| {
+                try buf.appendSlice(self.arena, "<type ");
+                try buf.appendSlice(self.arena, ti.name);
+                try buf.append(self.arena, '>');
+            },
+            .instance => |inst| {
+                try buf.appendSlice(self.arena, inst.info.name);
+                try buf.appendSlice(self.arena, " {");
+                for (inst.info.fields, 0..) |f, i| {
+                    try buf.appendSlice(self.arena, if (i > 0) ", " else " ");
+                    try buf.appendSlice(self.arena, f.name);
+                    try buf.appendSlice(self.arena, ": ");
+                    try self.appendValue(buf, inst.fields.get(f.name) orelse .nil);
+                }
+                try buf.appendSlice(self.arena, " }");
+            },
         }
     }
 };
@@ -799,4 +971,105 @@ test "list index out of range is a runtime error" {
 
 test "a program with no main produces no output" {
     try expectOutput("const X: int = 1", "");
+}
+
+// classes and structs
+
+test "struct construction, field access, and member assignment" {
+    const src =
+        \\struct Point:
+        \\    var x: int = 0
+        \\    var y: int = 0
+        \\
+        \\func main():
+        \\    var p: Point = Point()
+        \\    p.x = 3
+        \\    p.y = 4
+        \\    print(p.x + p.y)
+    ;
+    try expectOutput(src, "7\n");
+}
+
+test "methods mutate fields via bare names" {
+    const src =
+        \\class Counter:
+        \\    var count: int = 0
+        \\
+        \\    func bump():
+        \\        count = count + 1
+        \\
+        \\    func get() -> int:
+        \\        return count
+        \\
+        \\func main():
+        \\    var c: Counter = Counter()
+        \\    c.bump()
+        \\    c.bump()
+        \\    c.bump()
+        \\    print(c.get())
+    ;
+    try expectOutput(src, "3\n");
+}
+
+test "init acts as a constructor" {
+    const src =
+        \\class Box:
+        \\    var w: int = 0
+        \\
+        \\    func init(width: int):
+        \\        w = width
+        \\
+        \\    func area() -> int:
+        \\        return w * w
+        \\
+        \\func main():
+        \\    var b: Box = Box(5)
+        \\    print(b.area())
+    ;
+    try expectOutput(src, "25\n");
+}
+
+test "a method calls a sibling method by bare name" {
+    const src =
+        \\class Calc:
+        \\    var base: int = 10
+        \\
+        \\    func double() -> int:
+        \\        return base * 2
+        \\
+        \\    func quad() -> int:
+        \\        return double() * 2
+        \\
+        \\func main():
+        \\    var c: Calc = Calc()
+        \\    print(c.quad())
+    ;
+    try expectOutput(src, "40\n");
+}
+
+test "instances print their fields in declaration order" {
+    const src =
+        \\struct Vec2:
+        \\    var x: int = 1
+        \\    var y: int = 2
+        \\
+        \\func main():
+        \\    print(Vec2())
+    ;
+    try expectOutput(src, "Vec2 { x: 1, y: 2 }\n");
+}
+
+test "accessing an unknown member is a runtime error" {
+    const src =
+        \\struct Empty:
+        \\    var a: int = 0
+        \\
+        \\func main():
+        \\    var e: Empty = Empty()
+        \\    print(e.missing)
+    ;
+    var result = try runSource(testing.allocator, src);
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "no member 'missing'") != null);
 }
