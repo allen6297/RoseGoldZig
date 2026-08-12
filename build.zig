@@ -135,13 +135,13 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    // Frontend unit tests. The lexer, parser, and analyzer live in their own
-    // files under src/fontend and are not reachable from the executable's tests,
-    // so they get a dedicated test target. Rooting it at analyzer.zig also covers
-    // parser.zig and lexer.zig, since the analyzer imports them.
+    // Frontend unit tests. The lexer, parser, analyzer, and interpreter live in
+    // their own files under src/fontend and are not reachable from the
+    // executable's tests, so they get a dedicated test target rooted at an
+    // aggregator that imports all of them.
     const frontend_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/fontend/analyzer.zig"),
+            .root_source_file = b.path("src/fontend/tests.zig"),
             .target = target,
             .optimize = optimize,
         }),

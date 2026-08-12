@@ -305,6 +305,12 @@ const Analyzer = struct {
     // --- declarations --------------------------------------------------------
 
     fn run(self: *Analyzer, module: Module) Error!void {
+        // Built-in functions provided by the interpreter. Typed `any` so calls
+        // to them are unconstrained (variadic `print`, etc.).
+        for ([_][]const u8{ "print", "echo", "len", "range" }) |name| {
+            try self.declareIn(self.module_scope, name, .function, .any, .{ .start = 0, .end = 0, .line = 0, .col = 0 });
+        }
+
         // Phase 1a: register every top-level name (so declarations may reference
         // one another regardless of order).
         for (module.decls) |decl| try self.registerTopLevel(decl);
@@ -823,7 +829,7 @@ test "for binding and match binding are in scope in their bodies" {
     const src =
         \\func run(items: any):
         \\    for it in items {
-        \\        echo(it)
+        \\        handle(it)
         \\    }
         \\
         \\func classify(x: int) -> str:
@@ -833,7 +839,7 @@ test "for binding and match binding are in scope in their bodies" {
     ;
     var analysis = try analyzeSource(testing.allocator, src);
     defer analysis.deinit();
-    // `echo` and `describe` are undefined; `it` and `n` must resolve.
+    // `handle` and `describe` are undefined; `it` and `n` must resolve.
     try testing.expectEqual(@as(usize, 2), analysis.diagnostics.len);
     for (analysis.diagnostics) |d| {
         try testing.expect(std.mem.indexOf(u8, d.message, "'it'") == null);

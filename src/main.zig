@@ -3,6 +3,7 @@ const Io = std.Io;
 const Lexer = @import("fontend/lexer.zig");
 const Parser = @import("fontend/parser.zig");
 const Analyzer = @import("fontend/analyzer.zig");
+const Interpreter = @import("fontend/interpreter.zig");
 
 const RoseGold_Zig = @import("RoseGold_Zig");
 
@@ -34,9 +35,39 @@ pub fn main(init: std.process.Init) !void {
 
     try parserDemo(arena, stdout_writer);
     try analyzerDemo(arena, stdout_writer);
+    try interpreterDemo(arena, stdout_writer);
 
     try stdout_writer.flush(); // Don't forget to flush!
 }
+
+/// Executes a small program and prints whatever it produces.
+fn interpreterDemo(gpa: std.mem.Allocator, out: *Io.Writer) !void {
+    var tree = try Parser.parse(gpa, interpreter_demo_source);
+    defer tree.deinit();
+    var result = try Interpreter.run(gpa, tree.module);
+    defer result.deinit();
+
+    try out.print("\n== interpreter demo ==\n", .{});
+    if (result.runtime_error) |e| {
+        try out.print("runtime error {d}:{d}: {s}\n", .{ e.line, e.col, e.message });
+    }
+    try out.print("{s}", .{result.output});
+}
+
+const interpreter_demo_source =
+    \\func fib(n: int) -> int:
+    \\    if n < 2:
+    \\        return n
+    \\    return fib(n - 1) + fib(n - 2)
+    \\
+    \\func main():
+    \\    print("fib(10) =", fib(10))
+    \\    var total: int = 0
+    \\    for i in range(5) {
+    \\        total = total + i
+    \\    }
+    \\    print("sum(0..4) =", total)
+;
 
 /// Runs the semantic analyzer over a small program with two deliberate mistakes
 /// — a type mismatch and an undefined reference — to show name resolution and
