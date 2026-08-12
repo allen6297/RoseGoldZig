@@ -20,7 +20,7 @@ uniform. See `examples/demo.rg` (single file) and `examples/app.rg` (imports
 zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
-zig build test                  # run every test (193 as of writing)
+zig build test                  # run every test (199 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -115,8 +115,10 @@ loader, then the analyzer and interpreter over the loaded module set.
   (including inherited members) with `private` reachable only inside its own
   type, that every path of a function with a concrete return type returns a
   value, and collection element types (a list/map literal's inferred element
-  types, list/map indexing result + index type, and `for`-binding types — all
-  element-aware but lenient on `any`/`unknown`).
+  types, list/map indexing result + index type, `for`-binding types, and the
+  collection builtins — `push`/`pop`/`keys`/`values`/`has`/`range` are typed
+  element-aware, e.g. `pop(list<T>) → T`, `keys(map<K,V>) → list<K>`, `push`/`has`
+  check the element/key — all lenient on `any`/`unknown`).
 - **Interpreter:** runs everything above. Classes/structs: `Name(...)` constructs (fields
   take defaults; a method named `init` is the constructor), inheritance is honored at
   runtime (inherited fields, method override, chained `init`). Enum cases are distinct
@@ -148,10 +150,10 @@ loader, then the analyzer and interpreter over the loaded module set.
 
 ### Known gaps / future work
 - No **static** class members at runtime (only enum cases via `Enum.CASE`).
-- Collection **element types are analyzer-only** and not runtime-enforced; the
-  `push`/`keys`/`values`/etc. builtins are still typed `any`, so they neither
-  consume nor produce element-typed results (e.g. `keys(m)` is `any`, not `list<K>`).
-  Element assignability is covariant (unsound under mutation, but matches the
-  lenient design).
+- Collection **element types are analyzer-only** and not runtime-enforced (values
+  stay dynamically typed). Element assignability is covariant (unsound under
+  mutation, but matches the lenient design). The element-aware builtins are
+  special-cased by name at their call sites rather than being first-class generic
+  signatures, so calling one indirectly (`var f = push`) falls back to `any`.
 - Module resolution has no **search path / package roots** and no cross-module type
   annotations (see **Modules → Limits**). `static` still parses unused.

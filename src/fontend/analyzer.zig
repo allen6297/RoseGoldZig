@@ -256,6 +256,9 @@ const SymbolKind = enum {
     variable,
     constant,
     function,
+    /// A built-in function (see `interpreter.builtin_names`); typed specially at
+    /// call sites since they are polymorphic/variadic.
+    builtin,
     class,
     struct_type,
     enum_type,
@@ -618,7 +621,7 @@ const Analyzer = struct {
         // Built-in functions provided by the interpreter. Typed `any` so calls
         // to them are unconstrained (variadic `print`, conversions, etc.).
         for (interpreter.builtin_names) |name| {
-            try self.declareIn(self.module_scope, name, .function, .any, .{ .start = 0, .end = 0, .line = 0, .col = 0 });
+            try self.declareIn(self.module_scope, name, .builtin, .any, .{ .start = 0, .end = 0, .line = 0, .col = 0 });
         }
 
         // Phase 1a: register every top-level name (so declarations may reference
@@ -1188,6 +1191,14 @@ const Analyzer = struct {
     }
 
     fn typeCall(self: *Analyzer, c: Expr.Call) Error!Type {
+        // Builtins are polymorphic (their result may depend on an argument's
+        // element type), so type them specially — but only when the name really
+        // resolves to the builtin and isn't shadowed by a local/param.
+        if (c.callee.* == .identifier) {
+            if (self.resolve(c.callee.identifier.name)) |sym| {
+                if (sym.kind == .builtin) return self.typeBuiltinCall(c.callee.identifier.name, c);
+            }
+        }
         const ct = try self.typeOf(c.callee.*);
         switch (ct) {
             .func => |sig| {
@@ -1212,6 +1223,63 @@ const Analyzer = struct {
                 return .unknown;
             },
         }
+    }
+
+    /// Type a call to a built-in. Every argument is typed (so nested expressions
+    /// are still checked); the result type and any element-type checks depend on
+    /// the specific builtin. Unknown/`any` arguments degrade to a lenient result.
+    fn typeBuiltinCall(self: *Analyzer, name: []const u8, c: Expr.Call) Error!Type {
+        const args = try self.arena.alloc(Type, c.args.len);
+        for (c.args, 0..) |arg, i| args[i] = try self.typeOf(arg.*);
+
+        const eq = std.mem.eql;
+        // print/echo are variadic; everything else has a fixed arity.
+        if (eq(u8, name, "print") or eq(u8, name, "echo")) return .unknown;
+
+        const arity: usize = if (eq(u8, name, "push") or eq(u8, name, "has")) 2 else 1;
+        if (c.args.len != arity) {
+            try self.report(c.span, "{s} expects {d} argument(s), got {d}", .{ name, arity, c.args.len });
+            // Still infer a plausible result type below (using whatever args exist).
+        }
+
+        if (eq(u8, name, "len")) return .int;
+        if (eq(u8, name, "str")) return .str;
+        if (eq(u8, name, "int")) return .int;
+        if (eq(u8, name, "float")) return .float;
+        if (eq(u8, name, "range")) {
+            if (args.len >= 1 and !isAnyish(args[0]) and tagOf(args[0]) != .int) {
+                try self.report(parser.exprSpan(c.args[0].*), "range expects an int, got {s}", .{typeName(args[0])});
+            }
+            return self.makeList(.int);
+        }
+        if (eq(u8, name, "push")) {
+            if (args.len == 2 and tagOf(args[0]) == .list) {
+                const elem = args[0].list.elem;
+                if (!self.assignable(args[1], elem)) {
+                    try self.report(parser.exprSpan(c.args[1].*), "cannot push {s} into {s}", .{ typeName(args[1]), typeName(args[0]) });
+                }
+            }
+            return .void;
+        }
+        if (eq(u8, name, "pop")) {
+            if (args.len == 1 and tagOf(args[0]) == .list) return args[0].list.elem;
+            return .unknown;
+        }
+        if (eq(u8, name, "keys")) {
+            if (args.len == 1 and tagOf(args[0]) == .map) return self.makeList(args[0].map.key);
+            return .unknown;
+        }
+        if (eq(u8, name, "values")) {
+            if (args.len == 1 and tagOf(args[0]) == .map) return self.makeList(args[0].map.value);
+            return .unknown;
+        }
+        if (eq(u8, name, "has")) {
+            if (args.len == 2 and tagOf(args[0]) == .map and !self.assignable(args[1], args[0].map.key)) {
+                try self.report(parser.exprSpan(c.args[1].*), "cannot look up {s} in {s}", .{ typeName(args[1]), typeName(args[0]) });
+            }
+            return .bool;
+        }
+        return .unknown;
     }
 
     fn typeIndex(self: *Analyzer, i: Expr.Index) Error!Type {
@@ -2405,6 +2473,75 @@ test "wrong arity on a generic type is reported" {
     var analysis = try analyzeSource(testing.allocator, "var xs: list<int, str> = []");
     defer analysis.deinit();
     try expectMessageContains(analysis, "list takes at most one type argument");
+}
+
+// element-aware builtins
+
+test "push checks the value against the list's element type" {
+    const src =
+        \\func main():
+        \\    var xs: list<int> = [1]
+        \\    push(xs, "s")
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot push str into list<int>");
+}
+
+test "pop returns the list's element type" {
+    const src =
+        \\func main():
+        \\    var xs: list<int> = [1]
+        \\    var s: str = pop(xs)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot assign int to str");
+}
+
+test "keys returns a list of the map's key type" {
+    const src =
+        \\func main():
+        \\    var m: map<str, int> = {"a": 1}
+        \\    var n: int = keys(m)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot assign list<str> to int");
+}
+
+test "has checks the key against the map's key type" {
+    const src =
+        \\func main():
+        \\    var m: map<str, int> = {"a": 1}
+        \\    var b: bool = has(m, 3)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot look up int in map<str, int>");
+}
+
+test "range produces a list of int" {
+    const src =
+        \\func main():
+        \\    for n in range(3):
+        \\        var s: str = n
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot assign int to str");
+}
+
+test "a local shadowing a builtin is not treated as the builtin" {
+    // `push` here is a parameter (type `any`), so the element check does not fire.
+    const src =
+        \\func f(push):
+        \\    var xs: list<int> = [1]
+        \\    push(xs, "s")
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
 }
 
 test "signal names are declared and their params checked" {
