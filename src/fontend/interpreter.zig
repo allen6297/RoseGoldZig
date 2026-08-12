@@ -46,7 +46,13 @@ const List = std.ArrayList(Value);
 const MapEntry = struct { key: Value, value: Value };
 const Map = struct { entries: std.ArrayList(MapEntry) = .empty };
 
-const Builtin = enum { print, echo, len, range };
+const Builtin = enum { print, echo, len, range, str, int, float, push, pop, keys, values, has };
+
+/// The names bound to each builtin. Shared with the analyzer (see analyzer.zig)
+/// so a program using them both analyzes and runs.
+pub const builtin_names = [_][]const u8{
+    "print", "echo", "len", "range", "str", "int", "float", "push", "pop", "keys", "values", "has",
+};
 
 /// A field declared on a class/struct, with its default-value expression.
 const FieldDef = struct { name: []const u8, value: ?*const Expr };
@@ -441,10 +447,9 @@ const Interpreter = struct {
     }
 
     fn registerBuiltins(self: *Interpreter) Error!void {
-        try self.define(self.globals, "print", .{ .builtin = .print });
-        try self.define(self.globals, "echo", .{ .builtin = .echo });
-        try self.define(self.globals, "len", .{ .builtin = .len });
-        try self.define(self.globals, "range", .{ .builtin = .range });
+        inline for (builtin_names, 0..) |name, i| {
+            try self.define(self.globals, name, .{ .builtin = @enumFromInt(i) });
+        }
     }
 
     // --- statements ----------------------------------------------------------
@@ -663,6 +668,61 @@ const Interpreter = struct {
                 var i: i64 = 0;
                 while (i < n) : (i += 1) try l.append(self.arena, .{ .int = i });
                 return .{ .list = l };
+            },
+            .str => {
+                if (args.len != 1) return self.fail(span, "str expects 1 argument", .{});
+                var buf: std.ArrayList(u8) = .empty;
+                try self.appendValue(&buf, args[0]);
+                return .{ .str = try buf.toOwnedSlice(self.arena) };
+            },
+            .int => {
+                if (args.len != 1) return self.fail(span, "int expects 1 argument", .{});
+                switch (args[0]) {
+                    .int => |n| return .{ .int = n },
+                    .bool => |bo| return .{ .int = if (bo) 1 else 0 },
+                    .float => |f| {
+                        if (!std.math.isFinite(f) or f >= 9223372036854775808.0 or f < -9223372036854775808.0) {
+                            return self.fail(span, "cannot convert {d} to int", .{f});
+                        }
+                        return .{ .int = @intFromFloat(f) };
+                    },
+                    .str => |s| return .{ .int = std.fmt.parseInt(i64, s, 10) catch return self.fail(span, "cannot parse '{s}' as int", .{s}) },
+                    else => return self.fail(span, "cannot convert {s} to int", .{@tagName(args[0])}),
+                }
+            },
+            .float => {
+                if (args.len != 1) return self.fail(span, "float expects 1 argument", .{});
+                switch (args[0]) {
+                    .int => |n| return .{ .float = @floatFromInt(n) },
+                    .float => |f| return .{ .float = f },
+                    .str => |s| return .{ .float = std.fmt.parseFloat(f64, s) catch return self.fail(span, "cannot parse '{s}' as float", .{s}) },
+                    else => return self.fail(span, "cannot convert {s} to float", .{@tagName(args[0])}),
+                }
+            },
+            .push => {
+                if (args.len != 2 or args[0] != .list) return self.fail(span, "push expects a list and a value", .{});
+                try args[0].list.append(self.arena, args[1]);
+                return .nil;
+            },
+            .pop => {
+                if (args.len != 1 or args[0] != .list) return self.fail(span, "pop expects a list", .{});
+                return args[0].list.pop() orelse self.fail(span, "pop from an empty list", .{});
+            },
+            .keys, .values => {
+                if (args.len != 1 or args[0] != .map) return self.fail(span, "{s} expects a map", .{@tagName(b)});
+                const l = try self.arena.create(List);
+                l.* = .empty;
+                for (args[0].map.entries.items) |entry| {
+                    try l.append(self.arena, if (b == .keys) entry.key else entry.value);
+                }
+                return .{ .list = l };
+            },
+            .has => {
+                if (args.len != 2 or args[0] != .map) return self.fail(span, "has expects a map and a key", .{});
+                for (args[0].map.entries.items) |entry| {
+                    if (valuesEqual(entry.key, args[1])) return .{ .bool = true };
+                }
+                return .{ .bool = false };
             },
         }
     }
@@ -1212,6 +1272,50 @@ test "maps: literal and index" {
 
 test "float arithmetic" {
     try expectOutput("func main():\n    print(3.0 / 2.0)", "1.5\n");
+}
+
+// stdlib builtins
+
+test "str, int, and float conversions" {
+    const src =
+        \\func main():
+        \\    print(str(42))
+        \\    print(int("100") + 1)
+        \\    print(int(3.9))
+        \\    print(float(2))
+    ;
+    try expectOutput(src, "42\n101\n3\n2\n");
+}
+
+test "list push and pop" {
+    const src =
+        \\func main():
+        \\    var xs = [1, 2]
+        \\    push(xs, 3)
+        \\    print(xs)
+        \\    print(pop(xs))
+        \\    print(xs)
+    ;
+    try expectOutput(src, "[1, 2, 3]\n3\n[1, 2]\n");
+}
+
+test "map keys, values, and has" {
+    const src =
+        \\func main():
+        \\    var m = {"a": 1, "b": 2}
+        \\    print(keys(m))
+        \\    print(values(m))
+        \\    print(has(m, "a"))
+        \\    print(has(m, "z"))
+    ;
+    try expectOutput(src, "[a, b]\n[1, 2]\ntrue\nfalse\n");
+}
+
+test "pop from an empty list is a runtime error" {
+    var result = try runSource(testing.allocator, "func main():\n    var xs = []\n    print(pop(xs))");
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "empty list") != null);
 }
 
 test "logical operators short-circuit" {

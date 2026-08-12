@@ -34,6 +34,7 @@
 const std = @import("std");
 const parser = @import("parser.zig");
 const lexer = @import("lexer.zig");
+const interpreter = @import("interpreter.zig"); // for the shared builtin_names list
 
 const Module = parser.Module;
 const Decl = parser.Decl;
@@ -526,8 +527,8 @@ const Analyzer = struct {
 
     fn run(self: *Analyzer, module: Module) Error!void {
         // Built-in functions provided by the interpreter. Typed `any` so calls
-        // to them are unconstrained (variadic `print`, etc.).
-        for ([_][]const u8{ "print", "echo", "len", "range" }) |name| {
+        // to them are unconstrained (variadic `print`, conversions, etc.).
+        for (interpreter.builtin_names) |name| {
             try self.declareIn(self.module_scope, name, .function, .any, .{ .start = 0, .end = 0, .line = 0, .col = 0 });
         }
 

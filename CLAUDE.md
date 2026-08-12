@@ -107,7 +107,9 @@ there are no upward dependencies.
 - **Interpreter:** runs everything above. Classes/structs: `Name(...)` constructs (fields
   take defaults; a method named `init` is the constructor), inheritance is honored at
   runtime (inherited fields, method override, chained `init`). Enum cases are distinct
-  values printing as `Enum.CASE`. Builtins: `print`, `echo`, `len`, `range`.
+  values printing as `Enum.CASE`. Builtins (`interpreter.builtin_names`, shared with
+  the analyzer): `print`, `echo`, `len`, `range`, `str`, `int`, `float`, `push`, `pop`,
+  `keys`, `values`, `has`.
 
 ### Known gaps / future work
 - **Top-level** `pub`/`private` isn't enforced (needs a module system); only
