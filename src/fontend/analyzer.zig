@@ -18,10 +18,11 @@
 //! another regardless of order.
 //!
 //! Member access resolves to field/method types on a class or struct instance
-//! (`v.x`, `c.get()`), and unknown members are reported.
+//! (`v.x`, `c.get()`), and unknown members are reported. `extends`/`uses` names
+//! are validated and a subclass is assignable to any of its ancestors.
 //!
-//! Not yet done (future work): enum-case / static member access (`Status.OK`),
-//! element-typed lists/maps, and inheritance-aware assignability.
+//! Not yet done (future work): static member access on classes, and
+//! element-typed lists/maps.
 //!
 //! Diagnostics are self-contained — messages are formatted into the returned
 //! arena — so an `Analysis` may outlive the `Tree` it was built from.
@@ -97,23 +98,8 @@ fn isBoolish(t: Type) bool {
 }
 
 /// Whether a value of type `from` may be used where `to` is expected.
-fn assignable(from: Type, to: Type) bool {
-    if (isAnyish(from) or isAnyish(to)) return true;
-    // A bare type reference used as a value is unusual; stay lenient.
-    if (tagOf(from) == .enum_ref or tagOf(to) == .enum_ref) return true;
-    return switch (from) {
-        .int => tagOf(to) == .int or tagOf(to) == .float, // int widens to float
-        .float => tagOf(to) == .float,
-        .str => tagOf(to) == .str,
-        .bool => tagOf(to) == .bool,
-        .void => tagOf(to) == .void,
-        .list => tagOf(to) == .list,
-        .map => tagOf(to) == .map,
-        .func => tagOf(to) == .func,
-        .named => |n| tagOf(to) == .named and std.mem.eql(u8, n, to.named),
-        .any, .unknown, .enum_ref => true,
-    };
-}
+// `assignable` is a method on Analyzer (see below) so it can consult the
+// inheritance graph; `named` types use it.
 
 fn typeName(t: Type) []const u8 {
     return switch (t) {
@@ -197,6 +183,8 @@ const Scope = struct {
     symbols: std.StringHashMapUnmanaged(Symbol) = .{},
 };
 
+const NameSet = std.StringHashMapUnmanaged(void);
+
 // --- result ------------------------------------------------------------------
 
 pub const Analysis = struct {
@@ -244,6 +232,10 @@ const Analyzer = struct {
     /// Case scope of each enum, keyed by enum name, so `Enum.CASE` can be
     /// validated. Built before any body is analyzed.
     enum_types: std.StringHashMapUnmanaged(*Scope) = .{},
+    /// Direct `extends`/`uses` targets of each class, and the transitive set of
+    /// all supertypes, so a subclass is assignable to any of its ancestors.
+    direct_supers: std.StringHashMapUnmanaged([]const []const u8) = .{},
+    supertypes: std.StringHashMapUnmanaged(*NameSet) = .{},
 
     fn report(self: *Analyzer, span: Span, comptime fmt: []const u8, args: anytype) Error!void {
         const msg = try std.fmt.allocPrint(self.arena, fmt, args);
@@ -313,6 +305,83 @@ const Analyzer = struct {
         return sig;
     }
 
+    fn isClass(self: *Analyzer, name: []const u8) bool {
+        if (self.module_scope.symbols.get(name)) |sym| return sym.kind == .class;
+        return false;
+    }
+
+    /// Whether `sub` is `base` or transitively extends/uses it.
+    fn isSubtype(self: *Analyzer, sub: []const u8, base: []const u8) bool {
+        if (std.mem.eql(u8, sub, base)) return true;
+        if (self.supertypes.get(sub)) |set| return set.contains(base);
+        return false;
+    }
+
+    /// Whether a value of type `from` may be used where `to` is expected.
+    /// `named` types honor inheritance: a subclass is assignable to its bases.
+    fn assignable(self: *Analyzer, from: Type, to: Type) bool {
+        if (isAnyish(from) or isAnyish(to)) return true;
+        // A bare type reference used as a value is unusual; stay lenient.
+        if (tagOf(from) == .enum_ref or tagOf(to) == .enum_ref) return true;
+        return switch (from) {
+            .int => tagOf(to) == .int or tagOf(to) == .float, // int widens to float
+            .float => tagOf(to) == .float,
+            .str => tagOf(to) == .str,
+            .bool => tagOf(to) == .bool,
+            .void => tagOf(to) == .void,
+            .list => tagOf(to) == .list,
+            .map => tagOf(to) == .map,
+            .func => tagOf(to) == .func,
+            .named => |n| tagOf(to) == .named and self.isSubtype(n, to.named),
+            .any, .unknown, .enum_ref => true,
+        };
+    }
+
+    /// Validate every class's `extends`/`uses` targets and compute the transitive
+    /// set of supertypes for each class.
+    fn buildInheritance(self: *Analyzer, module: Module) Error!void {
+        // Pass 1: validate and record the direct supertypes of each class.
+        for (module.decls) |decl| switch (decl) {
+            .class => |c| {
+                var supers: std.ArrayList([]const u8) = .empty;
+                if (c.extends) |base| {
+                    if (self.isClass(base.name)) {
+                        try supers.append(self.arena, base.name);
+                    } else {
+                        try self.report(base.span, "unknown base class '{s}'", .{base.name});
+                    }
+                }
+                for (c.uses) |trait| {
+                    if (self.isClass(trait.name)) {
+                        try supers.append(self.arena, trait.name);
+                    } else {
+                        try self.report(trait.span, "unknown trait '{s}'", .{trait.name});
+                    }
+                }
+                try self.direct_supers.put(self.arena, c.name, try supers.toOwnedSlice(self.arena));
+            },
+            else => {},
+        };
+        // Pass 2: transitive closure over the direct supertypes.
+        for (module.decls) |decl| switch (decl) {
+            .class => |c| {
+                const set = try self.arena.create(NameSet);
+                set.* = .{};
+                try self.collectSupers(c.name, set);
+                try self.supertypes.put(self.arena, c.name, set);
+            },
+            else => {},
+        };
+    }
+
+    fn collectSupers(self: *Analyzer, name: []const u8, into: *NameSet) Error!void {
+        const direct = self.direct_supers.get(name) orelse return;
+        for (direct) |s| {
+            const gop = try into.getOrPut(self.arena, s);
+            if (!gop.found_existing) try self.collectSupers(s, into);
+        }
+    }
+
     // --- declarations --------------------------------------------------------
 
     fn run(self: *Analyzer, module: Module) Error!void {
@@ -339,6 +408,8 @@ const Analyzer = struct {
             .enum_decl => |en| try self.buildEnumType(en.name, en.members),
             else => {},
         };
+        // Validate extends/uses and compute the class hierarchy.
+        try self.buildInheritance(module);
         // Phase 2: analyze bodies.
         for (module.decls) |decl| try self.analyzeDecl(decl);
     }
@@ -399,7 +470,7 @@ const Analyzer = struct {
 
         if (declared) |dt| {
             if (value_ty) |vt| {
-                if (!assignable(vt, dt)) {
+                if (!self.assignable(vt, dt)) {
                     try self.report(parser.exprSpan(x.value.?.*), "cannot assign {s} to {s}", .{ typeName(vt), typeName(dt) });
                 }
             }
@@ -557,7 +628,7 @@ const Analyzer = struct {
             .assign => |x| {
                 const tt = try self.typeOf(x.target.*);
                 const vt = try self.typeOf(x.value.*);
-                if (!assignable(vt, tt)) {
+                if (!self.assignable(vt, tt)) {
                     try self.report(x.span, "cannot assign {s} to {s}", .{ typeName(vt), typeName(tt) });
                 }
             },
@@ -576,7 +647,7 @@ const Analyzer = struct {
             const vt = try self.typeOf(v.*);
             if (tagOf(ret) == .void) {
                 try self.report(r.span, "returning a value from a function declared to return void", .{});
-            } else if (!assignable(vt, ret)) {
+            } else if (!self.assignable(vt, ret)) {
                 try self.report(r.span, "cannot return {s} from a function returning {s}", .{ typeName(vt), typeName(ret) });
             }
         } else if (!isAnyish(ret) and tagOf(ret) != .void) {
@@ -657,7 +728,7 @@ const Analyzer = struct {
                 return .unknown;
             },
             .eq, .ne => {
-                if (!(isAnyish(lt) or isAnyish(rt) or assignable(lt, rt) or assignable(rt, lt))) {
+                if (!(isAnyish(lt) or isAnyish(rt) or self.assignable(lt, rt) or self.assignable(rt, lt))) {
                     try self.report(b.span, "cannot compare {s} and {s}", .{ typeName(lt), typeName(rt) });
                 }
                 return .bool;
@@ -693,7 +764,7 @@ const Analyzer = struct {
                 }
                 for (c.args, 0..) |arg, i| {
                     const at = try self.typeOf(arg.*);
-                    if (i < sig.params.len and !assignable(at, sig.params[i])) {
+                    if (i < sig.params.len and !self.assignable(at, sig.params[i])) {
                         try self.report(parser.exprSpan(arg.*), "argument {d}: cannot pass {s} where {s} is expected", .{ i + 1, typeName(at), typeName(sig.params[i]) });
                     }
                 }
@@ -1171,6 +1242,105 @@ test "member field type flows into type checking" {
     var analysis = try analyzeSource(testing.allocator, src);
     defer analysis.deinit();
     try expectMessageContains(analysis, "cannot return int");
+}
+
+// inheritance
+
+test "a subclass is assignable to its base" {
+    const src =
+        \\class Animal:
+        \\    var legs: int = 4
+        \\
+        \\class Cat extends Animal:
+        \\    var lives: int = 9
+        \\
+        \\func describe(a: Animal) -> int:
+        \\    return a.legs
+        \\
+        \\func run(c: Cat) -> int:
+        \\    return describe(c)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a base is not assignable to a subclass" {
+    const src =
+        \\class Animal:
+        \\    var legs: int = 4
+        \\
+        \\class Cat extends Animal:
+        \\    var lives: int = 9
+        \\
+        \\func pet(c: Cat) -> int:
+        \\    return c.lives
+        \\
+        \\func run(a: Animal) -> int:
+        \\    return pet(a)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot pass Animal where Cat is expected");
+}
+
+test "assignability follows the transitive hierarchy" {
+    const src =
+        \\class A:
+        \\    var x: int = 0
+        \\class B extends A:
+        \\    var y: int = 0
+        \\class C extends B:
+        \\    var z: int = 0
+        \\
+        \\func take_a(a: A) -> int:
+        \\    return 0
+        \\
+        \\func run(c: C) -> int:
+        \\    return take_a(c)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a used trait makes the class assignable to it" {
+    const src =
+        \\class Damageable:
+        \\    var hp: int = 0
+        \\
+        \\class Player uses Damageable:
+        \\    var name: str = ""
+        \\
+        \\func hit(d: Damageable) -> int:
+        \\    return d.hp
+        \\
+        \\func run(p: Player) -> int:
+        \\    return hit(p)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "an unknown base class is reported" {
+    const src =
+        \\class Cat extends Missing:
+        \\    var lives: int = 9
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "unknown base class 'Missing'");
+}
+
+test "an unknown trait is reported" {
+    const src =
+        \\class Player uses Flyable:
+        \\    var name: str = ""
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "unknown trait 'Flyable'");
 }
 
 test "member access on a class instance is typed" {

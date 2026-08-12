@@ -179,8 +179,8 @@ pub const Decl = union(enum) {
     pub const Class = struct {
         visibility: Visibility,
         name: []const u8,
-        extends: ?[]const u8,
-        uses: []const []const u8,
+        extends: ?TypeRef,
+        uses: []const TypeRef,
         members: []const Decl,
         span: Span,
     };
@@ -507,16 +507,16 @@ const Parser = struct {
     fn parseClass(self: *Parser, visibility: Visibility) Error!Decl.Class {
         const kw = try self.expect(.kw_class, "expected 'class'");
         const name = try self.expect(.identifier, "expected a class name");
-        var extends: ?[]const u8 = null;
+        var extends: ?TypeRef = null;
         if (self.eat(.kw_extends)) {
             const base = try self.expect(.identifier, "expected a base class name after 'extends'");
-            extends = base.text;
+            extends = .{ .name = base.text, .span = base.span };
         }
-        var uses: std.ArrayList([]const u8) = .empty;
+        var uses: std.ArrayList(TypeRef) = .empty;
         if (self.eat(.kw_uses)) {
             while (true) {
                 const trait = try self.expect(.identifier, "expected a trait name after 'uses'");
-                try uses.append(self.alloc, trait.text);
+                try uses.append(self.alloc, .{ .name = trait.text, .span = trait.span });
                 if (!self.eat(.comma)) break;
             }
         }
@@ -1180,9 +1180,9 @@ test "parses a class with methods, for loop, and if/else" {
     try testing.expect(std.meta.activeTag(d) == .class);
     const c = d.class;
     try testing.expectEqualStrings("Player", c.name);
-    try testing.expectEqualStrings("Entity", c.extends.?);
+    try testing.expectEqualStrings("Entity", c.extends.?.name);
     try testing.expectEqual(@as(usize, 1), c.uses.len);
-    try testing.expectEqualStrings("Damageable", c.uses[0]);
+    try testing.expectEqualStrings("Damageable", c.uses[0].name);
     try testing.expectEqual(@as(usize, 2), c.members.len);
 
     try testing.expect(std.meta.activeTag(c.members[0]) == .var_decl);
