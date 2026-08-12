@@ -885,6 +885,11 @@ const Interpreter = struct {
             .float_literal => |lit| .{ .float = std.fmt.parseFloat(f64, lit.text) catch return self.fail(lit.span, "invalid float '{s}'", .{lit.text}) },
             .string_literal => |lit| .{ .str = try self.unquote(lit.text) },
             .bool_literal => |b| .{ .bool = b.value },
+            .enum_case => |ec| blk: {
+                const ev = try self.arena.create(EnumValue);
+                ev.* = .{ .type_name = ec.enum_name, .member = ec.case };
+                break :blk .{ .enum_value = ev };
+            },
             else => .nil,
         };
     }
@@ -1140,6 +1145,23 @@ test "an optional-returning function and nil checks" {
         \\        print("none")
     ;
     try expectOutput(src, "found 5\nnone\n");
+}
+
+test "match dispatches on enum cases" {
+    const src =
+        \\enum Suit { HEARTS, SPADES }
+        \\
+        \\func color(s: Suit) -> str:
+        \\    return match s {
+        \\        Suit.HEARTS: "red"
+        \\        Suit.SPADES: "black"
+        \\    }
+        \\
+        \\func main():
+        \\    print(color(Suit.HEARTS))
+        \\    print(color(Suit.SPADES))
+    ;
+    try expectOutput(src, "red\nblack\n");
 }
 
 test "match expression selects the right arm" {

@@ -89,7 +89,8 @@ there are no upward dependencies.
 - **Expressions:** literals (incl. `nil`), identifiers, `and`/`or`/`not`,
   arithmetic/comparison with precedence, calls, indexing `a[i]`, member access `x.f`,
   array `[...]` and map `{k: v}` literals, and `match subj { pattern: body, ... }`
-  (patterns: literals, `_`, binding).
+  (patterns: literals, `_`, a binding name, or an enum case `Enum.CASE` — covering
+  every case is exhaustive without a `_`).
 - **Types:** `int`, `float`, `str`, `bool`, `void`, `any`, `list`, `map`, plus user
   classes/structs/enums, and optionals `?T` (hold `T` or `nil`). `int` widens to `float`.
   A subclass is assignable to its bases (via `extends`/`uses`, transitively). `nil` and a

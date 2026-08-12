@@ -1066,11 +1066,14 @@ const Analyzer = struct {
     fn typeMatch(self: *Analyzer, m: Expr.Match) Error!Type {
         const subject = try self.typeOf(m.subject.*);
 
-        // A `_` or binding pattern matches everything; otherwise the only way to
-        // be exhaustive is a bool subject with both `true` and `false` covered.
+        // A `_` or binding pattern matches everything; a bool subject is
+        // exhaustive when both `true`/`false` appear; an enum subject is
+        // exhaustive when every case is covered.
         var has_catch_all = false;
         var covers_true = false;
         var covers_false = false;
+        const subject_enum: ?[]const u8 = if (tagOf(subject) == .named and self.enum_types.contains(subject.named)) subject.named else null;
+        var covered: NameSet = .{};
         // The match's value is the least upper bound of its arms' bodies.
         var result: ?Type = null;
         var incompatible = false;
@@ -1084,6 +1087,7 @@ const Analyzer = struct {
                 .bool_literal => |b| {
                     if (b.value) covers_true = true else covers_false = true;
                 },
+                .enum_case => |ec| try self.checkEnumCasePattern(ec, subject, subject_enum, &covered),
                 else => {},
             }
 
@@ -1108,7 +1112,8 @@ const Analyzer = struct {
         }
 
         const bool_exhaustive = tagOf(subject) == .bool and covers_true and covers_false;
-        if (!has_catch_all and !bool_exhaustive) {
+        const enum_exhaustive = self.allCasesCovered(subject_enum, covered);
+        if (!has_catch_all and !bool_exhaustive and !enum_exhaustive) {
             try self.report(m.span, "match is not exhaustive; add a '_' case", .{});
         }
         if (incompatible) {
@@ -1116,6 +1121,39 @@ const Analyzer = struct {
             return .unknown;
         }
         return result orelse .unknown;
+    }
+
+    /// Validate an `Enum.CASE` pattern against the match subject, recording the
+    /// case as covered when it belongs to the subject's enum.
+    fn checkEnumCasePattern(self: *Analyzer, ec: Pattern.EnumCase, subject: Type, subject_enum: ?[]const u8, covered: *NameSet) Error!void {
+        const scope = self.enum_types.get(ec.enum_name) orelse {
+            try self.report(ec.span, "unknown enum '{s}'", .{ec.enum_name});
+            return;
+        };
+        if (!scope.symbols.contains(ec.case)) {
+            try self.report(ec.span, "enum '{s}' has no case '{s}'", .{ ec.enum_name, ec.case });
+            return;
+        }
+        if (subject_enum) |se| {
+            if (!std.mem.eql(u8, se, ec.enum_name)) {
+                try self.report(ec.span, "pattern '{s}.{s}' does not match a subject of type '{s}'", .{ ec.enum_name, ec.case, se });
+                return;
+            }
+            try covered.put(self.arena, ec.case, {});
+        } else if (!isAnyish(subject)) {
+            try self.report(ec.span, "cannot match an enum case against {s}", .{typeName(subject)});
+        }
+    }
+
+    /// Whether every case of `subject_enum` appears in `covered`.
+    fn allCasesCovered(self: *Analyzer, subject_enum: ?[]const u8, covered: NameSet) bool {
+        const se = subject_enum orelse return false;
+        const scope = self.enum_types.get(se) orelse return false;
+        var it = scope.symbols.keyIterator();
+        while (it.next()) |case| {
+            if (!covered.contains(case.*)) return false;
+        }
+        return true;
     }
 };
 
@@ -1534,6 +1572,84 @@ test "a nil check narrows the optional in the else-branch" {
     var a = try analyzeSource(testing.allocator, src);
     defer a.deinit();
     try testing.expectEqual(@as(usize, 0), a.diagnostics.len);
+}
+
+// enum patterns
+
+test "covering every enum case is exhaustive without a wildcard" {
+    const src =
+        \\enum Status { OK, NOT_FOUND }
+        \\
+        \\func label(s: Status) -> str:
+        \\    return match s {
+        \\        Status.OK: "ok"
+        \\        Status.NOT_FOUND: "missing"
+        \\    }
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 0), a.diagnostics.len);
+}
+
+test "a missing enum case is not exhaustive" {
+    const src =
+        \\enum Status { OK, NOT_FOUND, ERROR }
+        \\
+        \\func label(s: Status) -> str:
+        \\    return match s {
+        \\        Status.OK: "ok"
+        \\        Status.NOT_FOUND: "missing"
+        \\    }
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try expectMessageContains(a, "not exhaustive");
+}
+
+test "an unknown enum case in a pattern is reported" {
+    const src =
+        \\enum Status { OK, NOT_FOUND }
+        \\
+        \\func f(s: Status) -> str:
+        \\    return match s {
+        \\        Status.BLUE: "x"
+        \\        _: "y"
+        \\    }
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try expectMessageContains(a, "has no case 'BLUE'");
+}
+
+test "an enum-case pattern for the wrong enum is reported" {
+    const src =
+        \\enum Status { OK }
+        \\enum Color { RED }
+        \\
+        \\func f(s: Status) -> str:
+        \\    return match s {
+        \\        Color.RED: "x"
+        \\        _: "y"
+        \\    }
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try expectMessageContains(a, "does not match a subject of type 'Status'");
+}
+
+test "an enum-case pattern against a non-enum subject is reported" {
+    const src =
+        \\enum Status { OK }
+        \\
+        \\func f(n: int) -> str:
+        \\    return match n {
+        \\        Status.OK: "x"
+        \\        _: "y"
+        \\    }
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try expectMessageContains(a, "cannot match an enum case against int");
 }
 
 // match result type

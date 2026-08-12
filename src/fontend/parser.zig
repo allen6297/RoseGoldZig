@@ -10,7 +10,8 @@
 //!     statements
 //!   * expressions: literals (incl. `nil`), identifiers, member access, calls,
 //!     indexing, array/map literals, unary `-`/`not`, arithmetic/comparison/
-//!     logical operators with precedence, and `match`
+//!     logical operators with precedence, and `match` (patterns: literals, `_`,
+//!     a binding name, or an enum case `Enum.CASE`)
 //!   * types may be optional: `?T` holds a value of type `T` or `nil`
 //!
 //! Layout: colon-blocks are delimited by INDENT/DEDENT, brace-blocks by
@@ -111,6 +112,9 @@ pub const Pattern = union(enum) {
     string_literal: Expr.Literal,
     bool_literal: Expr.Bool,
     binding: Expr.Ident,
+    enum_case: EnumCase,
+
+    pub const EnumCase = struct { enum_name: []const u8, case: []const u8, span: Span };
 };
 
 pub const VarDecl = struct {
@@ -243,6 +247,7 @@ fn patternSpan(p: Pattern) Span {
         .int_literal, .float_literal, .string_literal => |lit| lit.span,
         .bool_literal => |b| b.span,
         .binding => |id| id.span,
+        .enum_case => |ec| ec.span,
     };
 }
 
@@ -983,8 +988,13 @@ const Parser = struct {
                 return .{ .bool_literal = .{ .value = false, .span = t.span } };
             },
             .identifier => {
-                _ = self.advance();
-                return .{ .binding = .{ .name = t.text, .span = t.span } };
+                const first = self.advance();
+                // `Enum.CASE` is an enum-case pattern; a bare name is a binding.
+                if (self.eat(.dot)) {
+                    const case = try self.expect(.identifier, "expected an enum case after '.'");
+                    return .{ .enum_case = .{ .enum_name = first.text, .case = case.text, .span = spanFrom(first, case) } };
+                }
+                return .{ .binding = .{ .name = first.text, .span = first.span } };
             },
             else => {
                 try self.err("expected a pattern");
@@ -1137,6 +1147,26 @@ test "parses an enum body" {
     try testing.expectEqual(@as(usize, 2), d.enum_decl.members.len);
     try testing.expectEqualStrings("OK", d.enum_decl.members[0].name);
     try testing.expectEqualStrings("NOT_FOUND", d.enum_decl.members[1].name);
+}
+
+test "parses enum-case patterns in match" {
+    const src =
+        \\func name(s: Status) -> str:
+        \\    return match s {
+        \\        Status.OK: "ok"
+        \\        n: "other"
+        \\    }
+    ;
+    var tree = try parse(testing.allocator, src);
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const arms = tree.module.decls[0].func.body[0].return_stmt.value.?.match.arms;
+    try testing.expectEqual(@as(usize, 2), arms.len);
+    try testing.expect(std.meta.activeTag(arms[0].pattern) == .enum_case);
+    try testing.expectEqualStrings("Status", arms[0].pattern.enum_case.enum_name);
+    try testing.expectEqualStrings("OK", arms[0].pattern.enum_case.case);
+    try testing.expect(std.meta.activeTag(arms[1].pattern) == .binding);
 }
 
 test "parses a function with a match expression" {
