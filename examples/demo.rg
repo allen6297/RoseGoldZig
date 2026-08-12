@@ -29,7 +29,6 @@ func main():
     print("fib(10) =", fib(10))
 
     var total: int = 0
-    for n in range(6) {
+    for n in range(6):
         total = total + n
-    }
     print("sum 0..5 =", total)

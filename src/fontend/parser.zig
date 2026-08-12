@@ -615,25 +615,6 @@ const Parser = struct {
         return try decls.toOwnedSlice(self.alloc);
     }
 
-    fn parseBraceStmtBlock(self: *Parser) Error![]const Stmt {
-        _ = try self.expect(.l_brace, "expected '{' to open a block");
-        self.skipNewlines();
-        var stmts: std.ArrayList(Stmt) = .empty;
-        while (!self.at(.r_brace) and !self.atEnd()) {
-            const s = self.parseStmt() catch |e| switch (e) {
-                error.ParseError => {
-                    self.recover();
-                    continue;
-                },
-                else => return e,
-            };
-            try stmts.append(self.alloc, s);
-            self.skipNewlines();
-        }
-        _ = try self.expect(.r_brace, "expected '}' to close the block");
-        return try stmts.toOwnedSlice(self.alloc);
-    }
-
     // --- statements ----------------------------------------------------------
 
     fn parseStmt(self: *Parser) Error!Stmt {
@@ -705,7 +686,7 @@ const Parser = struct {
         const binding = try self.expect(.identifier, "expected a loop variable after 'for'");
         _ = try self.expect(.kw_in, "expected 'in' after the loop variable");
         const iter = try self.parseExpr();
-        const body = try self.parseBraceStmtBlock();
+        const body = try self.parseColonStmtBlock();
         return .{
             .binding = binding.text,
             .iter = iter,
@@ -1164,9 +1145,8 @@ test "parses a class with methods, for loop, and if/else" {
         \\    var health: int = 100
         \\
         \\    pub func take_damage(amount: int) -> bool:
-        \\        for effect in active_effects {
+        \\        for effect in active_effects:
         \\            effect.tick()
-        \\        }
         \\        if health <= 0:
         \\            return true
         \\        else:
@@ -1326,9 +1306,8 @@ test "enum members without values still parse" {
 test "index and call chain in a for body" {
     const src =
         \\pub func run():
-        \\    for i in items {
+        \\    for i in items:
         \\        handlers[i].fire()
-        \\    }
     ;
     var tree = try parse(testing.allocator, src);
     defer tree.deinit();

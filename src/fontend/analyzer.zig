@@ -1057,9 +1057,8 @@ test "functions may reference each other regardless of order" {
 test "for binding and match binding are in scope in their bodies" {
     const src =
         \\func run(items: any):
-        \\    for it in items {
+        \\    for it in items:
         \\        handle(it)
-        \\    }
         \\
         \\func classify(x: int) -> str:
         \\    return match x {

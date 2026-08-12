@@ -1011,9 +1011,8 @@ test "for over range" {
     const src =
         \\func main():
         \\    var total: int = 0
-        \\    for x in range(4) {
+        \\    for x in range(4):
         \\        total = total + x
-        \\    }
         \\    print(total)
     ;
     try expectOutput(src, "6\n");
