@@ -64,6 +64,19 @@ const Optional = struct {
     name: []const u8,
 };
 
+/// A `list<T>`, carrying its element type and a pre-formatted name.
+const ListType = struct {
+    elem: Type,
+    name: []const u8,
+};
+
+/// A `map<K, V>`, carrying its key/value types and a pre-formatted name.
+const MapType = struct {
+    key: Type,
+    value: Type,
+    name: []const u8,
+};
+
 /// An inferred type. `unknown` marks something we couldn't determine (usually
 /// downstream of another error) and `any` is an explicit escape hatch; both are
 /// compatible with everything so they suppress cascading diagnostics. Lists and
@@ -76,8 +89,10 @@ const Type = union(enum) {
     str,
     bool,
     void,
-    list,
-    map,
+    /// A `list<T>` (element type tracked).
+    list: *const ListType,
+    /// A `map<K, V>` (key/value types tracked).
+    map: *const MapType,
     named: []const u8,
     func: *const FuncSig,
     /// A reference to an enum type itself (e.g. `Status` in `Status.OK`), as
@@ -129,8 +144,8 @@ fn typeName(t: Type) []const u8 {
         .str => "str",
         .bool => "bool",
         .void => "void",
-        .list => "list",
-        .map => "map",
+        .list => |l| l.name,
+        .map => |m| m.name,
         .named => |n| n,
         .func => "function",
         .enum_ref => |n| n,
@@ -390,6 +405,16 @@ const Analyzer = struct {
 
     /// Report a reference to an unknown type in an annotation.
     fn checkType(self: *Analyzer, t: TypeRef) Error!void {
+        // Type arguments only apply to `list`/`map`; validate arity and recurse.
+        if (std.mem.eql(u8, t.name, "list")) {
+            if (t.args.len > 1) try self.report(t.span, "list takes at most one type argument", .{});
+        } else if (std.mem.eql(u8, t.name, "map")) {
+            if (t.args.len != 0 and t.args.len != 2) try self.report(t.span, "map takes two type arguments (map<K, V>)", .{});
+        } else if (t.args.len > 0) {
+            try self.report(t.span, "'{s}' does not take type arguments", .{t.name});
+        }
+        for (t.args) |a| try self.checkType(a);
+
         if (isBuiltinType(t.name)) return;
         if (self.module_scope.symbols.get(t.name)) |sym| {
             if (isUserType(sym.kind)) return;
@@ -401,22 +426,28 @@ const Analyzer = struct {
     /// `checkType` for the existence error). Wraps the type in an optional when
     /// the annotation is `?T`.
     fn annotationType(self: *Analyzer, t: TypeRef) Error!Type {
-        const base = self.annotationBase(t.name);
+        const base = try self.annotationBase(t);
         if (!t.optional) return base;
-        const opt = try self.arena.create(Optional);
-        opt.* = .{ .inner = base, .name = try std.fmt.allocPrint(self.arena, "?{s}", .{typeName(base)}) };
-        return .{ .optional = opt };
+        return self.makeOptional(base);
     }
 
-    fn annotationBase(self: *Analyzer, n: []const u8) Type {
+    fn annotationBase(self: *Analyzer, t: TypeRef) Error!Type {
+        const n = t.name;
         if (std.mem.eql(u8, n, "int")) return .int;
         if (std.mem.eql(u8, n, "float")) return .float;
         if (std.mem.eql(u8, n, "str")) return .str;
         if (std.mem.eql(u8, n, "bool")) return .bool;
         if (std.mem.eql(u8, n, "void")) return .void;
         if (std.mem.eql(u8, n, "any")) return .any;
-        if (std.mem.eql(u8, n, "list")) return .list;
-        if (std.mem.eql(u8, n, "map")) return .map;
+        if (std.mem.eql(u8, n, "list")) {
+            const elem: Type = if (t.args.len >= 1) try self.annotationType(t.args[0]) else .any;
+            return self.makeList(elem);
+        }
+        if (std.mem.eql(u8, n, "map")) {
+            const key: Type = if (t.args.len >= 1) try self.annotationType(t.args[0]) else .any;
+            const value: Type = if (t.args.len >= 2) try self.annotationType(t.args[1]) else .any;
+            return self.makeMap(key, value);
+        }
         if (self.module_scope.symbols.get(n)) |sym| {
             if (isUserType(sym.kind)) return .{ .named = n };
         }
@@ -467,8 +498,11 @@ const Analyzer = struct {
             .str => tagOf(to) == .str,
             .bool => tagOf(to) == .bool,
             .void => tagOf(to) == .void,
-            .list => tagOf(to) == .list,
-            .map => tagOf(to) == .map,
+            // Element-aware, leaning on the recursive call (which shortcuts on
+            // `any`/`unknown` elements) so a plain `list`/`map` stays compatible.
+            .list => |l| tagOf(to) == .list and self.assignable(l.elem, to.list.elem),
+            .map => |m| tagOf(to) == .map and
+                self.assignable(m.key, to.map.key) and self.assignable(m.value, to.map.value),
             .func => tagOf(to) == .func,
             .named => |n| tagOf(to) == .named and self.isSubtype(n, to.named),
             .any, .unknown, .enum_ref => true,
@@ -487,6 +521,22 @@ const Analyzer = struct {
         return .{ .optional = opt };
     }
 
+    fn makeList(self: *Analyzer, elem: Type) Error!Type {
+        const lt = try self.arena.create(ListType);
+        lt.* = .{ .elem = elem, .name = try std.fmt.allocPrint(self.arena, "list<{s}>", .{typeName(elem)}) };
+        return .{ .list = lt };
+    }
+
+    fn makeMap(self: *Analyzer, key: Type, value: Type) Error!Type {
+        const mt = try self.arena.create(MapType);
+        mt.* = .{
+            .key = key,
+            .value = value,
+            .name = try std.fmt.allocPrint(self.arena, "map<{s}, {s}>", .{ typeName(key), typeName(value) }),
+        };
+        return .{ .map = mt };
+    }
+
     /// The least upper bound of two types, or null if they are incompatible. A
     /// `nil` arm makes the result optional; widening and inheritance apply.
     fn join(self: *Analyzer, a: Type, b: Type) Error!?Type {
@@ -501,6 +551,16 @@ const Analyzer = struct {
             const ib = if (tb == .optional) b.optional.inner else b;
             const inner = (try self.join(ia, ib)) orelse return null;
             return try self.makeOptional(inner);
+        }
+        // Collections unify element-wise (so `[cat, dog]` becomes `list<Animal>`).
+        if (ta == .list and tb == .list) {
+            const e = (try self.join(a.list.elem, b.list.elem)) orelse return null;
+            return try self.makeList(e);
+        }
+        if (ta == .map and tb == .map) {
+            const k = (try self.join(a.map.key, b.map.key)) orelse return null;
+            const v = (try self.join(a.map.value, b.map.value)) orelse return null;
+            return try self.makeMap(k, v);
         }
         if (self.assignable(a, b)) return b;
         if (self.assignable(b, a)) return a;
@@ -961,9 +1021,17 @@ const Analyzer = struct {
                 try self.analyzeChildBlock(x.body);
             },
             .for_stmt => |x| {
-                _ = try self.typeOf(x.iter.*);
+                const iter_t = try self.typeOf(x.iter.*);
+                // A `for` binds each list element, each map key, or each character
+                // of a string; anything else stays `unknown`.
+                const binding_t: Type = switch (iter_t) {
+                    .list => |l| l.elem,
+                    .map => |m| m.key,
+                    .str => .str,
+                    else => .unknown,
+                };
                 const child = try self.newScope(self.current);
-                try self.declareIn(child, x.binding, .binding, .unknown, x.span);
+                try self.declareIn(child, x.binding, .binding, binding_t, x.span);
                 const saved = self.current;
                 self.current = child;
                 self.loop_depth += 1;
@@ -1033,15 +1101,23 @@ const Analyzer = struct {
                 break :blk try self.memberType(ot, m.name, m.span);
             },
             .array => |a| blk: {
-                for (a.elements) |el| _ = try self.typeOf(el.*);
-                break :blk .list;
+                var elem: ?Type = null;
+                for (a.elements) |el| {
+                    const et = try self.typeOf(el.*);
+                    elem = if (elem) |cur| (try self.join(cur, et)) orelse .any else et;
+                }
+                break :blk try self.makeList(elem orelse .unknown);
             },
             .map => |m| blk: {
+                var kt: ?Type = null;
+                var vt: ?Type = null;
                 for (m.entries) |entry| {
-                    _ = try self.typeOf(entry.key.*);
-                    _ = try self.typeOf(entry.value.*);
+                    const k = try self.typeOf(entry.key.*);
+                    const v = try self.typeOf(entry.value.*);
+                    kt = if (kt) |cur| (try self.join(cur, k)) orelse .any else k;
+                    vt = if (vt) |cur| (try self.join(cur, v)) orelse .any else v;
                 }
-                break :blk .map;
+                break :blk try self.makeMap(kt orelse .unknown, vt orelse .unknown);
             },
             .match => |m| try self.typeMatch(m),
         };
@@ -1140,14 +1216,32 @@ const Analyzer = struct {
 
     fn typeIndex(self: *Analyzer, i: Expr.Index) Error!Type {
         const ot = try self.typeOf(i.object.*);
-        _ = try self.typeOf(i.index.*);
-        return switch (tagOf(ot)) {
-            .list, .map, .str, .any, .unknown => .unknown, // element types not tracked yet
-            else => blk: {
-                try self.report(i.span, "{s} is not indexable", .{typeName(ot)});
-                break :blk .unknown;
+        const it = try self.typeOf(i.index.*);
+        switch (ot) {
+            .list => |l| {
+                if (!isAnyish(it) and tagOf(it) != .int) {
+                    try self.report(parser.exprSpan(i.index.*), "list index must be an int, got {s}", .{typeName(it)});
+                }
+                return l.elem;
             },
-        };
+            .map => |m| {
+                if (!self.assignable(it, m.key)) {
+                    try self.report(parser.exprSpan(i.index.*), "map key must be {s}, got {s}", .{ typeName(m.key), typeName(it) });
+                }
+                return m.value;
+            },
+            .str => {
+                if (!isAnyish(it) and tagOf(it) != .int) {
+                    try self.report(parser.exprSpan(i.index.*), "string index must be an int, got {s}", .{typeName(it)});
+                }
+                return .str; // a one-character string
+            },
+            .any, .unknown => return .unknown,
+            else => {
+                try self.report(i.span, "{s} is not indexable", .{typeName(ot)});
+                return .unknown;
+            },
+        }
     }
 
     fn typeMatch(self: *Analyzer, m: Expr.Match) Error!Type {
@@ -2247,6 +2341,70 @@ test "a cross-module call checks argument types" {
     var bad = try analyzeModule(gpa, bad_tree.module, &imports);
     defer bad.deinit();
     try expectMessageContains(bad, "cannot pass str where int is expected");
+}
+
+// typed collections
+
+test "a list literal's element type must match its annotation" {
+    var analysis = try analyzeSource(testing.allocator, "var xs: list<int> = [\"a\", \"b\"]");
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot assign list<str> to list<int>");
+}
+
+test "indexing a list yields its element type" {
+    const src =
+        \\var xs: list<int> = [1, 2]
+        \\var s: str = xs[0]
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot assign int to str");
+}
+
+test "indexing a map yields its value type" {
+    const src =
+        \\func main():
+        \\    var m: map<str, int> = {"a": 1}
+        \\    var s: str = m["a"]
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot assign int to str");
+}
+
+test "a non-int list index is reported" {
+    const src =
+        \\func main():
+        \\    var xs: list<int> = [1]
+        \\    var y: int = xs["k"]
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "list index must be an int, got str");
+}
+
+test "for over a typed list binds the element type" {
+    const src =
+        \\func main():
+        \\    var xs: list<int> = [1, 2]
+        \\    for x in xs:
+        \\        var s: str = x
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot assign int to str");
+}
+
+test "a nested generic literal matching its annotation is clean" {
+    var analysis = try analyzeSource(testing.allocator, "var grid: map<str, list<int>> = {\"row\": [1, 2, 3]}");
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "wrong arity on a generic type is reported" {
+    var analysis = try analyzeSource(testing.allocator, "var xs: list<int, str> = []");
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "list takes at most one type argument");
 }
 
 test "signal names are declared and their params checked" {

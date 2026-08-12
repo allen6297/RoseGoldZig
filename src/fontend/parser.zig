@@ -39,6 +39,9 @@ pub const TypeRef = struct {
     span: Span,
     /// A leading `?` makes the type optional (may hold `nil`).
     optional: bool = false,
+    /// Type arguments for generic builtins: `list<T>` → `{T}`, `map<K, V>` →
+    /// `{K, V}`. Empty for a plain type.
+    args: []const TypeRef = &.{},
 };
 
 pub const Param = struct {
@@ -446,7 +449,21 @@ const Parser = struct {
     fn parseType(self: *Parser) Error!TypeRef {
         const optional = self.eat(.question);
         const t = try self.expect(.identifier, "expected a type name");
-        return .{ .name = t.text, .span = t.span, .optional = optional };
+        var end = t.span;
+        var args: []const TypeRef = &.{};
+        // Optional `<T, ...>` type arguments (e.g. `list<int>`, `map<str, int>`).
+        if (self.at(.lt)) {
+            _ = self.advance(); // '<'
+            var arg_list: std.ArrayList(TypeRef) = .empty;
+            try arg_list.append(self.alloc, try self.parseType());
+            while (self.eat(.comma)) {
+                try arg_list.append(self.alloc, try self.parseType());
+            }
+            const close = try self.expect(.gt, "expected '>' after type arguments");
+            end = close.span;
+            args = try arg_list.toOwnedSlice(self.alloc);
+        }
+        return .{ .name = t.text, .span = joinSpan(t.span, end), .optional = optional, .args = args };
     }
 
     fn parseVarDecl(self: *Parser, visibility: Visibility) Error!VarDecl {
@@ -1067,6 +1084,33 @@ test "parameter types are optional" {
     try testing.expectEqual(@as(usize, 2), f.params.len);
     try testing.expect(f.params[0].type == null); // msg is untyped
     try testing.expectEqualStrings("int", f.params[1].type.?.name);
+}
+
+test "parses generic collection type arguments" {
+    var tree = try parse(testing.allocator, "var m: map<str, list<int>> = {}");
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const ty = tree.module.decls[0].var_decl.type.?;
+    try testing.expectEqualStrings("map", ty.name);
+    try testing.expectEqual(@as(usize, 2), ty.args.len);
+    try testing.expectEqualStrings("str", ty.args[0].name);
+    // The value is itself a generic: list<int>.
+    try testing.expectEqualStrings("list", ty.args[1].name);
+    try testing.expectEqual(@as(usize, 1), ty.args[1].args.len);
+    try testing.expectEqualStrings("int", ty.args[1].args[0].name);
+}
+
+test "parses an optional generic type" {
+    var tree = try parse(testing.allocator, "var xs: ?list<int> = nil");
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const ty = tree.module.decls[0].var_decl.type.?;
+    try testing.expect(ty.optional);
+    try testing.expectEqualStrings("list", ty.name);
+    try testing.expectEqual(@as(usize, 1), ty.args.len);
+    try testing.expectEqualStrings("int", ty.args[0].name);
 }
 
 test "parses signals with and without parameters" {

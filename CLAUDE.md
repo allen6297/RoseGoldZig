@@ -20,7 +20,7 @@ uniform. See `examples/demo.rg` (single file) and `examples/app.rg` (imports
 zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
-zig build test                  # run every test (184 as of writing)
+zig build test                  # run every test (193 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -100,8 +100,10 @@ loader, then the analyzer and interpreter over the loaded module set.
   array `[...]` and map `{k: v}` literals, and `match subj { pattern: body, ... }`
   (patterns: literals, `_`, a binding name, or an enum case `Enum.CASE` — covering
   every case is exhaustive without a `_`).
-- **Types:** `int`, `float`, `str`, `bool`, `void`, `any`, `list`, `map`, plus user
-  classes/structs/enums, and optionals `?T` (hold `T` or `nil`). `int` widens to `float`.
+- **Types:** `int`, `float`, `str`, `bool`, `void`, `any`, `list`/`map` (optionally
+  with element types — `list<T>`, `map<K, V>`, nestable; a bare `list`/`map` is
+  `list<any>`/`map<any, any>`), plus user classes/structs/enums, and optionals `?T`
+  (hold `T` or `nil`). `int` widens to `float`.
   A subclass is assignable to its bases (via `extends`/`uses`, transitively). `nil` and a
   value both fit `?T`; a `?T` must be unwrapped (e.g. narrowed via `if v != nil:`) before
   it's usable as `T`. `?T`-returning functions may fall off the end (yielding `nil`).
@@ -111,8 +113,10 @@ loader, then the analyzer and interpreter over the loaded module set.
   arm-type unification (arms unify to a common type; a `nil` arm makes it optional),
   `extends`/`uses` validity + inheritance-aware assignability, member access
   (including inherited members) with `private` reachable only inside its own
-  type, and that every path of a function with a concrete return type returns a
-  value.
+  type, that every path of a function with a concrete return type returns a
+  value, and collection element types (a list/map literal's inferred element
+  types, list/map indexing result + index type, and `for`-binding types — all
+  element-aware but lenient on `any`/`unknown`).
 - **Interpreter:** runs everything above. Classes/structs: `Name(...)` constructs (fields
   take defaults; a method named `init` is the constructor), inheritance is honored at
   runtime (inherited fields, method override, chained `init`). Enum cases are distinct
@@ -144,6 +148,10 @@ loader, then the analyzer and interpreter over the loaded module set.
 
 ### Known gaps / future work
 - No **static** class members at runtime (only enum cases via `Enum.CASE`).
-- `list`/`map` are **untyped** (no element types tracked or checked).
+- Collection **element types are analyzer-only** and not runtime-enforced; the
+  `push`/`keys`/`values`/etc. builtins are still typed `any`, so they neither
+  consume nor produce element-typed results (e.g. `keys(m)` is `any`, not `list<K>`).
+  Element assignability is covariant (unsound under mutation, but matches the
+  lenient design).
 - Module resolution has no **search path / package roots** and no cross-module type
   annotations (see **Modules → Limits**). `static` still parses unused.
