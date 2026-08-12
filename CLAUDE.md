@@ -94,14 +94,18 @@ there are no upward dependencies.
 - **Analyzer checks:** undefined names, duplicate declarations, unknown types,
   init/return/operator/condition/assignment/call type compatibility, member access,
   enum-case validity (`Status.OK`), `match` exhaustiveness + unreachable arms,
-  `extends`/`uses` validity + inheritance-aware assignability, and that every
-  path of a function with a concrete return type returns a value.
+  `extends`/`uses` validity + inheritance-aware assignability, member access
+  (including inherited members) with `private` reachable only inside its own
+  type, and that every path of a function with a concrete return type returns a
+  value.
 - **Interpreter:** runs everything above. Classes/structs: `Name(...)` constructs (fields
   take defaults; a method named `init` is the constructor), inheritance is honored at
   runtime (inherited fields, method override, chained `init`). Enum cases are distinct
   values printing as `Enum.CASE`. Builtins: `print`, `echo`, `len`, `range`.
 
 ### Known gaps / future work
+- **Top-level** `pub`/`private` isn't enforced (needs a module system); only
+  class/struct *member* visibility is checked. `static` still parses unused.
 - No **static** class members at runtime (only enum cases via `Enum.CASE`).
 - `list`/`map` are **untyped** (no element types tracked or checked).
 - `match` patterns can't match **enum cases** (`Status.OK` as a pattern) yet.

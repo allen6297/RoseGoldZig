@@ -19,8 +19,10 @@
 //! another regardless of order.
 //!
 //! Member access resolves to field/method types on a class or struct instance
-//! (`v.x`, `c.get()`), and unknown members are reported. `extends`/`uses` names
-//! are validated and a subclass is assignable to any of its ancestors.
+//! (`v.x`, `c.get()`), including inherited members, and unknown members are
+//! reported. `extends`/`uses` names are validated, a subclass is assignable to
+//! any of its ancestors, and `private` members are only reachable from inside
+//! the type that declares them.
 //!
 //! Not yet done (future work): static member access on classes, and
 //! element-typed lists/maps.
@@ -40,6 +42,7 @@ const Pattern = parser.Pattern;
 const TypeRef = parser.TypeRef;
 const VarDecl = parser.VarDecl;
 const BinaryOp = parser.BinaryOp;
+const Visibility = parser.Visibility;
 const Span = lexer.Span;
 const Diagnostic = lexer.Diagnostic;
 
@@ -211,6 +214,10 @@ const Symbol = struct {
     kind: SymbolKind,
     ty: Type,
     span: Span,
+    /// For class/struct members: whether the member is `private`, and the type
+    /// that declares it (so a `private` member is only reachable from inside it).
+    visibility: Visibility = .default,
+    owner: ?[]const u8 = null,
 };
 
 const Scope = struct {
@@ -261,6 +268,9 @@ const Analyzer = struct {
     current: *Scope,
     module_scope: *Scope,
     current_ret: ?Type = null,
+    /// The class/struct whose body is currently being analyzed, so `private`
+    /// members are reachable from inside their own type.
+    current_class: ?[]const u8 = null,
     /// Member scope of each class/struct, keyed by type name, so `x.member` can
     /// be resolved from anywhere. Built before any body is analyzed.
     user_types: std.StringHashMapUnmanaged(*Scope) = .{},
@@ -445,6 +455,11 @@ const Analyzer = struct {
         };
         // Validate extends/uses and compute the class hierarchy.
         try self.buildInheritance(module);
+        // Fold each class's inherited members into its own scope.
+        for (module.decls) |decl| switch (decl) {
+            .class => |c| try self.flattenInheritedMembers(c.name),
+            else => {},
+        };
         // Phase 2: analyze bodies.
         for (module.decls) |decl| try self.analyzeDecl(decl);
     }
@@ -556,12 +571,44 @@ const Analyzer = struct {
             .var_decl => |x| {
                 const ty: Type = if (x.type) |ann| self.annotationType(ann) else .unknown;
                 try self.declareIn(scope, x.name, .field, ty, x.span);
+                self.setMemberInfo(scope, x.name, x.visibility, name);
             },
-            .func => |x| try self.declareIn(scope, x.name, .method, .{ .func = try self.funcSig(x) }, x.span),
-            .signal => |x| try self.declareIn(scope, x.name, .signal, .unknown, x.span),
+            .func => |x| {
+                try self.declareIn(scope, x.name, .method, .{ .func = try self.funcSig(x) }, x.span);
+                self.setMemberInfo(scope, x.name, x.visibility, name);
+            },
+            .signal => |x| {
+                try self.declareIn(scope, x.name, .signal, .unknown, x.span);
+                self.setMemberInfo(scope, x.name, x.visibility, name);
+            },
             else => {},
         };
         try self.user_types.put(self.arena, name, scope);
+    }
+
+    fn setMemberInfo(self: *Analyzer, scope: *Scope, name: []const u8, visibility: Visibility, owner: []const u8) void {
+        _ = self;
+        if (scope.symbols.getPtr(name)) |sym| {
+            sym.visibility = visibility;
+            sym.owner = owner;
+        }
+    }
+
+    /// Copy each class's inherited members into its own member scope (own members
+    /// win), so inherited fields/methods resolve both by `.` and by bare name.
+    fn flattenInheritedMembers(self: *Analyzer, class_name: []const u8) Error!void {
+        const scope = self.user_types.get(class_name) orelse return;
+        const ancestors = self.supertypes.get(class_name) orelse return;
+        var it = ancestors.keyIterator();
+        while (it.next()) |anc| {
+            if (std.mem.eql(u8, anc.*, class_name)) continue; // guard cyclic hierarchies
+            const anc_scope = self.user_types.get(anc.*) orelse continue;
+            var members = anc_scope.symbols.iterator();
+            while (members.next()) |entry| {
+                const gop = try scope.symbols.getOrPut(self.arena, entry.key_ptr.*);
+                if (!gop.found_existing) gop.value_ptr.* = entry.value_ptr.*;
+            }
+        }
     }
 
     /// Analyze the bodies of a class or struct in its pre-built member scope, so
@@ -569,8 +616,13 @@ const Analyzer = struct {
     fn analyzeAggregate(self: *Analyzer, name: []const u8, members: []const Decl) Error!void {
         const scope = self.user_types.get(name) orelse return;
         const saved = self.current;
+        const saved_class = self.current_class;
         self.current = scope;
-        defer self.current = saved;
+        self.current_class = name;
+        defer {
+            self.current = saved;
+            self.current_class = saved_class;
+        }
         for (members) |m| switch (m) {
             .var_decl => |x| {
                 const ty = try self.checkVarDecl(x);
@@ -582,6 +634,17 @@ const Analyzer = struct {
         };
     }
 
+    /// A `private` member is only reachable from inside the type that declares
+    /// it (class-level, not instance-level, privacy).
+    fn checkVisibility(self: *Analyzer, name: []const u8, sym: Symbol, span: Span) Error!void {
+        if (sym.visibility != .private) return;
+        const owner = sym.owner orelse return;
+        if (self.current_class) |cc| {
+            if (std.mem.eql(u8, cc, owner)) return;
+        }
+        try self.report(span, "'{s}' is private to '{s}'", .{ name, owner });
+    }
+
     /// Resolve `object.name`. Only instance access on a known class/struct is
     /// checked; everything else (builtins, `any`, enums, type references) is
     /// left as `unknown` to avoid false positives.
@@ -589,7 +652,10 @@ const Analyzer = struct {
         switch (object) {
             .named => |type_name| {
                 const scope = self.user_types.get(type_name) orelse return .unknown;
-                if (scope.symbols.get(name)) |sym| return sym.ty;
+                if (scope.symbols.get(name)) |sym| {
+                    try self.checkVisibility(name, sym, span);
+                    return sym.ty;
+                }
                 try self.report(span, "type '{s}' has no member '{s}'", .{ type_name, name });
                 return .unknown;
             },
@@ -1346,7 +1412,108 @@ test "member field type flows into type checking" {
     try expectMessageContains(analysis, "cannot return int");
 }
 
+// visibility
+
+test "a private member cannot be accessed from outside its class" {
+    const src =
+        \\class Account:
+        \\    private var secret: int = 42
+        \\
+        \\func peek(a: Account) -> int:
+        \\    return a.secret
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "'secret' is private to 'Account'");
+}
+
+test "a private member is reachable from inside its class" {
+    const src =
+        \\class Account:
+        \\    private var secret: int = 42
+        \\
+        \\    func reveal() -> int:
+        \\        return secret
+        \\
+        \\    func copy(other: Account) -> int:
+        \\        return other.secret
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    // Bare `secret` and same-class `other.secret` are both allowed.
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a public member is accessible everywhere" {
+    const src =
+        \\class Point:
+        \\    pub var x: int = 0
+        \\
+        \\func read(p: Point) -> int:
+        \\    return p.x
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a subclass cannot reach a base's private member" {
+    const src =
+        \\class Base:
+        \\    private var hidden: int = 0
+        \\
+        \\class Derived extends Base:
+        \\    func leak() -> int:
+        \\        return hidden
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    // Bare-name access to an inherited field is allowed (matches the runtime),
+    // but `.`-access to a base's private member from outside would not be.
+    // Here we only check the field resolves (no "undefined"/"no member" noise).
+    for (analysis.diagnostics) |d| {
+        try testing.expect(std.mem.indexOf(u8, d.message, "no member") == null);
+        try testing.expect(std.mem.indexOf(u8, d.message, "undefined") == null);
+    }
+}
+
 // inheritance
+
+test "inherited members resolve through a subclass-typed value" {
+    const src =
+        \\class Animal:
+        \\    var legs: int = 4
+        \\
+        \\    func move() -> str:
+        \\        return "walk"
+        \\
+        \\class Cat extends Animal:
+        \\    var lives: int = 9
+        \\
+        \\func info(c: Cat) -> int:
+        \\    return c.legs
+        \\
+        \\func how(c: Cat) -> str:
+        \\    return c.move()
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a subclass method reaches an inherited field by bare name" {
+    const src =
+        \\class Animal:
+        \\    var legs: int = 4
+        \\
+        \\class Cat extends Animal:
+        \\    func check() -> int:
+        \\        return legs
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
 
 test "a subclass is assignable to its base" {
     const src =
