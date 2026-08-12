@@ -20,7 +20,7 @@ uniform. See `examples/demo.rg` (single file) and `examples/app.rg` (imports
 zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
-zig build test                  # run every test (199 as of writing)
+zig build test                  # run every test (207 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -90,7 +90,9 @@ loader, then the analyzer and interpreter over the loaded module set.
   `c` as a module namespace — see **Modules** below), `const`/`var`
   (optional `: type`), `func name(p: T, q) -> R:` (params may be untyped → `any`),
   `class` (with `extends` / `uses`), `struct` (no inheritance), `enum { A, B = 2 }`,
-  `signal name(params)`. `pub`/`private`/`static` modifiers parse.
+  `signal name(params)`. `pub`/`private` visibility; `static` on a class/struct
+  member makes it belong to the type (shared storage / no receiver), reached via
+  `Type.member`.
 - **Statements:** `return`, `if`/`elif`/`else`, `while`, `for x in iter:`,
   `break`, `continue`, `pass`, assignment, expression statements. All statement
   blocks are colon-blocks (indentation); braces `{ }` are only for `enum`/`match`
@@ -121,7 +123,10 @@ loader, then the analyzer and interpreter over the loaded module set.
   check the element/key — all lenient on `any`/`unknown`).
 - **Interpreter:** runs everything above. Classes/structs: `Name(...)` constructs (fields
   take defaults; a method named `init` is the constructor), inheritance is honored at
-  runtime (inherited fields, method override, chained `init`). Enum cases are distinct
+  runtime (inherited fields, method override, chained `init`). `static` members live on
+  the type (`TypeInfo.statics`): static vars are one shared cell, static methods run with
+  no receiver but see the type's statics by bare name; both are reached via `Type.member`.
+  Enum cases are distinct
   values printing as `Enum.CASE`. Builtins (`interpreter.builtin_names`, shared with
   the analyzer): `print`, `echo`, `len`, `range`, `str`, `int`, `float`, `push`, `pop`,
   `keys`, `values`, `has`.
@@ -149,7 +154,8 @@ loader, then the analyzer and interpreter over the loaded module set.
   inheritance isn't supported; a runtime error is attributed to the entry file.
 
 ### Known gaps / future work
-- No **static** class members at runtime (only enum cases via `Enum.CASE`).
+- **Static** members are not inherited (reached only through their declaring type's
+  name) and constructor arguments still aren't checked against `init`.
 - Collection **element types are analyzer-only** and not runtime-enforced (values
   stay dynamically typed). Element assignability is covariant (unsound under
   mutation, but matches the lenient design). The element-aware builtins are

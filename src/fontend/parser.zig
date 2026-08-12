@@ -123,6 +123,9 @@ pub const Pattern = union(enum) {
 pub const VarDecl = struct {
     visibility: Visibility,
     is_const: bool,
+    /// `static` on a class/struct member: the var belongs to the type, not each
+    /// instance. Ignored at module level.
+    is_static: bool = false,
     name: []const u8,
     type: ?TypeRef,
     value: ?*Expr,
@@ -419,7 +422,7 @@ const Parser = struct {
         const is_static = self.eat(.kw_static);
         switch (self.peekKind()) {
             .kw_import => return .{ .import = try self.parseImport() },
-            .kw_const, .kw_var => return .{ .var_decl = try self.parseVarDecl(visibility) },
+            .kw_const, .kw_var => return .{ .var_decl = try self.parseVarDecl(visibility, is_static) },
             .kw_func => return .{ .func = try self.parseFunc(visibility, is_static) },
             .kw_class => return .{ .class = try self.parseClass(visibility) },
             .kw_struct => return .{ .struct_decl = try self.parseStruct(visibility) },
@@ -466,7 +469,7 @@ const Parser = struct {
         return .{ .name = t.text, .span = joinSpan(t.span, end), .optional = optional, .args = args };
     }
 
-    fn parseVarDecl(self: *Parser, visibility: Visibility) Error!VarDecl {
+    fn parseVarDecl(self: *Parser, visibility: Visibility, is_static: bool) Error!VarDecl {
         const kw = self.advance(); // 'const' or 'var'
         const is_const = kw.kind == .kw_const;
         const name = try self.expect(.identifier, "expected a variable name");
@@ -477,6 +480,7 @@ const Parser = struct {
         return .{
             .visibility = visibility,
             .is_const = is_const,
+            .is_static = is_static,
             .name = name.text,
             .type = type_ref,
             .value = value,
@@ -666,7 +670,7 @@ const Parser = struct {
                 const t = self.advance();
                 return .{ .continue_stmt = t.span };
             },
-            .kw_var, .kw_const => return .{ .var_decl = try self.parseVarDecl(.default) },
+            .kw_var, .kw_const => return .{ .var_decl = try self.parseVarDecl(.default, false) },
             else => {
                 const expr = try self.parseExpr();
                 if (self.eat(.assign)) {

@@ -98,6 +98,9 @@ const Type = union(enum) {
     /// A reference to an enum type itself (e.g. `Status` in `Status.OK`), as
     /// opposed to `named` which is a value of that type.
     enum_ref: []const u8,
+    /// A reference to a class/struct type itself (e.g. `Counter` in
+    /// `Counter.member` or `Counter()`), as opposed to `named` (an instance).
+    type_ref: []const u8,
     /// The type of the `nil` literal; assignable to any optional.
     nil,
     /// An optional type `?T`.
@@ -149,6 +152,7 @@ fn typeName(t: Type) []const u8 {
         .named => |n| n,
         .func => "function",
         .enum_ref => |n| n,
+        .type_ref => |n| n,
         .nil => "nil",
         .optional => |o| o.name,
         .module => "module",
@@ -366,6 +370,9 @@ const Analyzer = struct {
     /// Member scope of each class/struct, keyed by type name, so `x.member` can
     /// be resolved from anywhere. Built before any body is analyzed.
     user_types: std.StringHashMapUnmanaged(*Scope) = .{},
+    /// Static-member scope of each class/struct, keyed by type name, so
+    /// `Type.member` resolves and static methods see statics by bare name.
+    static_types: std.StringHashMapUnmanaged(*Scope) = .{},
     /// Case scope of each enum, keyed by enum name, so `Enum.CASE` can be
     /// validated. Built before any body is analyzed.
     enum_types: std.StringHashMapUnmanaged(*Scope) = .{},
@@ -486,6 +493,7 @@ const Analyzer = struct {
         if (isAnyish(from) or isAnyish(to)) return true;
         // A bare type reference used as a value is unusual; stay lenient.
         if (tagOf(from) == .enum_ref or tagOf(to) == .enum_ref) return true;
+        if (tagOf(from) == .type_ref or tagOf(to) == .type_ref) return true;
         if (tagOf(to) == .optional) {
             const inner = to.optional.inner;
             return switch (from) {
@@ -508,7 +516,7 @@ const Analyzer = struct {
                 self.assignable(m.key, to.map.key) and self.assignable(m.value, to.map.value),
             .func => tagOf(to) == .func,
             .named => |n| tagOf(to) == .named and self.isSubtype(n, to.named),
-            .any, .unknown, .enum_ref => true,
+            .any, .unknown, .enum_ref, .type_ref => true,
             .nil, .optional => false, // needs an optional target / must be unwrapped
             .module => tagOf(to) == .module, // modules aren't really values
         };
@@ -665,8 +673,8 @@ const Analyzer = struct {
                 try self.declareIn(self.module_scope, x.name, if (x.is_const) .constant else .variable, ty, x.span);
             },
             .func => |x| try self.declareIn(self.module_scope, x.name, .function, .unknown, x.span),
-            .class => |x| try self.declareIn(self.module_scope, x.name, .class, .unknown, x.span),
-            .struct_decl => |x| try self.declareIn(self.module_scope, x.name, .struct_type, .unknown, x.span),
+            .class => |x| try self.declareIn(self.module_scope, x.name, .class, .{ .type_ref = x.name }, x.span),
+            .struct_decl => |x| try self.declareIn(self.module_scope, x.name, .struct_type, .{ .type_ref = x.name }, x.span),
             .enum_decl => |x| try self.declareIn(self.module_scope, x.name, .enum_type, .{ .enum_ref = x.name }, x.span),
             .signal => |x| try self.declareIn(self.module_scope, x.name, .signal, .unknown, x.span),
         }
@@ -808,15 +816,18 @@ const Analyzer = struct {
     /// member access resolves regardless of declaration order.
     fn buildUserType(self: *Analyzer, name: []const u8, members: []const Decl) Error!void {
         const scope = try self.newScope(self.module_scope);
+        const static_scope = try self.newScope(self.module_scope);
         for (members) |m| switch (m) {
             .var_decl => |x| {
+                const target = if (x.is_static) static_scope else scope;
                 const ty: Type = if (x.type) |ann| try self.annotationType(ann) else .unknown;
-                try self.declareIn(scope, x.name, .field, ty, x.span);
-                self.setMemberInfo(scope, x.name, x.visibility, name);
+                try self.declareIn(target, x.name, .field, ty, x.span);
+                self.setMemberInfo(target, x.name, x.visibility, name);
             },
             .func => |x| {
-                try self.declareIn(scope, x.name, .method, .{ .func = try self.funcSig(x) }, x.span);
-                self.setMemberInfo(scope, x.name, x.visibility, name);
+                const target = if (x.is_static) static_scope else scope;
+                try self.declareIn(target, x.name, .method, .{ .func = try self.funcSig(x) }, x.span);
+                self.setMemberInfo(target, x.name, x.visibility, name);
             },
             .signal => |x| {
                 try self.declareIn(scope, x.name, .signal, .unknown, x.span);
@@ -825,6 +836,7 @@ const Analyzer = struct {
             else => {},
         };
         try self.user_types.put(self.arena, name, scope);
+        try self.static_types.put(self.arena, name, static_scope);
     }
 
     fn setMemberInfo(self: *Analyzer, scope: *Scope, name: []const u8, visibility: Visibility, owner: []const u8) void {
@@ -856,21 +868,31 @@ const Analyzer = struct {
     /// methods see the fields and each other by bare name.
     fn analyzeAggregate(self: *Analyzer, name: []const u8, members: []const Decl) Error!void {
         const scope = self.user_types.get(name) orelse return;
+        const static_scope = self.static_types.get(name) orelse return;
         const saved = self.current;
         const saved_class = self.current_class;
-        self.current = scope;
         self.current_class = name;
         defer {
             self.current = saved;
             self.current_class = saved_class;
         }
+        // A member is analyzed in its own scope, so static bodies see static
+        // members by bare name and instance bodies see instance members.
         for (members) |m| switch (m) {
             .var_decl => |x| {
+                const target = if (x.is_static) static_scope else scope;
+                self.current = target;
                 const ty = try self.checkVarDecl(x);
-                if (scope.symbols.getPtr(x.name)) |sym| sym.ty = ty;
+                if (target.symbols.getPtr(x.name)) |sym| sym.ty = ty;
             },
-            .func => |x| try self.analyzeFunc(x),
-            .signal => |x| try self.analyzeSignal(x),
+            .func => |x| {
+                self.current = if (x.is_static) static_scope else scope;
+                try self.analyzeFunc(x);
+            },
+            .signal => |x| {
+                self.current = scope;
+                try self.analyzeSignal(x);
+            },
             else => {},
         };
     }
@@ -904,6 +926,15 @@ const Analyzer = struct {
                 const scope = self.enum_types.get(enum_name) orelse return .unknown;
                 if (scope.symbols.contains(name)) return .{ .named = enum_name };
                 try self.report(span, "enum '{s}' has no case '{s}'", .{ enum_name, name });
+                return .unknown;
+            },
+            .type_ref => |type_name| {
+                const scope = self.static_types.get(type_name) orelse return .unknown;
+                if (scope.symbols.get(name)) |sym| {
+                    try self.checkVisibility(name, sym, span);
+                    return sym.ty;
+                }
+                try self.report(span, "type '{s}' has no static member '{s}'", .{ type_name, name });
                 return .unknown;
             },
             .module => |exports| {
@@ -1216,6 +1247,12 @@ const Analyzer = struct {
             .any, .unknown => {
                 for (c.args) |arg| _ = try self.typeOf(arg.*);
                 return .unknown;
+            },
+            // Calling a class/struct name constructs an instance of it. Argument
+            // checking against `init` is left lenient for now.
+            .type_ref => |type_name| {
+                for (c.args) |arg| _ = try self.typeOf(arg.*);
+                return .{ .named = type_name };
             },
             else => {
                 for (c.args) |arg| _ = try self.typeOf(arg.*);
@@ -2542,6 +2579,73 @@ test "a local shadowing a builtin is not treated as the builtin" {
     var analysis = try analyzeSource(testing.allocator, src);
     defer analysis.deinit();
     try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+// static members
+
+test "a static member reached via the type name is typed" {
+    const src =
+        \\class C:
+        \\    static var count: int = 0
+        \\
+        \\func main():
+        \\    var s: str = C.count
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot assign int to str");
+}
+
+test "an unknown static member is reported" {
+    const src =
+        \\class C:
+        \\    static var count: int = 0
+        \\
+        \\func main():
+        \\    print(C.nope)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "type 'C' has no static member 'nope'");
+}
+
+test "an instance field is not reachable as a static member" {
+    const src =
+        \\class C:
+        \\    var x: int = 0
+        \\
+        \\func main():
+        \\    print(C.x)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "type 'C' has no static member 'x'");
+}
+
+test "a static method sees static members by bare name" {
+    const src =
+        \\class C:
+        \\    static var n: int = 0
+        \\
+        \\    static func inc():
+        \\        n = n + 1
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "an instance method cannot reach statics by bare name" {
+    const src =
+        \\class C:
+        \\    static var n: int = 0
+        \\
+        \\    func inst() -> int:
+        \\        return n
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "undefined name 'n'");
 }
 
 test "signal names are declared and their params checked" {

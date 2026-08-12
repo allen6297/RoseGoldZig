@@ -77,6 +77,12 @@ const TypeInfo = struct {
     /// This type's fields plus inherited ones, base classes first (used for
     /// construction and printing).
     all_fields: []const FieldDef = &.{},
+    /// Storage shared across all instances: static vars (by value) and static
+    /// methods (as `static_method` values). Reached via `TypeName.member`.
+    statics: *Env = undefined,
+    /// Static `var` members, whose initializers are evaluated once (after the
+    /// module's globals exist) into `statics`.
+    static_fields: []const FieldDef = &.{},
 };
 
 /// A live class/struct instance.
@@ -91,6 +97,10 @@ const BoundMethod = struct { receiver: *Instance, func: *const Decl.Func };
 /// A function value: the declaration plus the globals of the module that
 /// defined it, so calling it resolves names in its home module.
 const FuncValue = struct { decl: *const Decl.Func, module: *Env };
+
+/// A `static` method paired with the type it belongs to, so its body resolves
+/// bare names against that type's statics (and its module).
+const StaticMethod = struct { ti: *const TypeInfo, func: *const Decl.Func };
 
 /// An enum type: its name and the set of member names it declares.
 const EnumType = struct {
@@ -113,6 +123,7 @@ pub const Value = union(enum) {
     builtin: Builtin,
     instance: *Instance,
     bound_method: *BoundMethod,
+    static_method: *const StaticMethod,
     type_ref: *const TypeInfo,
     enum_type: *const EnumType,
     enum_value: *const EnumValue,
@@ -160,6 +171,7 @@ fn valuesEqual(a: Value, b: Value) bool {
         .builtin => |x| b == .builtin and x == b.builtin,
         .instance => |x| b == .instance and x == b.instance,
         .bound_method => |x| b == .bound_method and x == b.bound_method,
+        .static_method => |x| b == .static_method and x == b.static_method,
         .type_ref => |x| b == .type_ref and x == b.type_ref,
         .enum_type => |x| b == .enum_type and x == b.enum_type,
         .enum_value => |x| b == .enum_value and
@@ -259,6 +271,9 @@ const Interpreter = struct {
     /// The instance whose method is currently executing, so bare `field` names
     /// inside a method resolve to (and assign to) that instance.
     current_receiver: ?*Instance = null,
+    /// The statics of the type whose `static` method is currently executing, so
+    /// bare names inside it resolve to (and assign to) that type's static members.
+    current_statics: ?*Env = null,
     /// Every class/struct by name, so supertypes can be resolved.
     types: std.StringHashMapUnmanaged(*TypeInfo) = .{},
 
@@ -297,6 +312,9 @@ const Interpreter = struct {
                 return .{ .bound_method = bm };
             }
         }
+        if (self.current_statics) |st| {
+            if (st.vars.get(name)) |v| return v;
+        }
         if (self.globals.vars.get(name)) |v| return v;
         return self.fail(span, "undefined name '{s}'", .{name});
     }
@@ -318,6 +336,12 @@ const Interpreter = struct {
                 return true;
             }
         }
+        if (self.current_statics) |st| {
+            if (st.vars.getPtr(name)) |slot| {
+                slot.* = value;
+                return true;
+            }
+        }
         if (self.globals.vars.getPtr(name)) |slot| {
             slot.* = value;
             return true;
@@ -334,14 +358,24 @@ const Interpreter = struct {
     ) Error!void {
         var fields: std.ArrayList(FieldDef) = .empty;
         var methods: std.StringHashMapUnmanaged(*const Decl.Func) = .{};
+        var static_fields: std.ArrayList(FieldDef) = .empty;
+        // Partition members: `static` ones belong to the type, the rest to
+        // instances. Static methods need the finished `ti`, so they are bound
+        // after it is created.
         for (members, 0..) |m, j| switch (m) {
-            .var_decl => |v| try fields.append(self.arena, .{ .name = v.name, .value = v.value }),
-            .func => try methods.put(self.arena, members[j].func.name, &members[j].func),
+            .var_decl => |v| {
+                const slot = if (v.is_static) &static_fields else &fields;
+                try slot.append(self.arena, .{ .name = v.name, .value = v.value });
+            },
+            .func => |f| if (!f.is_static) try methods.put(self.arena, f.name, &members[j].func),
             else => {},
         };
         var supers: std.ArrayList([]const u8) = .empty;
         if (extends) |b| try supers.append(self.arena, b.name);
         for (uses) |t| try supers.append(self.arena, t.name);
+
+        const statics = try self.arena.create(Env);
+        statics.* = .{ .parent = self.globals };
 
         const own_fields = try fields.toOwnedSlice(self.arena);
         const ti = try self.arena.create(TypeInfo);
@@ -352,9 +386,47 @@ const Interpreter = struct {
             .methods = methods,
             .super_names = try supers.toOwnedSlice(self.arena),
             .all_fields = own_fields, // recomputed with inheritance in computeInheritance
+            .statics = statics,
+            .static_fields = try static_fields.toOwnedSlice(self.arena),
         };
+
+        // Bind static methods into the statics env, carrying `ti`.
+        for (members, 0..) |m, j| switch (m) {
+            .func => |f| if (f.is_static) {
+                const sm = try self.arena.create(StaticMethod);
+                sm.* = .{ .ti = ti, .func = &members[j].func };
+                try statics.vars.put(self.arena, f.name, .{ .static_method = sm });
+            },
+            else => {},
+        };
+
         try self.types.put(self.arena, name, ti);
         try self.define(self.globals, name, .{ .type_ref = ti });
+    }
+
+    /// Evaluate a type's static `var` initializers into its statics env. Runs
+    /// after the module's globals and functions exist, so an initializer may use
+    /// them (and earlier statics, and this type's static methods).
+    fn initStatics(self: *Interpreter, ti: *const TypeInfo) Error!void {
+        if (ti.static_fields.len == 0) return;
+        const saved_env = self.env;
+        const saved_recv = self.current_receiver;
+        const saved_statics = self.current_statics;
+        const saved_globals = self.globals;
+        self.globals = ti.module;
+        self.env = ti.module;
+        self.current_receiver = null;
+        self.current_statics = ti.statics;
+        defer {
+            self.env = saved_env;
+            self.current_receiver = saved_recv;
+            self.current_statics = saved_statics;
+            self.globals = saved_globals;
+        }
+        for (ti.static_fields) |f| {
+            const v = if (f.value) |val| try self.eval(val.*) else Value.nil;
+            try ti.statics.vars.put(self.arena, f.name, v);
+        }
     }
 
     fn computeInheritance(self: *Interpreter, ti: *TypeInfo) Error!void {
@@ -422,16 +494,19 @@ const Interpreter = struct {
         // type's own module.
         const saved_env = self.env;
         const saved_recv = self.current_receiver;
+        const saved_statics = self.current_statics;
         const saved_globals = self.globals;
         self.globals = ti.module;
         self.env = ti.module;
         self.current_receiver = inst;
+        self.current_statics = null;
         for (ti.all_fields) |f| {
             const v = if (f.value) |val| try self.eval(val.*) else Value.nil;
             try inst.fields.put(self.arena, f.name, v);
         }
         self.env = saved_env;
         self.current_receiver = saved_recv;
+        self.current_statics = saved_statics;
         self.globals = saved_globals;
 
         // A method named `init` (inherited or own) acts as the constructor.
@@ -511,6 +586,12 @@ const Interpreter = struct {
                 const v = if (x.value) |val| try self.eval(val.*) else Value.nil;
                 try self.define(self.globals, x.name, v);
             },
+            else => {},
+        };
+        // Evaluate static field initializers, now that globals/functions exist.
+        for (module.decls) |decl| switch (decl) {
+            .class => |c| try self.initStatics(self.types.get(c.name).?),
+            .struct_decl => |s| try self.initStatics(self.types.get(s.name).?),
             else => {},
         };
     }
@@ -632,6 +713,13 @@ const Interpreter = struct {
                             return self.fail(mem.span, "type '{s}' has no field '{s}'", .{ inst.info.name, mem.name });
                         }
                     },
+                    .type_ref => |ti| {
+                        if (ti.statics.vars.getPtr(mem.name)) |slot| {
+                            slot.* = value;
+                        } else {
+                            return self.fail(mem.span, "type '{s}' has no static field '{s}'", .{ ti.name, mem.name });
+                        }
+                    },
                     else => return self.fail(mem.span, "cannot assign a member of {s}", .{@tagName(obj)}),
                 }
             },
@@ -675,9 +763,14 @@ const Interpreter = struct {
             return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
         }
         // Run in the function's home module, so its body sees that module's
-        // globals rather than the caller's.
+        // globals rather than the caller's. A plain function has no receiver or
+        // statics in scope.
         const saved_globals = self.globals;
+        const saved_recv = self.current_receiver;
+        const saved_statics = self.current_statics;
         self.globals = fv.module;
+        self.current_receiver = null;
+        self.current_statics = null;
         const call_env = try self.newEnv(self.globals);
         for (func.params, args) |p, arg| try self.define(call_env, p.name, arg);
 
@@ -689,6 +782,8 @@ const Interpreter = struct {
             self.env = saved_env;
             self.ret_value = saved_ret;
             self.globals = saved_globals;
+            self.current_receiver = saved_recv;
+            self.current_statics = saved_statics;
         }
         const flow = try self.execBlock(func.body);
         return if (flow == .returned) self.ret_value else Value.nil;
@@ -698,7 +793,8 @@ const Interpreter = struct {
         if (args.len != func.params.len) {
             return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
         }
-        // The method runs in its defining type's module.
+        // The method runs in its defining type's module, with the receiver in
+        // scope and no statics.
         const saved_globals = self.globals;
         self.globals = receiver.info.module;
         const call_env = try self.newEnv(self.globals);
@@ -707,14 +803,48 @@ const Interpreter = struct {
         const saved_env = self.env;
         const saved_ret = self.ret_value;
         const saved_recv = self.current_receiver;
+        const saved_statics = self.current_statics;
         self.env = call_env;
         self.ret_value = .nil;
         self.current_receiver = receiver;
+        self.current_statics = null;
         defer {
             self.env = saved_env;
             self.ret_value = saved_ret;
             self.current_receiver = saved_recv;
+            self.current_statics = saved_statics;
             self.globals = saved_globals;
+        }
+        const flow = try self.execBlock(func.body);
+        return if (flow == .returned) self.ret_value else Value.nil;
+    }
+
+    /// Call a `static` method: no receiver, the type's statics in scope, running
+    /// in the type's module.
+    fn callStaticMethod(self: *Interpreter, sm: *const StaticMethod, args: []const Value, span: Span) Error!Value {
+        const func = sm.func;
+        if (args.len != func.params.len) {
+            return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
+        }
+        const saved_globals = self.globals;
+        const saved_recv = self.current_receiver;
+        const saved_statics = self.current_statics;
+        self.globals = sm.ti.module;
+        self.current_receiver = null;
+        self.current_statics = sm.ti.statics;
+        const call_env = try self.newEnv(self.globals);
+        for (func.params, args) |p, arg| try self.define(call_env, p.name, arg);
+
+        const saved_env = self.env;
+        const saved_ret = self.ret_value;
+        self.env = call_env;
+        self.ret_value = .nil;
+        defer {
+            self.env = saved_env;
+            self.ret_value = saved_ret;
+            self.globals = saved_globals;
+            self.current_receiver = saved_recv;
+            self.current_statics = saved_statics;
         }
         const flow = try self.execBlock(func.body);
         return if (flow == .returned) self.ret_value else Value.nil;
@@ -925,6 +1055,7 @@ const Interpreter = struct {
             .func => |f| try self.callFunction(f, args, c.span),
             .builtin => |b| try self.callBuiltin(b, args, c.span),
             .bound_method => |bm| try self.callMethod(bm.func, bm.receiver, args, c.span),
+            .static_method => |sm| try self.callStaticMethod(sm, args, c.span),
             .type_ref => |ti| try self.construct(ti, args, c.span),
             else => self.fail(c.span, "{s} is not callable", .{@tagName(callee)}),
         };
@@ -953,6 +1084,10 @@ const Interpreter = struct {
             .module => |menv| {
                 if (menv.vars.get(m.name)) |v| return v;
                 return self.fail(m.span, "module has no member '{s}'", .{m.name});
+            },
+            .type_ref => |ti| {
+                if (ti.statics.vars.get(m.name)) |v| return v;
+                return self.fail(m.span, "type '{s}' has no static member '{s}'", .{ ti.name, m.name });
             },
             else => return self.fail(m.span, "cannot access a member of {s}", .{@tagName(obj)}),
         }
@@ -1086,7 +1221,7 @@ const Interpreter = struct {
                 }
                 try buf.append(self.arena, '}');
             },
-            .func, .builtin, .bound_method => try buf.appendSlice(self.arena, "<function>"),
+            .func, .builtin, .bound_method, .static_method => try buf.appendSlice(self.arena, "<function>"),
             .module => try buf.appendSlice(self.arena, "<module>"),
             .type_ref => |ti| {
                 try buf.appendSlice(self.arena, "<type ");
@@ -1660,6 +1795,54 @@ test "instances print inherited fields base-first" {
         \\    print(Sub())
     ;
     try expectOutput(src, "Sub { a: 1, b: 2 }\n");
+}
+
+test "static var and method are shared on the type" {
+    const src =
+        \\class Counter:
+        \\    static var count: int = 0
+        \\
+        \\    static func bump():
+        \\        count = count + 1
+        \\
+        \\func main():
+        \\    Counter.bump()
+        \\    Counter.bump()
+        \\    print(Counter.count)
+    ;
+    try expectOutput(src, "2\n");
+}
+
+test "a static factory sees statics and constructs instances" {
+    const src =
+        \\class Widget:
+        \\    var id: int = 0
+        \\    static var next: int = 100
+        \\
+        \\    static func make() -> Widget:
+        \\        var w: Widget = Widget()
+        \\        w.id = next
+        \\        next = next + 1
+        \\        return w
+        \\
+        \\func main():
+        \\    var a: Widget = Widget.make()
+        \\    var b: Widget = Widget.make()
+        \\    print(a.id, b.id, Widget.next)
+    ;
+    try expectOutput(src, "100 101 102\n");
+}
+
+test "static fields are not instance fields" {
+    const src =
+        \\class Widget:
+        \\    var id: int = 7
+        \\    static var count: int = 0
+        \\
+        \\func main():
+        \\    print(Widget())
+    ;
+    try expectOutput(src, "Widget { id: 7 }\n");
 }
 
 // --- modules -----------------------------------------------------------------
