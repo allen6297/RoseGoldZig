@@ -12,3 +12,7 @@ func main():
     print("square(6) =", mathutil.square(6))
     print("area(2) =", mathutil.area(2))
     print("ring(3, 2) =", geometry.ring_area(3, 2))
+
+    ## An imported type, named through its module and used across the boundary.
+    var c: geometry.Circle = geometry.circle(5)
+    print("circle r =", c.radius, "area =", mathutil.area(c.radius))

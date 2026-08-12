@@ -20,7 +20,7 @@ uniform. See `examples/demo.rg` (single file) and `examples/app.rg` (imports
 zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
-zig build test                  # run every test (207 as of writing)
+zig build test                  # run every test (211 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -104,8 +104,8 @@ loader, then the analyzer and interpreter over the loaded module set.
   every case is exhaustive without a `_`).
 - **Types:** `int`, `float`, `str`, `bool`, `void`, `any`, `list`/`map` (optionally
   with element types — `list<T>`, `map<K, V>`, nestable; a bare `list`/`map` is
-  `list<any>`/`map<any, any>`), plus user classes/structs/enums, and optionals `?T`
-  (hold `T` or `nil`). `int` widens to `float`.
+  `list<any>`/`map<any, any>`), plus user classes/structs/enums, an imported type
+  named `mod.T`, and optionals `?T` (hold `T` or `nil`). `int` widens to `float`.
   A subclass is assignable to its bases (via `extends`/`uses`, transitively). `nil` and a
   value both fit `?T`; a `?T` must be unwrapped (e.g. narrowed via `if v != nil:`) before
   it's usable as `T`. `?T`-returning functions may fall off the end (yielding `nil`).
@@ -148,10 +148,15 @@ loader, then the analyzer and interpreter over the loaded module set.
   from another module its body still resolves names in *its own* module — it can use its
   module's private helpers and consts. The analyzer mirrors this: an imported name has a
   `module` type whose members are that module's exports.
-- **Limits (v1):** imports resolve relative to the importer's dir (no search path); type
-  *annotations* can't be module-qualified (`var x: mod.T` won't parse), so an imported
-  type is only used through the values a module's functions return; cross-module
-  inheritance isn't supported; a runtime error is attributed to the entry file.
+- **Cross-module types.** A type annotation may be module-qualified: `var x: mod.T`
+  names a `pub` type `T` exported by `mod`. The analyzer validates the module exports
+  it and folds the imported type's member scopes into its own, so `x.member` (and
+  `mod.T`'s statics) are checked across the boundary — as is a value returned by an
+  imported function. (Names clash-resolve to the local type; construction is
+  interpreter-only and already worked via `mod.T()`.)
+- **Limits (v1):** imports resolve relative to the importer's dir (no search path);
+  cross-module *inheritance* isn't supported (a class can't `extends` an imported type);
+  a runtime error is attributed to the entry file.
 
 ### Known gaps / future work
 - **Static** members are not inherited (reached only through their declaring type's
@@ -161,5 +166,5 @@ loader, then the analyzer and interpreter over the loaded module set.
   mutation, but matches the lenient design). The element-aware builtins are
   special-cased by name at their call sites rather than being first-class generic
   signatures, so calling one indirectly (`var f = push`) falls back to `any`.
-- Module resolution has no **search path / package roots** and no cross-module type
-  annotations (see **Modules → Limits**). `static` still parses unused.
+- Module resolution has no **search path / package roots**, and cross-module
+  *inheritance* isn't supported (see **Modules → Limits**).

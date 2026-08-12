@@ -42,6 +42,9 @@ pub const TypeRef = struct {
     /// Type arguments for generic builtins: `list<T>` → `{T}`, `map<K, V>` →
     /// `{K, V}`. Empty for a plain type.
     args: []const TypeRef = &.{},
+    /// A module qualifier for an imported type: `mod.T` → `module = "mod"`,
+    /// `name = "T"`. Null for an unqualified type.
+    module: ?[]const u8 = null,
 };
 
 pub const Param = struct {
@@ -451,8 +454,15 @@ const Parser = struct {
 
     fn parseType(self: *Parser) Error!TypeRef {
         const optional = self.eat(.question);
-        const t = try self.expect(.identifier, "expected a type name");
-        var end = t.span;
+        const first = try self.expect(.identifier, "expected a type name");
+        // A `mod.T` qualifier names a type exported by an imported module.
+        var module: ?[]const u8 = null;
+        var name_tok = first;
+        if (self.eat(.dot)) {
+            module = first.text;
+            name_tok = try self.expect(.identifier, "expected a type name after '.'");
+        }
+        var end = name_tok.span;
         var args: []const TypeRef = &.{};
         // Optional `<T, ...>` type arguments (e.g. `list<int>`, `map<str, int>`).
         if (self.at(.lt)) {
@@ -466,7 +476,7 @@ const Parser = struct {
             end = close.span;
             args = try arg_list.toOwnedSlice(self.alloc);
         }
-        return .{ .name = t.text, .span = joinSpan(t.span, end), .optional = optional, .args = args };
+        return .{ .name = name_tok.text, .module = module, .span = joinSpan(first.span, end), .optional = optional, .args = args };
     }
 
     fn parseVarDecl(self: *Parser, visibility: Visibility, is_static: bool) Error!VarDecl {
@@ -1103,6 +1113,16 @@ test "parses generic collection type arguments" {
     try testing.expectEqualStrings("list", ty.args[1].name);
     try testing.expectEqual(@as(usize, 1), ty.args[1].args.len);
     try testing.expectEqualStrings("int", ty.args[1].args[0].name);
+}
+
+test "parses a module-qualified type" {
+    var tree = try parse(testing.allocator, "var p: geometry.Point = geometry.origin()");
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const ty = tree.module.decls[0].var_decl.type.?;
+    try testing.expectEqualStrings("geometry", ty.module.?);
+    try testing.expectEqualStrings("Point", ty.name);
 }
 
 test "parses an optional generic type" {

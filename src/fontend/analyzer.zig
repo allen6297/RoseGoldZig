@@ -294,9 +294,13 @@ const Scope = struct {
 };
 
 /// A module's public surface: the `pub` top-level symbols other modules may
-/// reach with `.`. Lives in the exporting module's analysis arena.
+/// reach with `.`, plus the member scopes of any exported class/struct types (so
+/// an importer that annotates `mod.T` can still check `x.member`). Lives in the
+/// exporting module's analysis arena.
 pub const ModuleExports = struct {
     symbols: std.StringHashMapUnmanaged(Symbol) = .{},
+    types: std.StringHashMapUnmanaged(*Scope) = .{},
+    static_types: std.StringHashMapUnmanaged(*Scope) = .{},
 };
 
 /// One import made available to `analyzeModule`: the bound name and the exports
@@ -415,6 +419,21 @@ const Analyzer = struct {
 
     /// Report a reference to an unknown type in an annotation.
     fn checkType(self: *Analyzer, t: TypeRef) Error!void {
+        // A `mod.T` qualifier: `mod` must be an imported module that exports the
+        // type `T`.
+        if (t.module) |mod_name| {
+            const sym = self.module_scope.symbols.get(mod_name);
+            if (sym == null or sym.?.kind != .import) {
+                try self.report(t.span, "'{s}' is not a module", .{mod_name});
+                return;
+            }
+            if (t.args.len > 0) try self.report(t.span, "'{s}.{s}' does not take type arguments", .{ mod_name, t.name });
+            const exported = self.importExports(mod_name).symbols.get(t.name);
+            if (exported == null or !isUserType(exported.?.kind)) {
+                try self.report(t.span, "module '{s}' has no exported type '{s}'", .{ mod_name, t.name });
+            }
+            return;
+        }
         // Type arguments only apply to `list`/`map`; validate arity and recurse.
         if (std.mem.eql(u8, t.name, "list")) {
             if (t.args.len > 1) try self.report(t.span, "list takes at most one type argument", .{});
@@ -442,6 +461,9 @@ const Analyzer = struct {
     }
 
     fn annotationBase(self: *Analyzer, t: TypeRef) Error!Type {
+        // An imported type `mod.T` resolves to a `named` instance type; its member
+        // scope is available if the module exported it (merged into user_types).
+        if (t.module != null) return .{ .named = t.name };
         const n = t.name;
         if (std.mem.eql(u8, n, "int")) return .int;
         if (std.mem.eql(u8, n, "float")) return .float;
@@ -656,6 +678,9 @@ const Analyzer = struct {
             .class => |c| try self.flattenInheritedMembers(c.name),
             else => {},
         };
+        // Make imported types' member scopes resolvable (so `mod.T` values can be
+        // checked); local types win on a name clash.
+        try self.mergeImportedTypes();
         // Phase 2: analyze bodies.
         for (module.decls) |decl| try self.analyzeDecl(decl);
     }
@@ -677,6 +702,24 @@ const Analyzer = struct {
             .struct_decl => |x| try self.declareIn(self.module_scope, x.name, .struct_type, .{ .type_ref = x.name }, x.span),
             .enum_decl => |x| try self.declareIn(self.module_scope, x.name, .enum_type, .{ .enum_ref = x.name }, x.span),
             .signal => |x| try self.declareIn(self.module_scope, x.name, .signal, .unknown, x.span),
+        }
+    }
+
+    /// Fold every imported module's exported type scopes into this module's
+    /// `user_types`/`static_types` (skipping names it already defines), so a
+    /// value of an imported type resolves its members and static members.
+    fn mergeImportedTypes(self: *Analyzer) Error!void {
+        for (self.imports) |imp| {
+            var it = imp.exports.types.iterator();
+            while (it.next()) |e| {
+                const gop = try self.user_types.getOrPut(self.arena, e.key_ptr.*);
+                if (!gop.found_existing) gop.value_ptr.* = e.value_ptr.*;
+            }
+            var sit = imp.exports.static_types.iterator();
+            while (sit.next()) |e| {
+                const gop = try self.static_types.getOrPut(self.arena, e.key_ptr.*);
+                if (!gop.found_existing) gop.value_ptr.* = e.value_ptr.*;
+            }
         }
     }
 
@@ -727,6 +770,10 @@ const Analyzer = struct {
             if (self.module_scope.symbols.get(name)) |sym| {
                 try exp.symbols.put(self.arena, name, sym);
             }
+            // Export a class/struct's member scopes so importers can check access
+            // through a `mod.T` annotation.
+            if (self.user_types.get(name)) |scope| try exp.types.put(self.arena, name, scope);
+            if (self.static_types.get(name)) |scope| try exp.static_types.put(self.arena, name, scope);
         }
         return exp;
     }
@@ -2446,6 +2493,45 @@ test "a cross-module call checks argument types" {
     var bad = try analyzeModule(gpa, bad_tree.module, &imports);
     defer bad.deinit();
     try expectMessageContains(bad, "cannot pass str where int is expected");
+}
+
+test "a mod.T annotation resolves the imported type's members" {
+    const gpa = testing.allocator;
+    var dep_tree = try parser.parse(gpa, "pub struct Point:\n    var x: int = 0\n    var y: int = 0\n\npub func origin() -> Point:\n    return Point()");
+    defer dep_tree.deinit();
+    var dep = try analyze(gpa, dep_tree.module);
+    defer dep.deinit();
+    try testing.expectEqual(@as(usize, 0), dep.diagnostics.len);
+
+    const imports = [_]ModuleImport{.{ .name = "geo", .exports = dep.exports }};
+    // `p` is annotated `geo.Point`; `p.x` (an int) is then checked against str.
+    var imp_tree = try parser.parse(gpa, "import geo\n\nfunc main():\n    var p: geo.Point = geo.origin()\n    var s: str = p.x");
+    defer imp_tree.deinit();
+    var imp = try analyzeModule(gpa, imp_tree.module, &imports);
+    defer imp.deinit();
+    try expectMessageContains(imp, "cannot assign int to str");
+}
+
+test "an unexported type cannot be named with mod.T" {
+    const gpa = testing.allocator;
+    // `Secret` is not `pub`, so it is not part of the module's surface.
+    var dep_tree = try parser.parse(gpa, "struct Secret:\n    var x: int = 0\n\npub func f() -> int:\n    return 0");
+    defer dep_tree.deinit();
+    var dep = try analyze(gpa, dep_tree.module);
+    defer dep.deinit();
+
+    const imports = [_]ModuleImport{.{ .name = "dep", .exports = dep.exports }};
+    var imp_tree = try parser.parse(gpa, "import dep\n\nfunc main():\n    var s: dep.Secret");
+    defer imp_tree.deinit();
+    var imp = try analyzeModule(gpa, imp_tree.module, &imports);
+    defer imp.deinit();
+    try expectMessageContains(imp, "module 'dep' has no exported type 'Secret'");
+}
+
+test "a qualified type on a non-module is reported" {
+    var analysis = try analyzeSource(testing.allocator, "func main():\n    var p: foo.Bar");
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "'foo' is not a module");
 }
 
 // typed collections
