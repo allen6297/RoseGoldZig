@@ -9,6 +9,7 @@
 //!   * type compatibility: variable initializers, `return` values, operator
 //!     operands, `if`/`while` conditions, assignments, and call arguments/arity
 //!   * enum-case access (`Status.OK`) and `match` exhaustiveness
+//!   * every path of a function with a concrete return type returns a value
 //!
 //! Types are inferred bottom-up for every expression. `unknown` (unresolved)
 //! and `any` are compatible with everything, so an earlier error never
@@ -148,6 +149,40 @@ fn isBuiltinType(name: []const u8) bool {
         if (std.mem.eql(u8, t, name)) return true;
     }
     return false;
+}
+
+// --- control flow ------------------------------------------------------------
+
+/// Whether a block always exits via `return` (i.e. cannot fall off the end).
+fn alwaysReturns(stmts: []const Stmt) bool {
+    for (stmts) |s| {
+        if (stmtReturns(s)) return true;
+    }
+    return false;
+}
+
+fn stmtReturns(stmt: Stmt) bool {
+    return switch (stmt) {
+        .return_stmt => true,
+        .if_stmt => |x| ifReturns(x),
+        // With no `break`, `while true:` never falls through.
+        .while_stmt => |x| switch (x.cond.*) {
+            .bool_literal => |b| b.value,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+fn ifReturns(x: Stmt.If) bool {
+    // An `if` guarantees a return only when it is exhaustive (has an `else`)
+    // and every branch returns.
+    if (x.else_body == null) return false;
+    if (!alwaysReturns(x.then_body)) return false;
+    for (x.elifs) |e| {
+        if (!alwaysReturns(e.body)) return false;
+    }
+    return alwaysReturns(x.else_body.?);
 }
 
 // --- symbols and scopes ------------------------------------------------------
@@ -416,7 +451,11 @@ const Analyzer = struct {
 
     fn registerTopLevel(self: *Analyzer, decl: Decl) Error!void {
         switch (decl) {
-            .import => |x| try self.declareIn(self.module_scope, x.name, .import, .unknown, x.span),
+            // Imports are inert: with no module system there is nothing to bind
+            // at runtime, so binding a name here would let `check` pass on a
+            // reference that fails at run time. The import still parses and is
+            // validated for shape.
+            .import => {},
             .var_decl => |x| {
                 const ty: Type = if (x.type) |ann| self.annotationType(ann) else .unknown;
                 try self.declareIn(self.module_scope, x.name, if (x.is_const) .constant else .variable, ty, x.span);
@@ -499,6 +538,13 @@ const Analyzer = struct {
             self.current_ret = saved_ret;
         }
         try self.analyzeStmts(f.body);
+
+        // A function with a concrete return type must return on every path.
+        if (self.current_ret) |rt| {
+            if (!isAnyish(rt) and tagOf(rt) != .void and !alwaysReturns(f.body)) {
+                try self.report(f.span, "'{s}' must return {s} on all paths", .{ f.name, typeName(rt) });
+            }
+        }
     }
 
     /// Build a class/struct's member scope (parent = module) and record it under
@@ -1098,6 +1144,62 @@ test "duplicate struct field is reported" {
     try expectMessageContains(analysis, "already declared");
 }
 
+// all-paths return
+
+test "a typed function that can fall off the end is reported" {
+    var analysis = try analyzeSource(testing.allocator, "func get() -> int:\n    pass");
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "must return int on all paths");
+}
+
+test "an if without else does not guarantee a return" {
+    const src =
+        \\func f(x: int) -> int:
+        \\    if x > 0:
+        \\        return x
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "must return int on all paths");
+}
+
+test "an if/else where both branches return is exhaustive" {
+    const src =
+        \\func f(x: int) -> int:
+        \\    if x > 0:
+        \\        return 1
+        \\    else:
+        \\        return 0
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a trailing return satisfies the all-paths check" {
+    const src =
+        \\func f(x: int) -> int:
+        \\    if x > 0:
+        \\        return 1
+        \\    return 0
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a void function need not return a value" {
+    var analysis = try analyzeSource(testing.allocator, "func f() -> void:\n    pass");
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "an unannotated function need not return" {
+    var analysis = try analyzeSource(testing.allocator, "func f():\n    pass");
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
 // type checking
 
 test "initializer type mismatch is reported" {
@@ -1372,19 +1474,17 @@ test "an untyped parameter accepts any value" {
     try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
 }
 
-test "a dotted import binds its last segment" {
-    const src =
-        \\import engine.graphics.render
-        \\
-        \\func draw():
-        \\    render()
-    ;
-    var analysis = try analyzeSource(testing.allocator, src);
-    defer analysis.deinit();
-    // `render` resolves (bound name); it is not undefined.
-    for (analysis.diagnostics) |d| {
-        try testing.expect(std.mem.indexOf(u8, d.message, "render") == null);
-    }
+test "an import is valid on its own but binds no usable name" {
+    // The import parses and validates cleanly...
+    var only = try analyzeSource(testing.allocator, "import engine.graphics.render");
+    defer only.deinit();
+    try testing.expectEqual(@as(usize, 0), only.diagnostics.len);
+
+    // ...but it does not introduce a value, so referencing it is undefined
+    // (which matches the interpreter, keeping `check` sound).
+    var used = try analyzeSource(testing.allocator, "import graphics\n\nfunc draw():\n    graphics()");
+    defer used.deinit();
+    try expectMessageContains(used, "undefined name 'graphics'");
 }
 
 test "signal names are declared and their params checked" {

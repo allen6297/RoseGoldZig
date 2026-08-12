@@ -77,7 +77,8 @@ there are no upward dependencies.
 
 ## Language reference (what's implemented)
 
-- **Declarations:** `import a.b.c` (dotted; binds the last segment), `const`/`var`
+- **Declarations:** `import a.b.c` (dotted; parses and validates but is **inert** —
+  binds no name, since there is no module system yet), `const`/`var`
   (optional `: type`), `func name(p: T, q) -> R:` (params may be untyped → `any`),
   `class` (with `extends` / `uses`), `struct` (no inheritance), `enum { A, B = 2 }`,
   `signal name(params)`. `pub`/`private`/`static` modifiers parse.
@@ -93,7 +94,8 @@ there are no upward dependencies.
 - **Analyzer checks:** undefined names, duplicate declarations, unknown types,
   init/return/operator/condition/assignment/call type compatibility, member access,
   enum-case validity (`Status.OK`), `match` exhaustiveness + unreachable arms,
-  `extends`/`uses` validity + inheritance-aware assignability.
+  `extends`/`uses` validity + inheritance-aware assignability, and that every
+  path of a function with a concrete return type returns a value.
 - **Interpreter:** runs everything above. Classes/structs: `Name(...)` constructs (fields
   take defaults; a method named `init` is the constructor), inheritance is honored at
   runtime (inherited fields, method override, chained `init`). Enum cases are distinct
