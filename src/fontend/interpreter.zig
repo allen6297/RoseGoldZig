@@ -5,7 +5,8 @@
 //! language: scalars, variables, arithmetic/comparison/logical operators,
 //! functions (with recursion), `if`/`elif`/`else`, `while`, `for`, `return`,
 //! `match`, list/map literals and indexing, and the `print`, `echo`, `len`,
-//! and `range` builtins.
+//! and `range` builtins. `for` iterates a list's elements, a string's
+//! characters, or a map's keys.
 //!
 //! Execution starts by binding the module's globals (functions and evaluated
 //! `const`/`var`), then calling `main()` if it exists. Program output is
@@ -496,8 +497,19 @@ const Interpreter = struct {
 
     fn execFor(self: *Interpreter, x: Stmt.For) Error!Flow {
         const iter = try self.eval(x.iter.*);
-        const items = switch (iter) {
+        // Iterate a list's elements, a string's characters, or a map's keys.
+        const items: []const Value = switch (iter) {
             .list => |l| l.items,
+            .str => |s| blk: {
+                const chars = try self.arena.alloc(Value, s.len);
+                for (0..s.len) |i| chars[i] = .{ .str = s[i .. i + 1] };
+                break :blk chars;
+            },
+            .map => |m| blk: {
+                const keys = try self.arena.alloc(Value, m.entries.items.len);
+                for (m.entries.items, 0..) |entry, i| keys[i] = entry.key;
+                break :blk keys;
+            },
             else => return self.fail(x.span, "cannot iterate over {s}", .{@tagName(iter)}),
         };
         for (items) |item| {
@@ -1016,6 +1028,44 @@ test "for over range" {
         \\    print(total)
     ;
     try expectOutput(src, "6\n");
+}
+
+test "for over a string yields each character" {
+    const src =
+        \\func main():
+        \\    for ch in "abc":
+        \\        print(ch)
+    ;
+    try expectOutput(src, "a\nb\nc\n");
+}
+
+test "for over a map yields its keys in insertion order" {
+    const src =
+        \\func main():
+        \\    var m = {"x": 1, "y": 2}
+        \\    for k in m:
+        \\        print(k)
+    ;
+    try expectOutput(src, "x\ny\n");
+}
+
+test "for over a map keys can index the map" {
+    const src =
+        \\func main():
+        \\    var m = {"a": 10, "b": 20}
+        \\    var total: int = 0
+        \\    for k in m:
+        \\        total = total + m[k]
+        \\    print(total)
+    ;
+    try expectOutput(src, "30\n");
+}
+
+test "iterating a non-iterable is a runtime error" {
+    var result = try runSource(testing.allocator, "func main():\n    for x in 5:\n        print(x)");
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "cannot iterate over int") != null);
 }
 
 test "match expression selects the right arm" {
