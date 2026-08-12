@@ -20,7 +20,8 @@ uniform. See `examples/demo.rg` (single file) and `examples/app.rg` (imports
 zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
-zig build test                  # run every test (211 as of writing)
+zig build run -- repl           # interactive session (also the default, no file)
+zig build test                  # run every test (214 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -28,9 +29,10 @@ zig test src/fontend/parser.zig
 zig test src/fontend/interpreter.zig   # covers parser + lexer too
 ```
 
-The CLI (`run`/`check`, default `run`) prints program output to **stdout** and
-renders diagnostics (with a source line + caret) to **stderr**, exiting non-zero
-on any error.
+The CLI (`run`/`check`/`repl`, default `run` with a file / `repl` without) prints
+program output to **stdout** and renders diagnostics (with a source line + caret)
+to **stderr**, exiting non-zero on any error. `repl` starts an interactive
+read-eval-print loop whose definitions and values persist across entries.
 
 ## Layout
 
@@ -38,7 +40,7 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 
 | File | Role |
 | --- | --- |
-| `src/main.zig` | CLI driver: arg parsing, file read, pipeline, diagnostic rendering. Plus scaffold tests. |
+| `src/main.zig` | CLI driver: arg parsing, file read, pipeline, diagnostic rendering, and the `repl` read-eval-print loop. Plus scaffold tests. |
 | `src/fontend/lexer.zig` | Lexer. Indentation → INDENT/DEDENT/NEWLINE layout tokens; comments; diagnostics. |
 | `src/fontend/parser.zig` | Recursive-descent parser → AST (all `pub`). Owns the AST node types. |
 | `src/fontend/loader.zig` | Module loader: reads + parses the entry file and its transitive imports into a dependency-ordered `Graph`; path resolution, dedup, cycle detection. |
@@ -157,6 +159,17 @@ loader, then the analyzer and interpreter over the loaded module set.
 - **Limits (v1):** imports resolve relative to the importer's dir (no search path);
   cross-module *inheritance* isn't supported (a class can't `extends` an imported type);
   a runtime error is attributed to the entry file.
+
+### REPL
+- `repl` (or no file) starts a persistent interpreter session (`interpreter.Repl`
+  via `replInit`/`run`). `parser.parseRepl` accepts a mix of declarations and
+  statements, so a bare expression like `1 + 1` is a statement whose value is
+  printed. Definitions and values persist across entries; the CLI keeps every
+  entry's source + parsed chunk alive because function values borrow that AST.
+- **It does not run the analyzer** — entries are parsed and interpreted directly,
+  so mistakes surface as runtime errors (the session survives them), not as
+  `check`-style diagnostics. Reading continues across an indented block (ended by
+  a blank line) or unclosed brackets. `import` is unavailable in the REPL.
 
 ### Known gaps / future work
 - **Static** members are not inherited (reached only through their declaring type's

@@ -257,6 +257,71 @@ pub fn runProgram(gpa: std.mem.Allocator, modules: []const ProgramModule) Error!
     };
 }
 
+// --- REPL --------------------------------------------------------------------
+
+/// The result of running one REPL entry: the text it produced (prints plus the
+/// printed value of any bare expression) and a runtime error if it hit one.
+pub const ReplOutcome = struct { output: []const u8, runtime_error: ?RuntimeError };
+
+/// A persistent interpreter for the REPL: globals, types, and output survive
+/// across entries. Heap-allocated so the interpreter's self-references (into its
+/// own arena and output) stay valid. The parsed `ReplChunk`s must be kept alive
+/// (function values borrow their AST); the caller owns that.
+pub const Repl = struct {
+    arena: std.heap.ArenaAllocator,
+    interp: Interpreter,
+    output: std.ArrayList(u8),
+
+    pub fn deinit(self: *Repl) void {
+        const gpa = self.arena.child_allocator;
+        self.arena.deinit();
+        gpa.destroy(self);
+    }
+
+    /// Run one parsed entry, returning the output it produced and any runtime
+    /// error. Output is fresh each call.
+    pub fn run(self: *Repl, items: []const parser.ReplItem) Error!ReplOutcome {
+        self.output.clearRetainingCapacity();
+        const in = &self.interp;
+        in.runtime_error = null;
+        in.env = in.globals;
+        in.current_receiver = null;
+        in.current_statics = null;
+        for (items) |item| {
+            const res = switch (item) {
+                .decl => |d| in.registerReplDecl(d),
+                .stmt => |s| in.runReplStmt(s),
+            };
+            res catch |e| switch (e) {
+                error.Runtime => return .{ .output = self.output.items, .runtime_error = in.runtime_error },
+                else => |other| return other,
+            };
+        }
+        return .{ .output = self.output.items, .runtime_error = null };
+    }
+};
+
+pub fn replInit(gpa: std.mem.Allocator) Error!*Repl {
+    const repl = try gpa.create(Repl);
+    errdefer gpa.destroy(repl);
+    repl.* = .{
+        .arena = std.heap.ArenaAllocator.init(gpa),
+        .interp = undefined,
+        .output = .empty,
+    };
+    const alloc = repl.arena.allocator();
+    const globals = try alloc.create(Env);
+    globals.* = .{ .parent = null };
+    repl.interp = .{
+        .arena = alloc,
+        .globals = globals,
+        .env = globals,
+        .output = &repl.output,
+    };
+    try repl.interp.registerBuiltins();
+    return repl;
+}
+
 // --- interpreter -------------------------------------------------------------
 
 const Flow = enum { normal, returned, break_loop, continue_loop };
@@ -599,6 +664,52 @@ const Interpreter = struct {
     fn registerBuiltins(self: *Interpreter) Error!void {
         inline for (builtin_names, 0..) |name, i| {
             try self.define(self.globals, name, .{ .builtin = @enumFromInt(i) });
+        }
+    }
+
+    /// Register one REPL declaration into the persistent globals. `decl` points
+    /// into a chunk the caller keeps alive (function values borrow it).
+    fn registerReplDecl(self: *Interpreter, decl: *const Decl) Error!void {
+        switch (decl.*) {
+            .class => |c| {
+                try self.registerType(c.name, c.members, c.extends, c.uses);
+                const ti = self.types.get(c.name).?;
+                try self.computeInheritance(ti);
+                try self.initStatics(ti);
+            },
+            .struct_decl => |s| {
+                try self.registerType(s.name, s.members, null, &.{});
+                const ti = self.types.get(s.name).?;
+                try self.computeInheritance(ti);
+                try self.initStatics(ti);
+            },
+            .enum_decl => |en| try self.registerEnum(en.name, en.members),
+            .func => |*f| {
+                const fv = try self.arena.create(FuncValue);
+                fv.* = .{ .decl = f, .module = self.globals };
+                try self.define(self.globals, f.name, .{ .func = fv });
+            },
+            .var_decl => |v| {
+                const val = if (v.value) |x| try self.eval(x.*) else Value.nil;
+                try self.define(self.globals, v.name, val);
+            },
+            .signal => {},
+            .import => |im| return self.fail(im.span, "import is not supported in the REPL", .{}),
+        }
+    }
+
+    /// Run one REPL statement. A bare expression is evaluated and its value
+    /// printed (unless nil); everything else executes in the globals.
+    fn runReplStmt(self: *Interpreter, stmt: *const Stmt) Error!void {
+        switch (stmt.*) {
+            .expr_stmt => |e| {
+                const v = try self.eval(e.*);
+                if (v != .nil) {
+                    try self.appendValue(self.output, v);
+                    try self.output.append(self.arena, '\n');
+                }
+            },
+            else => _ = try self.execStmt(stmt.*),
         }
     }
 
@@ -1831,6 +1942,50 @@ test "a static factory sees statics and constructs instances" {
         \\    print(a.id, b.id, Widget.next)
     ;
     try expectOutput(src, "100 101 102\n");
+}
+
+test "the REPL keeps state across entries" {
+    const gpa = testing.allocator;
+    var repl = try replInit(gpa);
+    defer repl.deinit();
+
+    // Entry 1: a global var and a function that reads it. Chunks must be kept
+    // alive because the function value borrows this AST.
+    var c1 = try parser.parseRepl(gpa, "var acc: int = 10\n\nfunc add(n: int) -> int:\n    return acc + n");
+    defer c1.deinit();
+    const o1 = try repl.run(c1.items);
+    try testing.expect(o1.runtime_error == null);
+    try testing.expectEqualStrings("", o1.output); // definitions print nothing
+
+    // Entry 2: a bare expression prints its value, using both.
+    var c2 = try parser.parseRepl(gpa, "add(5)");
+    defer c2.deinit();
+    const o2 = try repl.run(c2.items);
+    try testing.expectEqualStrings("15\n", o2.output);
+
+    // Entry 3: mutate the global; the function sees the new value.
+    var c3 = try parser.parseRepl(gpa, "acc = 100\nadd(1)");
+    defer c3.deinit();
+    const o3 = try repl.run(c3.items);
+    try testing.expectEqualStrings("101\n", o3.output);
+}
+
+test "a REPL runtime error is reported and state survives" {
+    const gpa = testing.allocator;
+    var repl = try replInit(gpa);
+    defer repl.deinit();
+
+    var c1 = try parser.parseRepl(gpa, "nope()");
+    defer c1.deinit();
+    const o1 = try repl.run(c1.items);
+    try testing.expect(o1.runtime_error != null);
+
+    // The session is still usable afterward.
+    var c2 = try parser.parseRepl(gpa, "1 + 2");
+    defer c2.deinit();
+    const o2 = try repl.run(c2.items);
+    try testing.expect(o2.runtime_error == null);
+    try testing.expectEqualStrings("3\n", o2.output);
 }
 
 test "static fields are not instance fields" {

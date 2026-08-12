@@ -9,15 +9,17 @@
 
 const std = @import("std");
 const Io = std.Io;
+const Parser = @import("fontend/parser.zig");
 const Loader = @import("fontend/loader.zig");
 const Analyzer = @import("fontend/analyzer.zig");
 const Interpreter = @import("fontend/interpreter.zig");
 
 const usage =
-    \\Usage: rosegold [run|check] <file.rg>
+    \\Usage: rosegold [run|check|repl] [<file.rg>]
     \\
     \\  run     parse, analyze, and execute the program (the default)
     \\  check   parse and analyze only, then report any problems
+    \\  repl    start an interactive session (also the default with no file)
     \\
 ;
 
@@ -53,17 +55,20 @@ fn handle(
     err: *Io.Writer,
     args: []const [:0]const u8,
 ) !u8 {
+    // With no arguments, or an explicit `repl`, start an interactive session.
+    if (args.len <= 1 or std.mem.eql(u8, args[1], "repl")) {
+        return repl(arena, io, out, err);
+    }
+
     // Parse arguments: an optional subcommand followed by a file path.
     var mode: Mode = .run;
     var arg_index: usize = 1;
-    if (args.len > 1) {
-        if (std.mem.eql(u8, args[1], "run")) {
-            mode = .run;
-            arg_index = 2;
-        } else if (std.mem.eql(u8, args[1], "check")) {
-            mode = .check;
-            arg_index = 2;
-        }
+    if (std.mem.eql(u8, args[1], "run")) {
+        mode = .run;
+        arg_index = 2;
+    } else if (std.mem.eql(u8, args[1], "check")) {
+        mode = .check;
+        arg_index = 2;
     }
     if (arg_index >= args.len) {
         try err.writeAll(usage);
@@ -127,6 +132,94 @@ fn handle(
         return 1;
     }
     return 0;
+}
+
+// --- REPL --------------------------------------------------------------------
+
+/// An interactive read-eval-print loop. Definitions and values persist across
+/// entries. An entry spanning an indented block or unclosed brackets keeps
+/// reading (a blank line ends an indented block).
+fn repl(arena: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer) !u8 {
+    const session = try Interpreter.replInit(arena);
+
+    try out.writeAll("RoseGold REPL. Enter a definition or expression; a blank line ends a block; Ctrl-D exits.\n");
+
+    var in_buf: [64 * 1024]u8 = undefined;
+    var reader: Io.File.Reader = .init(.stdin(), io, &in_buf);
+    const in = &reader.interface;
+
+    var entry: std.ArrayList(u8) = .empty;
+    var in_block = false;
+    while (true) {
+        try out.writeAll(if (in_block) "... " else "rg> ");
+        try out.flush();
+
+        const maybe_line = in.takeDelimiter('\n') catch |e| {
+            try err.print("\ninput error: {s}\n", .{@errorName(e)});
+            break;
+        };
+        const line = maybe_line orelse break; // EOF (Ctrl-D)
+
+        try entry.appendSlice(arena, line);
+        try entry.append(arena, '\n');
+
+        // Keep reading while brackets are unbalanced, or an indented block is
+        // open (a `:` line opens one; a blank line closes it).
+        if (bracketDepth(entry.items) > 0) {
+            in_block = true;
+            continue;
+        }
+        const trimmed = std.mem.trimEnd(u8, line, " \t\r");
+        if (trimmed.len > 0 and trimmed[trimmed.len - 1] == ':') {
+            in_block = true;
+            continue;
+        }
+        if (in_block and trimmed.len != 0) continue;
+        in_block = false;
+
+        if (std.mem.trim(u8, entry.items, " \t\r\n").len == 0) {
+            entry.clearRetainingCapacity();
+            continue;
+        }
+        // The parsed AST borrows its source, so give each entry its own copy that
+        // outlives the reused scratch buffer (function values persist).
+        const src = try arena.dupe(u8, entry.items);
+        entry.clearRetainingCapacity();
+        try runReplEntry(arena, out, err, session, src);
+    }
+    try out.writeAll("\n");
+    return 0;
+}
+
+fn runReplEntry(arena: std.mem.Allocator, out: *Io.Writer, err: *Io.Writer, session: *Interpreter.Repl, src: []const u8) !void {
+    // Never deinit the chunk: function values borrow its AST for the session.
+    const chunk = try Parser.parseRepl(arena, src);
+    if (chunk.diagnostics.len > 0) {
+        for (chunk.diagnostics) |d| {
+            try render(err, "error", "<repl>", src, d.message, d.line, d.col);
+        }
+        try err.flush();
+        return;
+    }
+    const outcome = try session.run(chunk.items);
+    try out.writeAll(outcome.output);
+    try out.flush();
+    if (outcome.runtime_error) |re| {
+        try render(err, "runtime error", "<repl>", src, re.message, re.line, re.col);
+        try err.flush();
+    }
+}
+
+/// Net count of open brackets in `s` (naive: ignores strings/comments, which is
+/// good enough to decide whether a REPL entry needs another line).
+fn bracketDepth(s: []const u8) i32 {
+    var depth: i32 = 0;
+    for (s) |c| switch (c) {
+        '(', '[', '{' => depth += 1,
+        ')', ']', '}' => depth -= 1,
+        else => {},
+    };
+    return depth;
 }
 
 // --- diagnostic rendering ----------------------------------------------------

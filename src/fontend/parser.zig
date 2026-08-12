@@ -1062,9 +1062,99 @@ pub fn parse(gpa: std.mem.Allocator, src: []const u8) Error!Tree {
     return .{ .arena = arena, .module = module, .diagnostics = diags };
 }
 
+// --- REPL parsing ------------------------------------------------------------
+
+/// One thing entered at the REPL: a top-level declaration or a statement (a bare
+/// expression is a `stmt` holding an `expr_stmt`). Pointers reference the chunk's
+/// arena, which must outlive the items.
+pub const ReplItem = union(enum) { decl: *const Decl, stmt: *const Stmt };
+
+pub const ReplChunk = struct {
+    arena: std.heap.ArenaAllocator,
+    items: []const ReplItem,
+    diagnostics: []const Diagnostic,
+
+    pub fn deinit(self: *ReplChunk) void {
+        self.arena.deinit();
+    }
+};
+
+fn isDeclStart(kind: TokenKind) bool {
+    return switch (kind) {
+        .kw_func, .kw_class, .kw_struct, .kw_enum, .kw_signal, .kw_import, .kw_pub, .kw_private, .kw_static => true,
+        else => false,
+    };
+}
+
+/// Parse a REPL entry: a mix of declarations and statements. Anything that isn't
+/// a declaration keyword is parsed as a statement, so `1 + 1` and `print(x)` are
+/// accepted directly.
+pub fn parseRepl(gpa: std.mem.Allocator, src: []const u8) Error!ReplChunk {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+
+    var lex = try lexer.tokenize(gpa, src);
+    defer lex.deinit(gpa);
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    for (lex.diagnostics.items) |d| try diagnostics.append(alloc, d);
+
+    var parser = Parser{
+        .alloc = alloc,
+        .tokens = lex.tokens.items,
+        .src = src,
+        .diagnostics = &diagnostics,
+    };
+
+    var items: std.ArrayList(ReplItem) = .empty;
+    parser.skipNewlines();
+    while (!parser.atEnd()) {
+        if (isDeclStart(parser.peekKind())) {
+            const d = parser.parseDecl() catch |e| switch (e) {
+                error.ParseError => {
+                    parser.recover();
+                    continue;
+                },
+                else => return e,
+            };
+            const dp = try alloc.create(Decl);
+            dp.* = d;
+            try items.append(alloc, .{ .decl = dp });
+        } else {
+            const s = parser.parseStmt() catch |e| switch (e) {
+                error.ParseError => {
+                    parser.recover();
+                    continue;
+                },
+                else => return e,
+            };
+            const sp = try alloc.create(Stmt);
+            sp.* = s;
+            try items.append(alloc, .{ .stmt = sp });
+        }
+        parser.skipNewlines();
+    }
+
+    const its = try items.toOwnedSlice(alloc);
+    const diags = try diagnostics.toOwnedSlice(alloc);
+    return .{ .arena = arena, .items = its, .diagnostics = diags };
+}
+
 // --- tests -------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "parseRepl accepts a definition and a bare expression" {
+    var chunk = try parseRepl(testing.allocator, "func f():\n    return 1\n\nf() + 2");
+    defer chunk.deinit();
+    try testing.expectEqual(@as(usize, 0), chunk.diagnostics.len);
+    try testing.expectEqual(@as(usize, 2), chunk.items.len);
+    try testing.expect(chunk.items[0] == .decl);
+    try testing.expect(chunk.items[0].decl.* == .func);
+    try testing.expect(chunk.items[1] == .stmt);
+    try testing.expect(chunk.items[1].stmt.* == .expr_stmt);
+}
 
 test "parses an import" {
     var tree = try parse(testing.allocator, "import graphics");
