@@ -39,6 +39,8 @@ pub const TokenKind = enum {
     kw_for,
     kw_in,
     kw_while,
+    kw_break,
+    kw_continue,
     kw_return,
     kw_pass,
     kw_pub,
@@ -105,6 +107,8 @@ const keywords = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "for", .kw_for },
     .{ "in", .kw_in },
     .{ "while", .kw_while },
+    .{ "break", .kw_break },
+    .{ "continue", .kw_continue },
     .{ "return", .kw_return },
     .{ "pass", .kw_pass },
     .{ "pub", .kw_pub },
@@ -1000,6 +1004,16 @@ test "logical keywords lex as keywords" {
     for (expected, result.tokens.items) |kind, tok| {
         try std.testing.expectEqual(kind, tok.kind);
     }
+}
+
+test "break and continue are keywords" {
+    const gpa = std.testing.allocator;
+    var result = try tokenize(gpa, "break\ncontinue\n");
+    defer result.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.len);
+    try std.testing.expectEqual(TokenKind.kw_break, result.tokens.items[0].kind);
+    try std.testing.expectEqual(TokenKind.kw_continue, result.tokens.items[2].kind);
 }
 
 test "signal is a keyword" {

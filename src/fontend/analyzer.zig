@@ -168,13 +168,34 @@ fn stmtReturns(stmt: Stmt) bool {
     return switch (stmt) {
         .return_stmt => true,
         .if_stmt => |x| ifReturns(x),
-        // With no `break`, `while true:` never falls through.
+        // `while true:` never falls through unless a `break` can exit it.
         .while_stmt => |x| switch (x.cond.*) {
-            .bool_literal => |b| b.value,
+            .bool_literal => |b| b.value and !hasBreak(x.body),
             else => false,
         },
         else => false,
     };
+}
+
+/// Whether a `break` at this loop's own level can be reached (breaks inside
+/// nested loops belong to those loops, so we do not descend into them).
+fn hasBreak(stmts: []const Stmt) bool {
+    for (stmts) |s| {
+        switch (s) {
+            .break_stmt => return true,
+            .if_stmt => |x| {
+                if (hasBreak(x.then_body)) return true;
+                for (x.elifs) |e| {
+                    if (hasBreak(e.body)) return true;
+                }
+                if (x.else_body) |eb| {
+                    if (hasBreak(eb)) return true;
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn ifReturns(x: Stmt.If) bool {
@@ -271,6 +292,9 @@ const Analyzer = struct {
     /// The class/struct whose body is currently being analyzed, so `private`
     /// members are reachable from inside their own type.
     current_class: ?[]const u8 = null,
+    /// How many loops enclose the statement being analyzed, so `break`/
+    /// `continue` outside a loop can be reported.
+    loop_depth: u32 = 0,
     /// Member scope of each class/struct, keyed by type name, so `x.member` can
     /// be resolved from anywhere. Built before any body is analyzed.
     user_types: std.StringHashMapUnmanaged(*Scope) = .{},
@@ -726,6 +750,8 @@ const Analyzer = struct {
             },
             .while_stmt => |x| {
                 try self.checkCondition(x.cond);
+                self.loop_depth += 1;
+                defer self.loop_depth -= 1;
                 try self.analyzeChildBlock(x.body);
             },
             .for_stmt => |x| {
@@ -734,7 +760,11 @@ const Analyzer = struct {
                 try self.declareIn(child, x.binding, .binding, .unknown, x.span);
                 const saved = self.current;
                 self.current = child;
-                defer self.current = saved;
+                self.loop_depth += 1;
+                defer {
+                    self.current = saved;
+                    self.loop_depth -= 1;
+                }
                 try self.analyzeStmts(x.body);
             },
             .assign => |x| {
@@ -746,6 +776,12 @@ const Analyzer = struct {
             },
             .expr_stmt => |e| _ = try self.typeOf(e.*),
             .pass => {},
+            .break_stmt => |span| {
+                if (self.loop_depth == 0) try self.report(span, "'break' outside a loop", .{});
+            },
+            .continue_stmt => |span| {
+                if (self.loop_depth == 0) try self.report(span, "'continue' outside a loop", .{});
+            },
         }
     }
 
@@ -1263,6 +1299,47 @@ test "an unannotated function need not return" {
     var analysis = try analyzeSource(testing.allocator, "func f():\n    pass");
     defer analysis.deinit();
     try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+// loop control
+
+test "break outside a loop is reported" {
+    var analysis = try analyzeSource(testing.allocator, "func f():\n    break");
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "'break' outside a loop");
+}
+
+test "continue outside a loop is reported" {
+    var analysis = try analyzeSource(testing.allocator, "func f():\n    continue");
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "'continue' outside a loop");
+}
+
+test "break and continue are allowed inside loops" {
+    const src =
+        \\func f(xs: any):
+        \\    while true:
+        \\        if false:
+        \\            break
+        \\        continue
+        \\    for x in xs:
+        \\        break
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "while true without a break still guarantees a return" {
+    var analysis = try analyzeSource(testing.allocator, "func f() -> int:\n    while true:\n        return 1");
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "while true with a break no longer guarantees a return" {
+    var analysis = try analyzeSource(testing.allocator, "func f() -> int:\n    while true:\n        break");
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "must return int on all paths");
 }
 
 // type checking

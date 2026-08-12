@@ -82,9 +82,10 @@ there are no upward dependencies.
   (optional `: type`), `func name(p: T, q) -> R:` (params may be untyped → `any`),
   `class` (with `extends` / `uses`), `struct` (no inheritance), `enum { A, B = 2 }`,
   `signal name(params)`. `pub`/`private`/`static` modifiers parse.
-- **Statements:** `return`, `if`/`elif`/`else`, `while`, `for x in iter:`, `pass`,
-  assignment, expression statements. All statement blocks are colon-blocks
-  (indentation); braces `{ }` are only for `enum`/`match` bodies.
+- **Statements:** `return`, `if`/`elif`/`else`, `while`, `for x in iter:`,
+  `break`, `continue`, `pass`, assignment, expression statements. All statement
+  blocks are colon-blocks (indentation); braces `{ }` are only for `enum`/`match`
+  bodies.
 - **Expressions:** literals, identifiers, `and`/`or`/`not`, arithmetic/comparison with
   precedence, calls, indexing `a[i]`, member access `x.f`, array `[...]` and map `{k: v}`
   literals, and `match subj { pattern: body, ... }` (patterns: literals, `_`, binding).

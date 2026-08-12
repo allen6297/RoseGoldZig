@@ -211,7 +211,7 @@ pub fn run(gpa: std.mem.Allocator, module: Module) Error!RunResult {
 
 // --- interpreter -------------------------------------------------------------
 
-const Flow = enum { normal, returned };
+const Flow = enum { normal, returned, break_loop, continue_loop };
 
 const Interpreter = struct {
     arena: std.mem.Allocator,
@@ -451,7 +451,8 @@ const Interpreter = struct {
 
     fn execBlock(self: *Interpreter, stmts: []const Stmt) Error!Flow {
         for (stmts) |s| {
-            if (try self.execStmt(s) == .returned) return .returned;
+            const flow = try self.execStmt(s);
+            if (flow != .normal) return flow; // propagate return/break/continue
         }
         return .normal;
     }
@@ -487,10 +488,16 @@ const Interpreter = struct {
             },
             .while_stmt => |x| {
                 while (isTruthy(try self.eval(x.cond.*))) {
-                    if (try self.execChildBlock(x.body) == .returned) return .returned;
+                    switch (try self.execChildBlock(x.body)) {
+                        .returned => return .returned,
+                        .break_loop => break,
+                        .normal, .continue_loop => {},
+                    }
                 }
             },
             .for_stmt => |x| return self.execFor(x),
+            .break_stmt => return .break_loop,
+            .continue_stmt => return .continue_loop,
         }
         return .normal;
     }
@@ -519,7 +526,11 @@ const Interpreter = struct {
             try self.define(child, x.binding, item);
             const flow = self.execBlock(x.body);
             self.env = saved;
-            if (try flow == .returned) return .returned;
+            switch (try flow) {
+                .returned => return .returned,
+                .break_loop => break,
+                .normal, .continue_loop => {},
+            }
         }
         return .normal;
     }
@@ -1066,6 +1077,46 @@ test "iterating a non-iterable is a runtime error" {
     defer result.deinit();
     try testing.expect(result.runtime_error != null);
     try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "cannot iterate over int") != null);
+}
+
+test "break exits a loop early" {
+    const src =
+        \\func main():
+        \\    var i: int = 0
+        \\    while i < 10:
+        \\        if i == 3:
+        \\            break
+        \\        i = i + 1
+        \\    print(i)
+    ;
+    try expectOutput(src, "3\n");
+}
+
+test "continue skips to the next iteration" {
+    const src =
+        \\func main():
+        \\    var sum: int = 0
+        \\    for n in range(5):
+        \\        if n == 2:
+        \\            continue
+        \\        sum = sum + n
+        \\    print(sum)
+    ;
+    try expectOutput(src, "8\n"); // 0 + 1 + 3 + 4
+}
+
+test "break affects only the innermost loop" {
+    const src =
+        \\func main():
+        \\    var count: int = 0
+        \\    for a in range(3):
+        \\        for b in range(3):
+        \\            if b == 1:
+        \\                break
+        \\            count = count + 1
+        \\    print(count)
+    ;
+    try expectOutput(src, "3\n"); // inner runs once (b=0) per outer iteration
 }
 
 test "match expression selects the right arm" {

@@ -5,8 +5,9 @@
 //! It covers the subset the language currently exercises:
 //!   * top-level declarations: `import` (dotted paths), `const`/`var`, `enum`,
 //!     `func` (with optional parameter types), `class`, `struct`, `signal`
-//!   * statements: `return`, `if`/`elif`/`else`, `while`, `for`, `pass`,
-//!     local `var`/`const`, assignments, and expression statements
+//!   * statements: `return`, `if`/`elif`/`else`, `while`, `for`, `break`,
+//!     `continue`, `pass`, local `var`/`const`, assignments, and expression
+//!     statements
 //!   * expressions: literals, identifiers, member access, calls, indexing,
 //!     array/map literals, unary `-`/`not`, arithmetic/comparison/logical
 //!     operators with precedence, and `match`
@@ -126,6 +127,8 @@ pub const Stmt = union(enum) {
     assign: Assign,
     expr_stmt: *Expr,
     pass: Span,
+    break_stmt: Span,
+    continue_stmt: Span,
 
     pub const Return = struct { value: ?*Expr, span: Span };
     pub const ElseIf = struct { cond: *Expr, body: []const Stmt };
@@ -626,6 +629,14 @@ const Parser = struct {
             .kw_pass => {
                 const t = self.advance();
                 return .{ .pass = t.span };
+            },
+            .kw_break => {
+                const t = self.advance();
+                return .{ .break_stmt = t.span };
+            },
+            .kw_continue => {
+                const t = self.advance();
+                return .{ .continue_stmt = t.span };
             },
             .kw_var, .kw_const => return .{ .var_decl = try self.parseVarDecl(.default) },
             else => {
@@ -1301,6 +1312,24 @@ test "enum members without values still parse" {
     const e = tree.module.decls[0].enum_decl;
     try testing.expectEqual(@as(usize, 2), e.members.len);
     try testing.expect(e.members[0].value == null);
+}
+
+test "parses break and continue statements" {
+    const src =
+        \\func f():
+        \\    while true:
+        \\        break
+        \\    for x in xs:
+        \\        continue
+    ;
+    var tree = try parse(testing.allocator, src);
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const body = tree.module.decls[0].func.body;
+    try testing.expectEqual(@as(usize, 2), body.len);
+    try testing.expect(std.meta.activeTag(body[0].while_stmt.body[0]) == .break_stmt);
+    try testing.expect(std.meta.activeTag(body[1].for_stmt.body[0]) == .continue_stmt);
 }
 
 test "index and call chain in a for body" {
