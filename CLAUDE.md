@@ -97,7 +97,8 @@ there are no upward dependencies.
   it's usable as `T`. `?T`-returning functions may fall off the end (yielding `nil`).
 - **Analyzer checks:** undefined names, duplicate declarations, unknown types,
   init/return/operator/condition/assignment/call type compatibility, member access,
-  enum-case validity (`Status.OK`), `match` exhaustiveness + unreachable arms,
+  enum-case validity (`Status.OK`), `match` exhaustiveness + unreachable arms +
+  arm-type unification (arms unify to a common type; a `nil` arm makes it optional),
   `extends`/`uses` validity + inheritance-aware assignability, member access
   (including inherited members) with `private` reachable only inside its own
   type, and that every path of a function with a concrete return type returns a

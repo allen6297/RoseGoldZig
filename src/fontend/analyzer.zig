@@ -8,7 +8,8 @@
 //!   * unknown types in annotations
 //!   * type compatibility: variable initializers, `return` values, operator
 //!     operands, `if`/`while` conditions, assignments, and call arguments/arity
-//!   * enum-case access (`Status.OK`) and `match` exhaustiveness
+//!   * enum-case access (`Status.OK`), `match` exhaustiveness, and unification
+//!     of `match` arm types into the expression's result type
 //!   * every path of a function with a concrete return type returns a value
 //!
 //! Types are inferred bottom-up for every expression. `unknown` (unresolved)
@@ -444,6 +445,36 @@ const Analyzer = struct {
             .any, .unknown, .enum_ref => true,
             .nil, .optional => false, // needs an optional target / must be unwrapped
         };
+    }
+
+    fn makeOptional(self: *Analyzer, inner: Type) Error!Type {
+        switch (tagOf(inner)) {
+            .optional, .nil => return inner, // ?(?T) = ?T; ?nil = nil
+            else => {},
+        }
+        const opt = try self.arena.create(Optional);
+        opt.* = .{ .inner = inner, .name = try std.fmt.allocPrint(self.arena, "?{s}", .{typeName(inner)}) };
+        return .{ .optional = opt };
+    }
+
+    /// The least upper bound of two types, or null if they are incompatible. A
+    /// `nil` arm makes the result optional; widening and inheritance apply.
+    fn join(self: *Analyzer, a: Type, b: Type) Error!?Type {
+        if (isAnyish(a) or isAnyish(b)) return .unknown;
+        const ta = tagOf(a);
+        const tb = tagOf(b);
+        if (ta == .nil and tb == .nil) return .nil;
+        if (ta == .nil) return try self.makeOptional(b);
+        if (tb == .nil) return try self.makeOptional(a);
+        if (ta == .optional or tb == .optional) {
+            const ia = if (ta == .optional) a.optional.inner else a;
+            const ib = if (tb == .optional) b.optional.inner else b;
+            const inner = (try self.join(ia, ib)) orelse return null;
+            return try self.makeOptional(inner);
+        }
+        if (self.assignable(a, b)) return b;
+        if (self.assignable(b, a)) return a;
+        return null;
     }
 
     /// Validate every class's `extends`/`uses` targets and compute the transitive
@@ -1040,6 +1071,9 @@ const Analyzer = struct {
         var has_catch_all = false;
         var covers_true = false;
         var covers_false = false;
+        // The match's value is the least upper bound of its arms' bodies.
+        var result: ?Type = null;
+        var incompatible = false;
 
         for (m.arms) |arm| {
             if (has_catch_all) {
@@ -1060,15 +1094,28 @@ const Analyzer = struct {
             }
             const saved = self.current;
             self.current = child;
-            defer self.current = saved;
-            _ = try self.typeOf(arm.body.*);
+            const at = self.typeOf(arm.body.*) catch |e| {
+                self.current = saved;
+                return e;
+            };
+            self.current = saved;
+
+            if (result) |r| {
+                if (try self.join(r, at)) |joined| result = joined else incompatible = true;
+            } else {
+                result = at;
+            }
         }
 
         const bool_exhaustive = tagOf(subject) == .bool and covers_true and covers_false;
         if (!has_catch_all and !bool_exhaustive) {
             try self.report(m.span, "match is not exhaustive; add a '_' case", .{});
         }
-        return .unknown; // arm types are not unified yet
+        if (incompatible) {
+            try self.report(m.span, "match arms have incompatible types", .{});
+            return .unknown;
+        }
+        return result orelse .unknown;
     }
 };
 
@@ -1483,6 +1530,86 @@ test "a nil check narrows the optional in the else-branch" {
         \\        return 0
         \\    else:
         \\        return x
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 0), a.diagnostics.len);
+}
+
+// match result type
+
+test "a homogeneous match unifies to the arm type" {
+    // The match yields str, so returning it as int is an error.
+    const src =
+        \\func f(n: int) -> int:
+        \\    return match n {
+        \\        1: "a"
+        \\        _: "b"
+        \\    }
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try expectMessageContains(a, "cannot return str");
+}
+
+test "a match widens numeric arms to float" {
+    const src =
+        \\func f(n: int) -> str:
+        \\    return match n {
+        \\        1: 5
+        \\        _: 3.0
+        \\    }
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try expectMessageContains(a, "cannot return float");
+}
+
+test "a match with a nil arm is optional" {
+    const clean =
+        \\func f(n: int) -> ?int:
+        \\    return match n {
+        \\        1: n
+        \\        _: nil
+        \\    }
+    ;
+    var ok = try analyzeSource(testing.allocator, clean);
+    defer ok.deinit();
+    try testing.expectEqual(@as(usize, 0), ok.diagnostics.len);
+
+    // The ?int result is not assignable to a bare int.
+    const bad =
+        \\func f(n: int) -> int:
+        \\    return match n {
+        \\        1: n
+        \\        _: nil
+        \\    }
+    ;
+    var err = try analyzeSource(testing.allocator, bad);
+    defer err.deinit();
+    try expectMessageContains(err, "cannot return ?int");
+}
+
+test "incompatible match arms are reported" {
+    const src =
+        \\func f(n: int) -> any:
+        \\    return match n {
+        \\        1: 5
+        \\        _: "no"
+        \\    }
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try expectMessageContains(a, "incompatible types");
+}
+
+test "a well-typed match type-checks cleanly" {
+    const src =
+        \\func label(n: int) -> str:
+        \\    return match n {
+        \\        1: "one"
+        \\        _: "many"
+        \\    }
     ;
     var a = try analyzeSource(testing.allocator, src);
     defer a.deinit();
