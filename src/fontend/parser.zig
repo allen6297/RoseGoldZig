@@ -3,7 +3,8 @@
 //!
 //! A recursive-descent parser over the token stream produced by `lexer.zig`.
 //! It covers the subset the language currently exercises:
-//!   * top-level declarations: `import`, `const`/`var`, `enum`, `func`, `class`
+//!   * top-level declarations: `import`, `const`/`var`, `enum`, `func`, `class`,
+//!     `struct`
 //!   * statements: `return`, `if`/`elif`/`else`, `while`, `for`, `pass`,
 //!     local `var`/`const`, assignments, and expression statements
 //!   * expressions: literals, identifiers, member access, calls, indexing,
@@ -152,6 +153,7 @@ pub const Decl = union(enum) {
     var_decl: VarDecl,
     func: Func,
     class: Class,
+    struct_decl: Struct,
     enum_decl: Enum,
 
     pub const Import = struct { name: []const u8, span: Span };
@@ -169,6 +171,13 @@ pub const Decl = union(enum) {
         name: []const u8,
         extends: ?[]const u8,
         uses: []const []const u8,
+        members: []const Decl,
+        span: Span,
+    };
+    /// Like a class, but a plain aggregate: no `extends` / `uses`.
+    pub const Struct = struct {
+        visibility: Visibility,
+        name: []const u8,
         members: []const Decl,
         span: Span,
     };
@@ -387,6 +396,7 @@ const Parser = struct {
             .kw_const, .kw_var => return .{ .var_decl = try self.parseVarDecl(visibility) },
             .kw_func => return .{ .func = try self.parseFunc(visibility, is_static) },
             .kw_class => return .{ .class = try self.parseClass(visibility) },
+            .kw_struct => return .{ .struct_decl = try self.parseStruct(visibility) },
             .kw_enum => return .{ .enum_decl = try self.parseEnum(visibility) },
             else => {
                 try self.err("expected a declaration");
@@ -479,6 +489,18 @@ const Parser = struct {
             .name = name.text,
             .extends = extends,
             .uses = try uses.toOwnedSlice(self.alloc),
+            .members = members,
+            .span = spanFrom(kw, self.prev()),
+        };
+    }
+
+    fn parseStruct(self: *Parser, visibility: Visibility) Error!Decl.Struct {
+        const kw = try self.expect(.kw_struct, "expected 'struct'");
+        const name = try self.expect(.identifier, "expected a struct name");
+        const members = try self.parseColonDeclBlock();
+        return .{
+            .visibility = visibility,
+            .name = name.text,
             .members = members,
             .span = spanFrom(kw, self.prev()),
         };
@@ -985,6 +1007,27 @@ test "parses a typed const with a string value" {
     try testing.expectEqualStrings("VERSION", d.var_decl.name);
     try testing.expectEqualStrings("str", d.var_decl.type.?.name);
     try testing.expect(std.meta.activeTag(d.var_decl.value.?.*) == .string_literal);
+}
+
+test "parses a struct with fields and a method" {
+    const src =
+        \\struct Point:
+        \\    var x: int = 0
+        \\    var y: int = 0
+        \\
+        \\    func magnitude() -> int:
+        \\        return x
+    ;
+    var tree = try parse(testing.allocator, src);
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const d = tree.module.decls[0];
+    try testing.expect(std.meta.activeTag(d) == .struct_decl);
+    try testing.expectEqualStrings("Point", d.struct_decl.name);
+    try testing.expectEqual(@as(usize, 3), d.struct_decl.members.len);
+    try testing.expect(std.meta.activeTag(d.struct_decl.members[0]) == .var_decl);
+    try testing.expect(std.meta.activeTag(d.struct_decl.members[2]) == .func);
 }
 
 test "parses an enum body" {

@@ -162,12 +162,17 @@ const SymbolKind = enum {
     constant,
     function,
     class,
+    struct_type,
     enum_type,
     parameter,
     field,
     method,
     binding,
 };
+
+fn isUserType(kind: SymbolKind) bool {
+    return kind == .class or kind == .struct_type or kind == .enum_type;
+}
 
 const Symbol = struct {
     kind: SymbolKind,
@@ -258,7 +263,7 @@ const Analyzer = struct {
     fn checkType(self: *Analyzer, t: TypeRef) Error!void {
         if (isBuiltinType(t.name)) return;
         if (self.module_scope.symbols.get(t.name)) |sym| {
-            if (sym.kind == .class or sym.kind == .enum_type) return;
+            if (isUserType(sym.kind)) return;
         }
         try self.report(t.span, "unknown type '{s}'", .{t.name});
     }
@@ -276,7 +281,7 @@ const Analyzer = struct {
         if (std.mem.eql(u8, n, "list")) return .list;
         if (std.mem.eql(u8, n, "map")) return .map;
         if (self.module_scope.symbols.get(n)) |sym| {
-            if (sym.kind == .class or sym.kind == .enum_type) return .{ .named = n };
+            if (isUserType(sym.kind)) return .{ .named = n };
         }
         return .unknown;
     }
@@ -318,6 +323,7 @@ const Analyzer = struct {
             },
             .func => |x| try self.declareIn(self.module_scope, x.name, .function, .unknown, x.span),
             .class => |x| try self.declareIn(self.module_scope, x.name, .class, .unknown, x.span),
+            .struct_decl => |x| try self.declareIn(self.module_scope, x.name, .struct_type, .unknown, x.span),
             .enum_decl => |x| try self.declareIn(self.module_scope, x.name, .enum_type, .unknown, x.span),
         }
     }
@@ -330,7 +336,8 @@ const Analyzer = struct {
                 if (self.module_scope.symbols.getPtr(x.name)) |sym| sym.ty = ty;
             },
             .func => |x| try self.analyzeFunc(x),
-            .class => |x| try self.analyzeClass(x),
+            .class => |x| try self.analyzeMembers(x.members),
+            .struct_decl => |x| try self.analyzeMembers(x.members),
             .enum_decl => |x| try self.analyzeEnum(x),
         }
     }
@@ -376,26 +383,28 @@ const Analyzer = struct {
         try self.analyzeStmts(f.body);
     }
 
-    fn analyzeClass(self: *Analyzer, c: Decl.Class) Error!void {
-        const class_scope = try self.newScope(self.module_scope);
+    /// Analyze the body of a class or struct: a member scope hanging off the
+    /// module, in which fields and methods are registered before any body so
+    /// methods can see them (and each other) by bare name.
+    fn analyzeMembers(self: *Analyzer, members: []const Decl) Error!void {
+        const scope = try self.newScope(self.module_scope);
 
-        // Register members first so methods can see fields and each other.
-        for (c.members) |m| switch (m) {
+        for (members) |m| switch (m) {
             .var_decl => |x| {
                 const ty: Type = if (x.type) |ann| self.annotationType(ann) else .unknown;
-                try self.declareIn(class_scope, x.name, .field, ty, x.span);
+                try self.declareIn(scope, x.name, .field, ty, x.span);
             },
-            .func => |x| try self.declareIn(class_scope, x.name, .method, .{ .func = try self.funcSig(x) }, x.span),
+            .func => |x| try self.declareIn(scope, x.name, .method, .{ .func = try self.funcSig(x) }, x.span),
             else => {},
         };
 
         const saved = self.current;
-        self.current = class_scope;
+        self.current = scope;
         defer self.current = saved;
-        for (c.members) |m| switch (m) {
+        for (members) |m| switch (m) {
             .var_decl => |x| {
                 const ty = try self.checkVarDecl(x);
-                if (class_scope.symbols.getPtr(x.name)) |sym| sym.ty = ty;
+                if (scope.symbols.getPtr(x.name)) |sym| sym.ty = ty;
             },
             .func => |x| try self.analyzeFunc(x),
             else => {},
@@ -785,6 +794,34 @@ test "duplicate enum member is reported" {
     var analysis = try analyzeSource(testing.allocator, "enum E { A, B, A }");
     defer analysis.deinit();
     try expectMessageContains(analysis, "A");
+}
+
+test "a declared struct is a valid type and its methods see fields" {
+    const src =
+        \\struct Box:
+        \\    var w: int = 0
+        \\    var h: int = 0
+        \\
+        \\    func area() -> int:
+        \\        return w
+        \\
+        \\func make(b: Box):
+        \\    pass
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "duplicate struct field is reported" {
+    const src =
+        \\struct S:
+        \\    var a: int = 0
+        \\    var a: int = 1
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "already declared");
 }
 
 // type checking

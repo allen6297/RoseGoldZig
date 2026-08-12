@@ -79,6 +79,7 @@ fn parserDemo(gpa: std.mem.Allocator, out: *Io.Writer) !void {
             .var_decl => |x| try out.print("  {s:<10} {s}\n", .{ kind, x.name }),
             .func => |x| try out.print("  {s:<10} {s} ({d} param(s))\n", .{ kind, x.name, x.params.len }),
             .class => |x| try out.print("  {s:<10} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
+            .struct_decl => |x| try out.print("  {s:<10} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
             .enum_decl => |x| try out.print("  {s:<10} {s} ({d} member(s))\n", .{ kind, x.name, x.members.len }),
         }
     }
@@ -98,6 +99,10 @@ const demo_source =
     \\    OK
     \\    NOT_FOUND
     \\}
+    \\
+    \\struct Vec2:
+    \\    var x: int = 0
+    \\    var y: int = 0
     \\
     \\pub func describe(code: int) -> str:
     \\    return match code {

@@ -25,6 +25,7 @@ pub const TokenKind = enum {
     // keywords
     kw_import,
     kw_class,
+    kw_struct,
     kw_extends,
     kw_uses,
     kw_func,
@@ -90,6 +91,7 @@ pub const TokenKind = enum {
 const keywords = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "import", .kw_import },
     .{ "class", .kw_class },
+    .{ "struct", .kw_struct },
     .{ "extends", .kw_extends },
     .{ "uses", .kw_uses },
     .{ "func", .kw_func },
@@ -998,6 +1000,16 @@ test "logical keywords lex as keywords" {
     for (expected, result.tokens.items) |kind, tok| {
         try std.testing.expectEqual(kind, tok.kind);
     }
+}
+
+test "struct is a keyword" {
+    const gpa = std.testing.allocator;
+    var result = try tokenize(gpa, "struct Point\n");
+    defer result.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.items.len);
+    try std.testing.expectEqual(TokenKind.kw_struct, result.tokens.items[0].kind);
+    try std.testing.expectEqual(TokenKind.identifier, result.tokens.items[1].kind);
 }
 
 test "empty source is just eof" {
