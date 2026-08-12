@@ -16,8 +16,11 @@
 //! registered before any body is analyzed, so declarations may refer to one
 //! another regardless of order.
 //!
-//! Not yet done (future work): member-access result types (`x.field` needs the
-//! type of `x`), element-typed lists/maps, and inheritance-aware assignability.
+//! Member access resolves to field/method types on a class or struct instance
+//! (`v.x`, `c.get()`), and unknown members are reported.
+//!
+//! Not yet done (future work): enum-case / static member access (`Status.OK`),
+//! element-typed lists/maps, and inheritance-aware assignability.
 //!
 //! Diagnostics are self-contained — messages are formatted into the returned
 //! arena — so an `Analysis` may outlive the `Tree` it was built from.
@@ -226,6 +229,9 @@ const Analyzer = struct {
     current: *Scope,
     module_scope: *Scope,
     current_ret: ?Type = null,
+    /// Member scope of each class/struct, keyed by type name, so `x.member` can
+    /// be resolved from anywhere. Built before any body is analyzed.
+    user_types: std.StringHashMapUnmanaged(*Scope) = .{},
 
     fn report(self: *Analyzer, span: Span, comptime fmt: []const u8, args: anytype) Error!void {
         const msg = try std.fmt.allocPrint(self.arena, fmt, args);
@@ -301,13 +307,17 @@ const Analyzer = struct {
         // Phase 1a: register every top-level name (so declarations may reference
         // one another regardless of order).
         for (module.decls) |decl| try self.registerTopLevel(decl);
-        // Phase 1b: fill in function signatures now that all type names exist.
+        // Phase 1b: now that all type names exist, fill in function signatures
+        // and build the member table of every class/struct (so `x.member` can be
+        // resolved from any body).
         for (module.decls) |decl| switch (decl) {
             .func => |f| {
                 if (self.module_scope.symbols.getPtr(f.name)) |sym| {
                     sym.ty = .{ .func = try self.funcSig(f) };
                 }
             },
+            .class => |c| try self.buildUserType(c.name, c.members),
+            .struct_decl => |s| try self.buildUserType(s.name, s.members),
             else => {},
         };
         // Phase 2: analyze bodies.
@@ -336,8 +346,8 @@ const Analyzer = struct {
                 if (self.module_scope.symbols.getPtr(x.name)) |sym| sym.ty = ty;
             },
             .func => |x| try self.analyzeFunc(x),
-            .class => |x| try self.analyzeMembers(x.members),
-            .struct_decl => |x| try self.analyzeMembers(x.members),
+            .class => |x| try self.analyzeAggregate(x.name, x.members),
+            .struct_decl => |x| try self.analyzeAggregate(x.name, x.members),
             .enum_decl => |x| try self.analyzeEnum(x),
         }
     }
@@ -383,12 +393,11 @@ const Analyzer = struct {
         try self.analyzeStmts(f.body);
     }
 
-    /// Analyze the body of a class or struct: a member scope hanging off the
-    /// module, in which fields and methods are registered before any body so
-    /// methods can see them (and each other) by bare name.
-    fn analyzeMembers(self: *Analyzer, members: []const Decl) Error!void {
+    /// Build a class/struct's member scope (parent = module) and record it under
+    /// its type name. Duplicate members are reported here. Runs in phase 1b so
+    /// member access resolves regardless of declaration order.
+    fn buildUserType(self: *Analyzer, name: []const u8, members: []const Decl) Error!void {
         const scope = try self.newScope(self.module_scope);
-
         for (members) |m| switch (m) {
             .var_decl => |x| {
                 const ty: Type = if (x.type) |ann| self.annotationType(ann) else .unknown;
@@ -397,7 +406,13 @@ const Analyzer = struct {
             .func => |x| try self.declareIn(scope, x.name, .method, .{ .func = try self.funcSig(x) }, x.span),
             else => {},
         };
+        try self.user_types.put(self.arena, name, scope);
+    }
 
+    /// Analyze the bodies of a class or struct in its pre-built member scope, so
+    /// methods see the fields and each other by bare name.
+    fn analyzeAggregate(self: *Analyzer, name: []const u8, members: []const Decl) Error!void {
+        const scope = self.user_types.get(name) orelse return;
         const saved = self.current;
         self.current = scope;
         defer self.current = saved;
@@ -409,6 +424,21 @@ const Analyzer = struct {
             .func => |x| try self.analyzeFunc(x),
             else => {},
         };
+    }
+
+    /// Resolve `object.name`. Only instance access on a known class/struct is
+    /// checked; everything else (builtins, `any`, enums, type references) is
+    /// left as `unknown` to avoid false positives.
+    fn memberType(self: *Analyzer, object: Type, name: []const u8, span: Span) Error!Type {
+        switch (object) {
+            .named => |type_name| {
+                const scope = self.user_types.get(type_name) orelse return .unknown;
+                if (scope.symbols.get(name)) |sym| return sym.ty;
+                try self.report(span, "type '{s}' has no member '{s}'", .{ type_name, name });
+                return .unknown;
+            },
+            else => return .unknown,
+        }
     }
 
     fn analyzeEnum(self: *Analyzer, e: Decl.Enum) Error!void {
@@ -522,8 +552,8 @@ const Analyzer = struct {
             .call => |c| try self.typeCall(c),
             .index => |i| try self.typeIndex(i),
             .member => |m| blk: {
-                _ = try self.typeOf(m.object.*);
-                break :blk .unknown; // member types await real type checking
+                const ot = try self.typeOf(m.object.*);
+                break :blk try self.memberType(ot, m.name, m.span);
             },
             .array => |a| blk: {
                 for (a.elements) |el| _ = try self.typeOf(el.*);
@@ -919,6 +949,64 @@ test "a well-typed call has no diagnostics" {
         \\
         \\func h() -> int:
         \\    return g(3)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+// member access
+
+test "instance field and method access are typed" {
+    const src =
+        \\struct Vec2:
+        \\    var x: int = 0
+        \\    var y: int = 0
+        \\
+        \\    func first() -> int:
+        \\        return x
+        \\
+        \\func sum(v: Vec2) -> int:
+        \\    return v.x + v.y + v.first()
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "accessing an unknown member is reported" {
+    const src =
+        \\struct Vec2:
+        \\    var x: int = 0
+        \\
+        \\func f(v: Vec2) -> int:
+        \\    return v.z
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "has no member 'z'");
+}
+
+test "member field type flows into type checking" {
+    const src =
+        \\struct Vec2:
+        \\    var x: int = 0
+        \\
+        \\func f(v: Vec2) -> str:
+        \\    return v.x
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot return int");
+}
+
+test "member access on a class instance is typed" {
+    const src =
+        \\class Player:
+        \\    var health: int = 100
+        \\
+        \\func hp(p: Player) -> int:
+        \\    return p.health
     ;
     var analysis = try analyzeSource(testing.allocator, src);
     defer analysis.deinit();
