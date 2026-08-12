@@ -14,9 +14,8 @@
 //! Classes and structs execute: `Name(...)` constructs an instance (fields take
 //! their declared defaults; a method named `init` runs as the constructor),
 //! fields and methods are reached with `.`, and a method's body sees its own
-//! instance's fields and methods by bare name.
-//!
-//! Not yet executable (future work): enum values.
+//! instance's fields and methods by bare name. Enum cases execute as `Enum.CASE`
+//! values that print as `Enum.CASE` and compare equal only to the same case.
 //!
 //! All runtime data lives in an arena owned by the returned `RunResult`. The
 //! AST (and its source) must outlive the run, since function values borrow it.
@@ -65,6 +64,15 @@ const Instance = struct {
 /// A method paired with the instance it was accessed on.
 const BoundMethod = struct { receiver: *Instance, func: *const Decl.Func };
 
+/// An enum type: its name and the set of member names it declares.
+const EnumType = struct {
+    name: []const u8,
+    members: std.StringHashMapUnmanaged(void) = .{},
+};
+
+/// A single enum case, e.g. `Status.OK`.
+const EnumValue = struct { type_name: []const u8, member: []const u8 };
+
 pub const Value = union(enum) {
     nil,
     int: i64,
@@ -78,6 +86,8 @@ pub const Value = union(enum) {
     instance: *Instance,
     bound_method: *BoundMethod,
     type_ref: *const TypeInfo,
+    enum_type: *const EnumType,
+    enum_value: *const EnumValue,
 };
 
 fn isTruthy(v: Value) bool {
@@ -121,6 +131,10 @@ fn valuesEqual(a: Value, b: Value) bool {
         .instance => |x| b == .instance and x == b.instance,
         .bound_method => |x| b == .bound_method and x == b.bound_method,
         .type_ref => |x| b == .type_ref and x == b.type_ref,
+        .enum_type => |x| b == .enum_type and x == b.enum_type,
+        .enum_value => |x| b == .enum_value and
+            std.mem.eql(u8, x.type_name, b.enum_value.type_name) and
+            std.mem.eql(u8, x.member, b.enum_value.member),
     };
 }
 
@@ -275,6 +289,13 @@ const Interpreter = struct {
         try self.define(self.globals, name, .{ .type_ref = ti });
     }
 
+    fn registerEnum(self: *Interpreter, name: []const u8, members: []const parser.EnumMember) Error!void {
+        const et = try self.arena.create(EnumType);
+        et.* = .{ .name = name };
+        for (members) |m| try et.members.put(self.arena, m.name, {});
+        try self.define(self.globals, name, .{ .enum_type = et });
+    }
+
     fn construct(self: *Interpreter, ti: *const TypeInfo, args: []const Value, span: Span) Error!Value {
         const inst = try self.arena.create(Instance);
         inst.* = .{ .info = ti };
@@ -306,10 +327,11 @@ const Interpreter = struct {
     fn execute(self: *Interpreter, module: Module) Error!void {
         try self.registerBuiltins();
 
-        // Bind class/struct names to type values so `Name(...)` constructs them.
+        // Bind class/struct/enum names so `Name(...)` and `Enum.CASE` resolve.
         for (module.decls) |decl| switch (decl) {
             .class => |c| try self.registerType(c.name, c.members),
             .struct_decl => |s| try self.registerType(s.name, s.members),
+            .enum_decl => |en| try self.registerEnum(en.name, en.members),
             else => {},
         };
         // Bind functions so globals and `main` can call any of them.
@@ -671,6 +693,14 @@ const Interpreter = struct {
                 }
                 return self.fail(m.span, "type '{s}' has no member '{s}'", .{ inst.info.name, m.name });
             },
+            .enum_type => |et| {
+                if (!et.members.contains(m.name)) {
+                    return self.fail(m.span, "enum '{s}' has no member '{s}'", .{ et.name, m.name });
+                }
+                const ev = try self.arena.create(EnumValue);
+                ev.* = .{ .type_name = et.name, .member = m.name };
+                return .{ .enum_value = ev };
+            },
             else => return self.fail(m.span, "cannot access a member of {s}", .{@tagName(obj)}),
         }
     }
@@ -803,6 +833,16 @@ const Interpreter = struct {
                 try buf.appendSlice(self.arena, "<type ");
                 try buf.appendSlice(self.arena, ti.name);
                 try buf.append(self.arena, '>');
+            },
+            .enum_type => |et| {
+                try buf.appendSlice(self.arena, "<enum ");
+                try buf.appendSlice(self.arena, et.name);
+                try buf.append(self.arena, '>');
+            },
+            .enum_value => |ev| {
+                try buf.appendSlice(self.arena, ev.type_name);
+                try buf.append(self.arena, '.');
+                try buf.appendSlice(self.arena, ev.member);
             },
             .instance => |inst| {
                 try buf.appendSlice(self.arena, inst.info.name);
@@ -1072,4 +1112,43 @@ test "accessing an unknown member is a runtime error" {
     defer result.deinit();
     try testing.expect(result.runtime_error != null);
     try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "no member 'missing'") != null);
+}
+
+// enums
+
+test "enum cases print and compare by identity" {
+    const src =
+        \\enum Status { OK = 200, NOT_FOUND = 404 }
+        \\
+        \\func main():
+        \\    var s = Status.OK
+        \\    print(s)
+        \\    print(s == Status.OK)
+        \\    print(s == Status.NOT_FOUND)
+    ;
+    try expectOutput(src, "Status.OK\ntrue\nfalse\n");
+}
+
+test "enum cases of the same ordinal position are still distinct types" {
+    const src =
+        \\enum A { X }
+        \\enum B { X }
+        \\
+        \\func main():
+        \\    print(A.X == B.X)
+    ;
+    try expectOutput(src, "false\n");
+}
+
+test "an unknown enum case is a runtime error" {
+    const src =
+        \\enum Color { RED, GREEN }
+        \\
+        \\func main():
+        \\    print(Color.BLUE)
+    ;
+    var result = try runSource(testing.allocator, src);
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "no member 'BLUE'") != null);
 }
