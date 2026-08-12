@@ -14,8 +14,11 @@
 //! Classes and structs execute: `Name(...)` constructs an instance (fields take
 //! their declared defaults; a method named `init` runs as the constructor),
 //! fields and methods are reached with `.`, and a method's body sees its own
-//! instance's fields and methods by bare name. Enum cases execute as `Enum.CASE`
-//! values that print as `Enum.CASE` and compare equal only to the same case.
+//! instance's fields and methods by bare name. Inheritance is honored at
+//! runtime: a subclass instance is built with its inherited fields, and method
+//! lookup walks the `extends`/`uses` chain (the most-derived method wins). Enum
+//! cases execute as `Enum.CASE` values that print as `Enum.CASE` and compare
+//! equal only to the same case.
 //!
 //! All runtime data lives in an arena owned by the returned `RunResult`. The
 //! AST (and its source) must outlive the run, since function values borrow it.
@@ -47,12 +50,19 @@ const Builtin = enum { print, echo, len, range };
 /// A field declared on a class/struct, with its default-value expression.
 const FieldDef = struct { name: []const u8, value: ?*const Expr };
 
-/// The runtime shape of a class or struct: its ordered fields (for default
-/// construction) and its methods.
+/// The runtime shape of a class or struct: its own fields and methods, its
+/// declared supertypes, and (computed once) the transitive ancestors and full
+/// inherited field list.
 const TypeInfo = struct {
     name: []const u8,
-    fields: []const FieldDef,
-    methods: std.StringHashMapUnmanaged(*const Decl.Func),
+    own_fields: []const FieldDef,
+    methods: std.StringHashMapUnmanaged(*const Decl.Func) = .{},
+    super_names: []const []const u8 = &.{},
+    /// Transitive supertypes, most-derived first (used for method resolution).
+    ancestors: []const *const TypeInfo = &.{},
+    /// This type's fields plus inherited ones, base classes first (used for
+    /// construction and printing).
+    all_fields: []const FieldDef = &.{},
 };
 
 /// A live class/struct instance.
@@ -212,6 +222,8 @@ const Interpreter = struct {
     /// The instance whose method is currently executing, so bare `field` names
     /// inside a method resolve to (and assign to) that instance.
     current_receiver: ?*Instance = null,
+    /// Every class/struct by name, so supertypes can be resolved.
+    types: std.StringHashMapUnmanaged(*TypeInfo) = .{},
 
     fn fail(self: *Interpreter, span: Span, comptime fmt: []const u8, args: anytype) Error {
         self.runtime_error = .{
@@ -242,7 +254,7 @@ const Interpreter = struct {
         }
         if (self.current_receiver) |recv| {
             if (recv.fields.get(name)) |v| return v;
-            if (recv.info.methods.get(name)) |func| {
+            if (self.findMethod(recv.info, name)) |func| {
                 const bm = try self.arena.create(BoundMethod);
                 bm.* = .{ .receiver = recv, .func = func };
                 return .{ .bound_method = bm };
@@ -276,7 +288,13 @@ const Interpreter = struct {
         return false;
     }
 
-    fn registerType(self: *Interpreter, name: []const u8, members: []const Decl) Error!void {
+    fn registerType(
+        self: *Interpreter,
+        name: []const u8,
+        members: []const Decl,
+        extends: ?parser.TypeRef,
+        uses: []const parser.TypeRef,
+    ) Error!void {
         var fields: std.ArrayList(FieldDef) = .empty;
         var methods: std.StringHashMapUnmanaged(*const Decl.Func) = .{};
         for (members, 0..) |m, j| switch (m) {
@@ -284,9 +302,70 @@ const Interpreter = struct {
             .func => try methods.put(self.arena, members[j].func.name, &members[j].func),
             else => {},
         };
+        var supers: std.ArrayList([]const u8) = .empty;
+        if (extends) |b| try supers.append(self.arena, b.name);
+        for (uses) |t| try supers.append(self.arena, t.name);
+
+        const own_fields = try fields.toOwnedSlice(self.arena);
         const ti = try self.arena.create(TypeInfo);
-        ti.* = .{ .name = name, .fields = try fields.toOwnedSlice(self.arena), .methods = methods };
+        ti.* = .{
+            .name = name,
+            .own_fields = own_fields,
+            .methods = methods,
+            .super_names = try supers.toOwnedSlice(self.arena),
+            .all_fields = own_fields, // recomputed with inheritance in computeInheritance
+        };
+        try self.types.put(self.arena, name, ti);
         try self.define(self.globals, name, .{ .type_ref = ti });
+    }
+
+    fn computeInheritance(self: *Interpreter, ti: *TypeInfo) Error!void {
+        // Ancestors: transitive supertypes, most-derived first, deduped.
+        var ancestors: std.ArrayList(*const TypeInfo) = .empty;
+        var seen_anc: std.StringHashMapUnmanaged(void) = .{};
+        try self.collectAncestors(ti, &ancestors, &seen_anc);
+        ti.ancestors = try ancestors.toOwnedSlice(self.arena);
+
+        // Fields: base classes first, then own, deduped by name.
+        var all: std.ArrayList(FieldDef) = .empty;
+        var seen_f: std.StringHashMapUnmanaged(void) = .{};
+        var i = ti.ancestors.len;
+        while (i > 0) {
+            i -= 1;
+            for (ti.ancestors[i].own_fields) |f| {
+                if ((try seen_f.getOrPut(self.arena, f.name)).found_existing) continue;
+                try all.append(self.arena, f);
+            }
+        }
+        for (ti.own_fields) |f| {
+            if ((try seen_f.getOrPut(self.arena, f.name)).found_existing) continue;
+            try all.append(self.arena, f);
+        }
+        ti.all_fields = try all.toOwnedSlice(self.arena);
+    }
+
+    fn collectAncestors(
+        self: *Interpreter,
+        ti: *const TypeInfo,
+        out: *std.ArrayList(*const TypeInfo),
+        seen: *std.StringHashMapUnmanaged(void),
+    ) Error!void {
+        for (ti.super_names) |sn| {
+            const sup = self.types.get(sn) orelse continue;
+            if ((try seen.getOrPut(self.arena, sn)).found_existing) continue;
+            try out.append(self.arena, sup);
+            try self.collectAncestors(sup, out, seen);
+        }
+    }
+
+    /// Look up a method on `ti` or any of its ancestors (most-derived wins).
+    fn findMethod(self: *Interpreter, ti: *const TypeInfo, name: []const u8) ?*const Decl.Func {
+        _ = self;
+        if (ti.methods.get(name)) |m| return m;
+        for (ti.ancestors) |a| {
+            if (a.methods.get(name)) |m| return m;
+        }
+        return null;
     }
 
     fn registerEnum(self: *Interpreter, name: []const u8, members: []const parser.EnumMember) Error!void {
@@ -306,15 +385,15 @@ const Interpreter = struct {
         const saved_recv = self.current_receiver;
         self.env = self.globals;
         self.current_receiver = inst;
-        for (ti.fields) |f| {
+        for (ti.all_fields) |f| {
             const v = if (f.value) |val| try self.eval(val.*) else Value.nil;
             try inst.fields.put(self.arena, f.name, v);
         }
         self.env = saved_env;
         self.current_receiver = saved_recv;
 
-        // A method named `init` acts as the constructor.
-        if (ti.methods.get("init")) |init_fn| {
+        // A method named `init` (inherited or own) acts as the constructor.
+        if (self.findMethod(ti, "init")) |init_fn| {
             _ = try self.callMethod(init_fn, inst, args, span);
         } else if (args.len != 0) {
             return self.fail(span, "{s} takes no constructor arguments", .{ti.name});
@@ -329,9 +408,16 @@ const Interpreter = struct {
 
         // Bind class/struct/enum names so `Name(...)` and `Enum.CASE` resolve.
         for (module.decls) |decl| switch (decl) {
-            .class => |c| try self.registerType(c.name, c.members),
-            .struct_decl => |s| try self.registerType(s.name, s.members),
+            .class => |c| try self.registerType(c.name, c.members, c.extends, c.uses),
+            .struct_decl => |s| try self.registerType(s.name, s.members, null, &.{}),
             .enum_decl => |en| try self.registerEnum(en.name, en.members),
+            else => {},
+        };
+        // Resolve the transitive ancestors and inherited fields of each type,
+        // now that every type is registered.
+        for (module.decls) |decl| switch (decl) {
+            .class => |c| try self.computeInheritance(self.types.get(c.name).?),
+            .struct_decl => |s| try self.computeInheritance(self.types.get(s.name).?),
             else => {},
         };
         // Bind functions so globals and `main` can call any of them.
@@ -686,7 +772,7 @@ const Interpreter = struct {
         switch (obj) {
             .instance => |inst| {
                 if (inst.fields.get(m.name)) |v| return v;
-                if (inst.info.methods.get(m.name)) |func| {
+                if (self.findMethod(inst.info, m.name)) |func| {
                     const bm = try self.arena.create(BoundMethod);
                     bm.* = .{ .receiver = inst, .func = func };
                     return .{ .bound_method = bm };
@@ -847,7 +933,7 @@ const Interpreter = struct {
             .instance => |inst| {
                 try buf.appendSlice(self.arena, inst.info.name);
                 try buf.appendSlice(self.arena, " {");
-                for (inst.info.fields, 0..) |f, i| {
+                for (inst.info.all_fields, 0..) |f, i| {
                     try buf.appendSlice(self.arena, if (i > 0) ", " else " ");
                     try buf.appendSlice(self.arena, f.name);
                     try buf.appendSlice(self.arena, ": ");
@@ -1151,4 +1237,94 @@ test "an unknown enum case is a runtime error" {
     defer result.deinit();
     try testing.expect(result.runtime_error != null);
     try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "no member 'BLUE'") != null);
+}
+
+// runtime inheritance
+
+test "a subclass instance has inherited fields and methods" {
+    const src =
+        \\class Animal:
+        \\    var legs: int = 4
+        \\
+        \\    func count() -> int:
+        \\        return legs
+        \\
+        \\class Cat extends Animal:
+        \\    var lives: int = 9
+        \\
+        \\func main():
+        \\    var c: Cat = Cat()
+        \\    print(c.legs)
+        \\    print(c.lives)
+        \\    print(c.count())
+    ;
+    try expectOutput(src, "4\n9\n4\n");
+}
+
+test "a subclass method overrides the base" {
+    const src =
+        \\class Animal:
+        \\    func speak() -> str:
+        \\        return "..."
+        \\
+        \\class Dog extends Animal:
+        \\    func speak() -> str:
+        \\        return "woof"
+        \\
+        \\func main():
+        \\    var d: Dog = Dog()
+        \\    print(d.speak())
+    ;
+    try expectOutput(src, "woof\n");
+}
+
+test "an inherited init runs as the constructor" {
+    const src =
+        \\class Base:
+        \\    var x: int = 0
+        \\
+        \\    func init(v: int):
+        \\        x = v
+        \\
+        \\class Derived extends Base:
+        \\    var y: int = 0
+        \\
+        \\func main():
+        \\    var d: Derived = Derived(7)
+        \\    print(d.x)
+    ;
+    try expectOutput(src, "7\n");
+}
+
+test "a used trait contributes fields and methods" {
+    const src =
+        \\class Damageable:
+        \\    var hp: int = 100
+        \\
+        \\    func hurt(amount: int):
+        \\        hp = hp - amount
+        \\
+        \\class Player uses Damageable:
+        \\    var name: str = "hero"
+        \\
+        \\func main():
+        \\    var p: Player = Player()
+        \\    p.hurt(30)
+        \\    print(p.hp)
+    ;
+    try expectOutput(src, "70\n");
+}
+
+test "instances print inherited fields base-first" {
+    const src =
+        \\class Base:
+        \\    var a: int = 1
+        \\
+        \\class Sub extends Base:
+        \\    var b: int = 2
+        \\
+        \\func main():
+        \\    print(Sub())
+    ;
+    try expectOutput(src, "Sub { a: 1, b: 2 }\n");
 }
