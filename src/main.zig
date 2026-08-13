@@ -165,15 +165,20 @@ fn repl(arena: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer) !u8 
         try entry.append(arena, '\n');
 
         // Keep reading while brackets are unbalanced, or an indented block is
-        // open (a `:` line opens one; a blank line closes it).
-        if (bracketDepth(entry.items) > 0) {
-            in_block = true;
-            continue;
-        }
+        // open (a `:` line opens one; a blank line closes it). A whole-line
+        // comment never opens a block or counts brackets (it may still sit
+        // inside one already open).
         const trimmed = std.mem.trimEnd(u8, line, " \t\r");
-        if (trimmed.len > 0 and trimmed[trimmed.len - 1] == ':') {
-            in_block = true;
-            continue;
+        const is_comment = std.mem.startsWith(u8, std.mem.trimStart(u8, trimmed, " \t"), "##");
+        if (!is_comment) {
+            if (bracketDepth(entry.items) > 0) {
+                in_block = true;
+                continue;
+            }
+            if (trimmed.len > 0 and trimmed[trimmed.len - 1] == ':') {
+                in_block = true;
+                continue;
+            }
         }
         if (in_block and trimmed.len != 0) continue;
         in_block = false;
