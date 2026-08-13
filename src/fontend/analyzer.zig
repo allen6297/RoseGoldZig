@@ -1193,16 +1193,32 @@ const Analyzer = struct {
             },
             .for_stmt => |x| {
                 const iter_t = try self.typeOf(x.iter.*);
-                // A `for` binds each list element, each map key, or each character
-                // of a string; anything else stays `unknown`.
-                const binding_t: Type = switch (iter_t) {
-                    .list => |l| l.elem,
-                    .map => |m| m.key,
-                    .str => .str,
-                    else => .unknown,
-                };
                 const child = try self.newScope(self.current);
-                try self.declareIn(child, x.binding, .binding, binding_t, x.span);
+                if (x.value_binding) |vb| {
+                    // Two bindings: (index/key, value).
+                    const first_t: Type = switch (iter_t) {
+                        .map => |m| m.key,
+                        .list, .str => .int,
+                        else => .unknown,
+                    };
+                    const second_t: Type = switch (iter_t) {
+                        .list => |l| l.elem,
+                        .map => |m| m.value,
+                        .str => .str,
+                        else => .unknown,
+                    };
+                    try self.declareIn(child, x.binding, .binding, first_t, x.span);
+                    try self.declareIn(child, vb, .binding, second_t, x.span);
+                } else {
+                    // A single binding takes each list element, map key, or char.
+                    const binding_t: Type = switch (iter_t) {
+                        .list => |l| l.elem,
+                        .map => |m| m.key,
+                        .str => .str,
+                        else => .unknown,
+                    };
+                    try self.declareIn(child, x.binding, .binding, binding_t, x.span);
+                }
                 const saved = self.current;
                 self.current = child;
                 self.loop_depth += 1;
@@ -1262,6 +1278,13 @@ const Analyzer = struct {
                     .literal => {},
                 };
                 break :blk .str;
+            },
+            .range => |r| blk: {
+                const st = try self.typeOf(r.start.*);
+                const et = try self.typeOf(r.end.*);
+                if (!isAnyish(st) and tagOf(st) != .int) try self.report(parser.exprSpan(r.start.*), "range start must be an int, got {s}", .{typeName(st)});
+                if (!isAnyish(et) and tagOf(et) != .int) try self.report(parser.exprSpan(r.end.*), "range end must be an int, got {s}", .{typeName(et)});
+                break :blk try self.makeList(.int);
             },
             .bool_literal => .bool,
             .nil_literal => .nil,
@@ -2951,6 +2974,19 @@ test "a stdlib builtin's result type is checked" {
     var sp = try analyzeSource(testing.allocator, "func main():\n    var n: int = split(\"a,b\", \",\")[0]");
     defer sp.deinit();
     try expectMessageContains(sp, "cannot assign str to int");
+}
+
+test "for over a range binds an int" {
+    var a = try analyzeSource(testing.allocator, "func main():\n    for i in 0..3:\n        var s: str = i");
+    defer a.deinit();
+    try expectMessageContains(a, "cannot assign int to str");
+}
+
+test "a two-binding for types the index and value" {
+    // `xs` is list<str>, so `i` is the int index and `x` is str.
+    var a = try analyzeSource(testing.allocator, "func main():\n    var xs: list<str> = [\"a\"]\n    for i, x in xs:\n        var bad: str = i");
+    defer a.deinit();
+    try expectMessageContains(a, "cannot assign int to str");
 }
 
 test "an interpolation hole is type-checked" {

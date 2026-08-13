@@ -58,6 +58,7 @@ pub const TokenKind = enum {
     colon,
     comma,
     dot,
+    dot_dot,
     arrow,
     arrow_equals,
     underscore,
@@ -432,7 +433,13 @@ pub const Lexer = struct {
         const kind: TokenKind = switch (c) {
             ':' => .colon,
             ',' => .comma,
-            '.' => .dot,
+            '.' => blk: {
+                if (self.peek() == '.') {
+                    self.pos += 1;
+                    break :blk .dot_dot;
+                }
+                break :blk .dot;
+            },
             '?' => .question,
             '+' => self.oneOrEq(.plus, .plus_eq),
             '*' => self.oneOrEq(.star, .star_eq),

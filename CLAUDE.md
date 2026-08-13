@@ -22,7 +22,7 @@ zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style) to stdout
-zig build test                  # run every test (246 as of writing)
+zig build test                  # run every test (250 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -100,15 +100,18 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `signal name(params)`. `pub`/`private` visibility; `static` on a class/struct
   member makes it belong to the type (shared storage / no receiver), reached via
   `Type.member`.
-- **Statements:** `return`, `if`/`elif`/`else`, `while`, `for x in iter:`,
-  `break`, `continue`, `pass`, assignment (incl. compound `+= -= *= /= %=`, which
+- **Statements:** `return`, `if`/`elif`/`else`, `while`, `for x in iter:` (also
+  `for i, x in iter:` — a second binding gives index+element for a list/string or
+  key+value for a map), `break`, `continue`, `pass`, assignment (incl. compound
+  `+= -= *= /= %=`, which
   the parser desugars to `x = x <op> e`), expression statements. All statement
   blocks are colon-blocks (indentation); braces `{ }` are only for `enum`/`match`
   bodies.
 - **Expressions:** literals (incl. `nil`), string interpolation `"a ${expr} b"`
   (the parser splits the literal and sub-parses each hole; `\$` escapes; no string
   literals inside a hole), identifiers, `and`/`or`/`not`,
-  arithmetic/comparison with precedence, calls, indexing `a[i]`, member access `x.f`,
+  arithmetic/comparison with precedence, a range `a..b` (the ints `a` … `b-1`, as a
+  `list<int>`), calls, indexing `a[i]`, member access `x.f`,
   array `[...]` and map `{k: v}` literals, anonymous functions `func(params): expr`
   (single expression, implicitly returned; or `func(params):` + an indented block)
   that close over the surrounding scope, and `match subj { pattern: body, ... }`

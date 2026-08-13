@@ -88,8 +88,10 @@ pub const Expr = union(enum) {
     match: Match,
     lambda: *const Lambda,
     interpolation: *const Interpolation,
+    range: Range,
 
     pub const Literal = struct { text: []const u8, span: Span };
+    pub const Range = struct { start: *Expr, end: *Expr, span: Span };
     pub const Bool = struct { value: bool, span: Span };
     pub const Ident = struct { name: []const u8, span: Span };
     pub const Unary = struct { op: UnaryOp, operand: *Expr, span: Span };
@@ -171,6 +173,9 @@ pub const Stmt = union(enum) {
     pub const While = struct { cond: *Expr, body: []const Stmt, span: Span };
     pub const For = struct {
         binding: []const u8,
+        /// A second binding (`for i, x in ...`): the first is the index/key, the
+        /// second the value. Null for a single-binding loop.
+        value_binding: ?[]const u8,
         iter: *Expr,
         body: []const Stmt,
         span: Span,
@@ -261,6 +266,7 @@ pub fn exprSpan(e: Expr) Span {
         .match => |m| m.span,
         .lambda => |l| l.span,
         .interpolation => |x| x.span,
+        .range => |r| r.span,
     };
 }
 
@@ -861,11 +867,17 @@ const Parser = struct {
     fn parseFor(self: *Parser) Error!Stmt.For {
         const kw = self.advance(); // 'for'
         const binding = try self.expect(.identifier, "expected a loop variable after 'for'");
+        var value_binding: ?[]const u8 = null;
+        if (self.eat(.comma)) {
+            const second = try self.expect(.identifier, "expected a second loop variable after ','");
+            value_binding = second.text;
+        }
         _ = try self.expect(.kw_in, "expected 'in' after the loop variable");
         const iter = try self.parseExpr();
         const body = try self.parseColonStmtBlock();
         return .{
             .binding = binding.text,
+            .value_binding = value_binding,
             .iter = iter,
             .body = body,
             .span = spanFrom(kw, self.prev()),
@@ -875,7 +887,17 @@ const Parser = struct {
     // --- expressions ---------------------------------------------------------
 
     fn parseExpr(self: *Parser) Error!*Expr {
-        return self.parseOr();
+        const left = try self.parseOr();
+        // A range `start..end` (lowest precedence, non-chaining).
+        if (self.eat(.dot_dot)) {
+            const right = try self.parseOr();
+            return self.mkExpr(.{ .range = .{
+                .start = left,
+                .end = right,
+                .span = joinSpan(exprSpan(left.*), exprSpan(right.*)),
+            } });
+        }
+        return left;
     }
 
     // Logical operators sit below the comparison/arithmetic precedence table:

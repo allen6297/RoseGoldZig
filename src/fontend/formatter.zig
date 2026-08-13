@@ -284,6 +284,10 @@ const Formatter = struct {
                 try self.pad();
                 try self.w("for ");
                 try self.w(x.binding);
+                if (x.value_binding) |vb| {
+                    try self.w(", ");
+                    try self.w(vb);
+                }
                 try self.w(" in ");
                 try self.expr(x.iter.*);
                 try self.w(":");
@@ -396,6 +400,11 @@ const Formatter = struct {
             },
             .match => |m| try self.matchExpr(m),
             .lambda => |lam| try self.lambda(lam),
+            .range => |r| {
+                try self.exprPrec(r.start.*, 0);
+                try self.w("..");
+                try self.exprPrec(r.end.*, 0);
+            },
             .interpolation => |x| {
                 try self.w("\"");
                 for (x.parts) |p| switch (p) {
@@ -515,6 +524,13 @@ test "formats a class with fields grouped and methods spaced" {
         "    func sum() -> int:\n" ++
         "        return x + y\n";
     try testing.expectEqualStrings(want, out);
+}
+
+test "formats ranges and an index/value for" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "func main():\n    for i,x in 0..n:\n        print(i)");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("func main():\n    for i, x in 0..n:\n        print(i)\n", out);
 }
 
 test "formats an interpolated string, spacing holes" {

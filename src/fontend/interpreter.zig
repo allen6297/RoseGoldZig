@@ -893,28 +893,53 @@ const Interpreter = struct {
         return .normal;
     }
 
+    fn evalRange(self: *Interpreter, r: Expr.Range) Error!Value {
+        const s = try self.eval(r.start.*);
+        const e = try self.eval(r.end.*);
+        if (s != .int or e != .int) return self.fail(r.span, "range bounds must be integers", .{});
+        const l = try self.arena.create(List);
+        l.* = .empty;
+        var i = s.int;
+        while (i < e.int) : (i += 1) try l.append(self.arena, .{ .int = i });
+        return .{ .list = l };
+    }
+
     fn execFor(self: *Interpreter, x: Stmt.For) Error!Flow {
         const iter = try self.eval(x.iter.*);
-        // Iterate a list's elements, a string's characters, or a map's keys.
-        const items: []const Value = switch (iter) {
-            .list => |l| l.items,
-            .str => |s| blk: {
-                const chars = try self.arena.alloc(Value, s.len);
-                for (0..s.len) |i| chars[i] = .{ .str = s[i .. i + 1] };
-                break :blk chars;
+        const two = x.value_binding != null;
+        // Build (index/key, value) pairs. A single binding takes the value for a
+        // list/string, but the key for a map (matching `for k in map`).
+        var firsts: std.ArrayList(Value) = .empty;
+        var seconds: std.ArrayList(Value) = .empty;
+        var single_first = false;
+        switch (iter) {
+            .list => |l| for (l.items, 0..) |el, i| {
+                try firsts.append(self.arena, .{ .int = @intCast(i) });
+                try seconds.append(self.arena, el);
             },
-            .map => |m| blk: {
-                const keys = try self.arena.alloc(Value, m.entries.items.len);
-                for (m.entries.items, 0..) |entry, i| keys[i] = entry.key;
-                break :blk keys;
+            .str => |s| for (0..s.len) |i| {
+                try firsts.append(self.arena, .{ .int = @intCast(i) });
+                try seconds.append(self.arena, .{ .str = s[i .. i + 1] });
+            },
+            .map => |m| {
+                single_first = true;
+                for (m.entries.items) |entry| {
+                    try firsts.append(self.arena, entry.key);
+                    try seconds.append(self.arena, entry.value);
+                }
             },
             else => return self.fail(x.span, "cannot iterate over {s}", .{@tagName(iter)}),
-        };
-        for (items) |item| {
+        }
+        for (firsts.items, seconds.items) |first, second| {
             const child = try self.newEnv(self.env);
             const saved = self.env;
             self.env = child;
-            try self.define(child, x.binding, item);
+            if (two) {
+                try self.define(child, x.binding, first);
+                try self.define(child, x.value_binding.?, second);
+            } else {
+                try self.define(child, x.binding, if (single_first) first else second);
+            }
             const flow = self.execBlock(x.body);
             self.env = saved;
             switch (try flow) {
@@ -1313,6 +1338,7 @@ const Interpreter = struct {
                 };
                 break :blk .{ .str = try buf.toOwnedSlice(self.arena) };
             },
+            .range => |r| try self.evalRange(r),
             .lambda => |lam| blk: {
                 // Capture the current environment and context.
                 const cl = try self.arena.create(Closure);
@@ -2333,6 +2359,23 @@ test "string and collection stdlib builtins" {
         \\    print(abs(-5), min(3, 7), max(3, 7))
     ;
     try expectOutput(src, "HI bye\n[a, b, c]\nx-y-z\ntrue true\n[1, 2, 3] [3, 2, 1]\n5 3 7\n");
+}
+
+test "range loops and index/value iteration" {
+    const src =
+        \\func main():
+        \\    var sum = 0
+        \\    for i in 0..4:
+        \\        sum += i
+        \\    print(sum)
+        \\    var xs = ["a", "b"]
+        \\    for i, x in xs:
+        \\        print("${i}=${x}")
+        \\    var m = {"k": 9}
+        \\    for key, v in m:
+        \\        print("${key}:${v}")
+    ;
+    try expectOutput(src, "6\n0=a\n1=b\nk:9\n");
 }
 
 test "string interpolation evaluates and concatenates its holes" {
