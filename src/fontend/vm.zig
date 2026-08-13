@@ -1,12 +1,13 @@
 //! A bytecode compiler + stack VM: an alternative execution backend to the
-//! tree-walking interpreter, reached via `run --vm`. It covers the core of the
+//! tree-walking interpreter, reached via `run --vm`. It covers nearly all of the
 //! language — expressions, control flow, functions (with recursion), locals and
 //! globals, lists/maps/ranges, lambdas with by-reference closures (upvalues),
-//! string interpolation, `match`, and classes/structs (construction, fields,
-//! methods, single/`uses` inheritance with virtual dispatch), plus the common
-//! builtins. Constructs it does not compile (enums, statics, modules, signals,
-//! …) are reported as unsupported, so the tree-walker remains the full-featured
-//! default.
+//! string interpolation, `match`, enums, classes/structs (construction, fields,
+//! methods, single/`uses` inheritance with virtual dispatch, statics), modules
+//! (per-module globals; cross-module funcs/consts/types), and the common builtins
+//! (including the higher-order `map`/`filter`/`reduce`). Constructs it does not
+//! compile (signals, cross-module inheritance) are reported as unsupported, so
+//! the tree-walker remains the full-featured default.
 //!
 //! Design: each function compiles to a `Chunk` of opcodes + constants; the VM
 //! runs a `Chunk` over a value stack with a frame stack for calls.
@@ -54,6 +55,17 @@ const Function = struct {
     arity: usize,
     chunk: Chunk = .{},
     upvalues: []const Upvalue = &.{},
+    /// The module this function is defined in, so its body resolves globals in
+    /// its own module even when called from another (like the interpreter's
+    /// home-module closures).
+    module: *RtModule = undefined,
+};
+
+/// A module's runtime namespace: its own top-level bindings (functions, types,
+/// enums, consts/vars, and imported module values), reached by name.
+const RtModule = struct {
+    name: []const u8,
+    globals: std.StringHashMapUnmanaged(Value) = .{},
 };
 
 /// A runtime upvalue: while `stack_index` is set it aliases that stack slot
@@ -118,6 +130,7 @@ const Value = union(enum) {
     type: *RtType,
     enum_type: *const RtEnum,
     enum_value: *const EnumValue,
+    module: *RtModule,
 };
 
 fn isTruthy(v: Value) bool {
@@ -165,6 +178,7 @@ fn valuesEqual(a: Value, b: Value) bool {
         .enum_value => |x| b == .enum_value and
             std.mem.eql(u8, x.enum_name, b.enum_value.enum_name) and
             std.mem.eql(u8, x.member, b.enum_value.member),
+        .module => |x| b == .module and x == b.module,
     };
 }
 
@@ -251,29 +265,54 @@ pub const Result = struct {
     }
 };
 
-/// Compile and run `module` on the VM. Diagnostics is non-empty if a construct
-/// could not be compiled; otherwise output/runtime_error report execution.
+/// One module of a program: its parsed AST plus which loaded modules it imports
+/// (dependency order, entry last) — mirrors the interpreter's `ProgramModule`.
+pub const ModuleImport = struct { name: []const u8, module_index: usize };
+pub const ProgramModule = struct { module: Module, imports: []const ModuleImport = &.{}, name: []const u8 = "module" };
+
+/// Compile and run a single module on the VM (convenience for the common case).
 pub fn run(gpa: std.mem.Allocator, module: Module) Error!Result {
+    return runProgram(gpa, &.{.{ .module = module }});
+}
+
+/// Compile and run a set of modules in dependency order (entry last). Each
+/// module gets its own globals; a function resolves globals in its home module.
+pub fn runProgram(gpa: std.mem.Allocator, modules: []const ProgramModule) Error!Result {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const alloc = arena.allocator();
 
     var diagnostics: std.ArrayList(lexer.Diagnostic) = .empty;
 
+    // Create every module's runtime namespace up front so imports (which point
+    // at earlier modules) can bind to them.
+    const rtmods = try alloc.alloc(*RtModule, modules.len);
+    for (modules, 0..) |pm, i| {
+        const rt = try alloc.create(RtModule);
+        rt.* = .{ .name = pm.name };
+        rtmods[i] = rt;
+    }
+
     var c = Compiler{ .alloc = alloc, .diagnostics = &diagnostics };
-    const program = c.compileModule(module) catch |e| switch (e) {
-        error.Compile => {
-            return .{ .arena = arena, .output = "", .runtime_error = null, .diagnostics = try diagnostics.toOwnedSlice(alloc) };
-        },
-        else => return e,
-    };
+    const programs = try alloc.alloc(Program, modules.len);
+    for (modules, 0..) |pm, i| {
+        c.current_module = rtmods[i];
+        c.types = .{};
+        c.enums = .{};
+        c.current_type = null;
+        c.current_static_type = null;
+        programs[i] = c.compileModule(pm.module, pm.imports, rtmods, i == modules.len - 1) catch |e| switch (e) {
+            error.Compile => return .{ .arena = arena, .output = "", .runtime_error = null, .diagnostics = try diagnostics.toOwnedSlice(alloc) },
+            else => return e,
+        };
+    }
     if (diagnostics.items.len > 0) {
         return .{ .arena = arena, .output = "", .runtime_error = null, .diagnostics = try diagnostics.toOwnedSlice(alloc) };
     }
 
     var output: std.ArrayList(u8) = .empty;
     var vm = VM{ .alloc = alloc, .output = &output };
-    vm.run(program) catch |e| switch (e) {
+    vm.run(programs) catch |e| switch (e) {
         error.Runtime => return .{ .arena = arena, .output = try output.toOwnedSlice(alloc), .runtime_error = vm.runtime_error, .diagnostics = &.{} },
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -364,6 +403,9 @@ const Compiler = struct {
     cur: *FnState = undefined,
     types: std.StringHashMapUnmanaged(*TypeDef) = .{},
     enums: std.StringHashMapUnmanaged(*RtEnum) = .{},
+    /// The module currently being compiled; stamped onto every `Function` so its
+    /// body resolves globals in its own module at runtime.
+    current_module: *RtModule = undefined,
     /// The type whose method/constructor/field-default is being compiled, so a
     /// bare name can resolve to a field or method of the receiver.
     current_type: ?*TypeDef = null,
@@ -381,10 +423,10 @@ const Compiler = struct {
         return error.Compile;
     }
 
-    fn compileModule(self: *Compiler, module: Module) Error!Program {
+    fn compileModule(self: *Compiler, module: Module, imports: []const ModuleImport, rtmods: []const *RtModule, is_entry: bool) Error!Program {
         // Reject unsupported top-level constructs early with a clear message.
         for (module.decls) |decl| switch (decl) {
-            .func, .var_decl, .class, .struct_decl, .enum_decl => {},
+            .import, .func, .var_decl, .class, .struct_decl, .enum_decl => {},
             else => return self.fail(declSpan(decl), "the --vm backend does not support this construct yet; use the default interpreter", .{}),
         };
 
@@ -406,7 +448,7 @@ const Compiler = struct {
 
         // The script runs as a function with no enclosing scope.
         const script = try self.alloc.create(Function);
-        script.* = .{ .name = "<script>", .arity = 0 };
+        script.* = .{ .name = "<script>", .arity = 0, .module = self.current_module };
         var script_fs = FnState{ .func = script, .enclosing = null };
         self.cur = &script_fs;
 
@@ -430,6 +472,14 @@ const Compiler = struct {
             const f = try self.compileFunction(decl.func, null);
             try funcs.put(self.alloc, decl.func.name, f);
         };
+
+        // Bind each imported module to its (already-created) namespace value, so
+        // `mod.name` and any top-level initializer referencing it resolve.
+        for (imports) |imp| {
+            self.cur.stack_top = 0;
+            try self.emitConst(.{ .module = rtmods[imp.module_index] }, zeroSpan);
+            try self.defineGlobal(imp.name, zeroSpan);
+        }
 
         // The script body: bind functions/globals, then call main(). Top-level
         // values become globals (not locals), so each starts from a clean stack.
@@ -478,7 +528,10 @@ const Compiler = struct {
             }
         }
 
-        if (funcs.get("main")) |_| {
+        // Only the entry module runs `main`; imported modules just populate their
+        // globals when their script runs.
+        if (is_entry and funcs.get("main") != null) {
+            self.cur.stack_top = 0;
             try self.emitGlobal(.get_global, "main", zeroSpan);
             try self.emit(.call, zeroSpan);
             try self.emitByte(0, zeroSpan); // argc
@@ -606,7 +659,7 @@ const Compiler = struct {
     fn compileMethod(self: *Compiler, t: *TypeDef, f: Decl.Func) Error!*Function {
         _ = t;
         const func = try self.alloc.create(Function);
-        func.* = .{ .name = f.name, .arity = f.params.len };
+        func.* = .{ .name = f.name, .arity = f.params.len, .module = self.current_module };
         var fs = FnState{ .func = func, .enclosing = null };
         const saved = self.cur;
         self.cur = &fs;
@@ -654,7 +707,7 @@ const Compiler = struct {
 
     fn compileStaticMethod(self: *Compiler, t: *TypeDef, f: Decl.Func) Error!*Function {
         const func = try self.alloc.create(Function);
-        func.* = .{ .name = f.name, .arity = f.params.len };
+        func.* = .{ .name = f.name, .arity = f.params.len, .module = self.current_module };
         var fs = FnState{ .func = func, .enclosing = null };
         const saved = self.cur;
         self.cur = &fs;
@@ -675,7 +728,7 @@ const Compiler = struct {
     /// field defaults with it as the receiver, run `init` (if any), return it.
     fn compileConstructor(self: *Compiler, t: *TypeDef) Error!void {
         const func = try self.alloc.create(Function);
-        func.* = .{ .name = t.name, .arity = t.init_arity };
+        func.* = .{ .name = t.name, .arity = t.init_arity, .module = self.current_module };
         var fs = FnState{ .func = func, .enclosing = null };
         const saved = self.cur;
         self.cur = &fs;
@@ -744,7 +797,7 @@ const Compiler = struct {
 
     fn compileFunction(self: *Compiler, f: Decl.Func, enclosing: ?*FnState) Error!*Function {
         const func = try self.alloc.create(Function);
-        func.* = .{ .name = f.name, .arity = f.params.len };
+        func.* = .{ .name = f.name, .arity = f.params.len, .module = self.current_module };
 
         var fs = FnState{ .func = func, .enclosing = enclosing };
         const saved = self.cur;
@@ -763,7 +816,7 @@ const Compiler = struct {
     /// `closure` op that captures its upvalues from the current frame.
     fn compileLambda(self: *Compiler, lam: *const Expr.Lambda) Error!void {
         const func = try self.alloc.create(Function);
-        func.* = .{ .name = "<lambda>", .arity = lam.params.len };
+        func.* = .{ .name = "<lambda>", .arity = lam.params.len, .module = self.current_module };
         var fs = FnState{ .func = func, .enclosing = self.cur };
         const saved = self.cur;
         self.cur = &fs;
@@ -1387,7 +1440,6 @@ const VM = struct {
     output: *std.ArrayList(u8),
     stack: std.ArrayList(Value) = .empty,
     frames: std.ArrayList(Frame) = .empty,
-    globals: std.StringHashMapUnmanaged(Value) = .{},
     open_upvalues: std.ArrayList(*UpvalueObj) = .empty,
     runtime_error: ?RuntimeError = null,
 
@@ -1410,13 +1462,17 @@ const VM = struct {
         return 0;
     }
 
-    fn run(self: *VM, program: Program) VMError!void {
-        // Register builtins as globals.
-        inline for (builtin_names, 0..) |name, i| {
-            try self.globals.put(self.alloc, name, .{ .builtin = @enumFromInt(i) });
+    /// Run each module's script in dependency order (populating that module's
+    /// globals); the entry script (compiled last) calls `main`.
+    fn run(self: *VM, programs: []const Program) VMError!void {
+        for (programs) |program| {
+            // Each module gets its own copy of the builtins in its globals.
+            inline for (builtin_names, 0..) |name, i| {
+                try program.script.module.globals.put(self.alloc, name, .{ .builtin = @enumFromInt(i) });
+            }
+            try self.frames.append(self.alloc, .{ .func = program.script, .upvalues = &.{}, .ip = 0, .base = 0 });
+            try self.exec();
         }
-        try self.frames.append(self.alloc, .{ .func = program.script, .upvalues = &.{}, .ip = 0, .base = 0 });
-        try self.exec();
     }
 
     fn push(self: *VM, v: Value) VMError!void {
@@ -1481,15 +1537,15 @@ const VM = struct {
                 },
                 .get_global => {
                     const name = chunk.constants.items[self.readU16(frame)].str;
-                    if (self.globals.get(name)) |v| try self.push(v) else return self.fail("undefined name '{s}'", .{name});
+                    if (frame.func.module.globals.get(name)) |v| try self.push(v) else return self.fail("undefined name '{s}'", .{name});
                 },
                 .set_global => {
                     const name = chunk.constants.items[self.readU16(frame)].str;
-                    if (self.globals.getPtr(name)) |slot| slot.* = self.peek(0) else return self.fail("undefined name '{s}'", .{name});
+                    if (frame.func.module.globals.getPtr(name)) |slot| slot.* = self.peek(0) else return self.fail("undefined name '{s}'", .{name});
                 },
                 .define_global => {
                     const name = chunk.constants.items[self.readU16(frame)].str;
-                    try self.globals.put(self.alloc, name, self.pop());
+                    try frame.func.module.globals.put(self.alloc, name, self.pop());
                 },
                 .get_upvalue => {
                     const idx = self.readByte(frame);
@@ -1600,6 +1656,9 @@ const VM = struct {
                             const ev = try self.alloc.create(EnumValue);
                             ev.* = .{ .enum_name = et.name, .member = name };
                             try self.push(.{ .enum_value = ev });
+                        },
+                        .module => |m| {
+                            if (m.globals.get(name)) |v| try self.push(v) else return self.fail("module '{s}' has no member '{s}'", .{ m.name, name });
                         },
                         else => return self.fail("cannot access member '{s}' of {s}", .{ name, @tagName(obj) }),
                     }
@@ -2101,6 +2160,7 @@ const VM = struct {
                 try buf.append(self.alloc, '}');
             },
             .closure, .builtin, .bound_method => try buf.appendSlice(self.alloc, "<function>"),
+            .module => try buf.appendSlice(self.alloc, "<module>"),
             .type => |t| try buf.appendSlice(self.alloc, t.name),
             .enum_type => |et| try buf.appendSlice(self.alloc, et.name),
             .enum_value => |ev| {
@@ -2139,6 +2199,80 @@ fn expectVMOutput(src: []const u8, expected: []const u8) !void {
     try testing.expectEqual(@as(usize, 0), result.diagnostics.len);
     try testing.expect(result.runtime_error == null);
     try testing.expectEqualStrings(expected, result.output);
+}
+
+/// Run a two-module VM program: `dep_src` bound as `dep_name`, imported by
+/// `entry_src` whose `main()` runs.
+fn expectModuleOutput(dep_name: []const u8, dep_src: []const u8, entry_src: []const u8, expected: []const u8) !void {
+    const gpa = testing.allocator;
+    var dep_tree = try parser.parse(gpa, dep_src);
+    defer dep_tree.deinit();
+    var entry_tree = try parser.parse(gpa, entry_src);
+    defer entry_tree.deinit();
+
+    const imports = [_]ModuleImport{.{ .name = dep_name, .module_index = 0 }};
+    const modules = [_]ProgramModule{
+        .{ .module = dep_tree.module, .imports = &.{}, .name = dep_name },
+        .{ .module = entry_tree.module, .imports = &imports, .name = "main" },
+    };
+    var result = try runProgram(gpa, &modules);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.diagnostics.len);
+    try testing.expect(result.runtime_error == null);
+    try testing.expectEqualStrings(expected, result.output);
+}
+
+test "vm: an imported function closes over its own module's globals" {
+    try expectModuleOutput(
+        "mathutil",
+        "const BASE: int = 10\n\npub func bump(n: int) -> int:\n    return n + BASE",
+        "import mathutil\n\nfunc main():\n    print(mathutil.bump(5))",
+        "15\n",
+    );
+}
+
+test "vm: an exported function may call a module-private sibling" {
+    try expectModuleOutput(
+        "util",
+        "func helper(n: int) -> int:\n    return n * 2\n\npub func doubleUp(n: int) -> int:\n    return helper(n) + helper(n)",
+        "import util\n\nfunc main():\n    print(util.doubleUp(3))",
+        "12\n",
+    );
+}
+
+test "vm: an imported type constructs and its methods run in its module" {
+    try expectModuleOutput(
+        "shapes",
+        "pub struct Point:\n    var x: int = 0\n    var y: int = 0\n\n    func sum() -> int:\n        return x + y",
+        "import shapes\n\nfunc main():\n    var p = shapes.Point()\n    p.x = 3\n    p.y = 4\n    print(p.sum())",
+        "7\n",
+    );
+}
+
+test "vm: an imported enum's cases cross the boundary" {
+    try expectModuleOutput(
+        "colors",
+        "pub enum Color { RED, GREEN }",
+        "import colors\n\nfunc main():\n    var c = colors.Color.RED\n    print(c, c == colors.Color.RED)",
+        "Color.RED true\n",
+    );
+}
+
+test "vm: reaching an undefined module member is a runtime error" {
+    const gpa = testing.allocator;
+    var dep_tree = try parser.parse(gpa, "pub func real() -> int:\n    return 1");
+    defer dep_tree.deinit();
+    var entry_tree = try parser.parse(gpa, "import util\n\nfunc main():\n    print(util.nope())");
+    defer entry_tree.deinit();
+    const imports = [_]ModuleImport{.{ .name = "util", .module_index = 0 }};
+    const modules = [_]ProgramModule{
+        .{ .module = dep_tree.module, .imports = &.{}, .name = "util" },
+        .{ .module = entry_tree.module, .imports = &imports, .name = "main" },
+    };
+    var result = try runProgram(gpa, &modules);
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "no member 'nope'") != null);
 }
 
 test "vm: arithmetic and precedence" {

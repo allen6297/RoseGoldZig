@@ -137,15 +137,21 @@ fn handle(
         return 0;
     }
 
-    // The bytecode VM backend: single-module programs only.
+    // The bytecode VM backend: compile and run every module in dependency order.
     if (use_vm) {
         const entry = graph.units[graph.units.len - 1];
-        if (graph.units.len > 1) {
-            try err.print("error: the --vm backend does not support modules yet\n", .{});
-            return 1;
+        const vm_modules = try arena.alloc(Vm.ProgramModule, graph.units.len);
+        for (graph.units, 0..) |unit, i| {
+            const imps = try arena.alloc(Vm.ModuleImport, unit.imports.len);
+            for (unit.imports, 0..) |imp, j| {
+                imps[j] = .{ .name = imp.name, .module_index = imp.module_index };
+            }
+            vm_modules[i] = .{ .module = unit.module, .imports = imps, .name = unit.path };
         }
-        const vm_result = try Vm.run(arena, entry.module);
+        const vm_result = try Vm.runProgram(arena, vm_modules);
         if (vm_result.diagnostics.len > 0) {
+            // Compile diagnostics carry a line/col but not their module; attribute
+            // them to the entry file (the common single-file case).
             for (vm_result.diagnostics) |d| {
                 try render(err, "error", entry.path, entry.src, d.message, d.line, d.col);
             }

@@ -23,7 +23,7 @@ zig build run -- run --vm FILE.rg  # execute on the bytecode VM instead
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (286 as of writing)
+zig build test                  # run every test (291 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -51,12 +51,12 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/fontend/loader.zig` | Module loader: reads + parses the entry file and its transitive imports into a dependency-ordered `Graph`; path resolution, dedup, cycle detection. |
 | `src/fontend/analyzer.zig` | Combined name resolution + type checking over the AST. |
 | `src/fontend/interpreter.zig` | Tree-walking evaluator (the default backend, full language). |
-| `src/fontend/vm.zig` | Alternative backend behind `run --vm`: a bytecode compiler + stack VM for the core language (see below). |
+| `src/fontend/vm.zig` | Alternative backend behind `run --vm`: a bytecode compiler + stack VM covering nearly all of the language, incl. modules (see below). |
 | `src/fontend/formatter.zig` | Canonical source printer (AST → formatted text) behind `fmt`; re-emits `##` line comments by line. |
 | `src/fontend/tests.zig` | Test aggregator; the `zig build test` frontend target roots here. |
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
 | `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. |
-| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules), `messy.rg` (badly-formatted input for `fmt`), `primes.rg` (core-only, runs on both backends). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
+| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg` (runs on both backends). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
 
 Each layer imports the ones below it (`interpreter`/`analyzer` → `parser` → `lexer`,
 and `loader`/`formatter` → `parser`); there are no upward dependencies. `main.zig`
@@ -260,9 +260,17 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   are closures stored there, and inside a static method a bare static name (own or
   inherited) resolves via a pushed type value + `get_member`. (As in the interpreter, an
   *instance* method reaches statics only through the type name, not by bare name.)
+- **Modules** compile too (`Vm.runProgram` over a dependency-ordered module set): each
+  module gets its own runtime namespace (`RtModule.globals`), and every `Function` carries
+  its home `module`, so `get_global`/`set_global`/`define_global` resolve in the defining
+  module even when called across the boundary (like the interpreter's home-module closures).
+  `import mod` binds `mod` to a `module` value; `mod.name` reads it via `get_member`; each
+  module's script runs in dependency order to populate its globals, and only the entry
+  runs `main`. Cross-module funcs/consts/types/enums all work.
 - **Not yet compiled** (reported as a clear "the --vm backend does not support …"
-  diagnostic, so the tree-walker stays the full-featured default): modules (so no
-  cross-module inheritance or imported bases/traits) and signals.
+  diagnostic, so the tree-walker stays the full-featured default): **signals**, and
+  **cross-module inheritance** (`extends`/`uses mod.Base` — the base's field layout /
+  method table isn't resolved across modules at compile time).
 
 ### Known gaps / future work
 - A subclass's own **static method** now sees an inherited static by bare name (both
@@ -277,4 +285,6 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   special-cased by name at their call sites rather than being first-class generic
   signatures, so calling one indirectly (`var f = push`) falls back to `any`.
 - Module resolution has no **search path / package roots** (see **Modules → Limits**);
-  cross-module inheritance is one level deep.
+  cross-module inheritance is one level deep on the interpreter, and unsupported on the
+  `--vm` backend (an imported base's field layout / method table isn't resolved across
+  modules at compile time — reported as a clear diagnostic).
