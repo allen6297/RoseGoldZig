@@ -23,7 +23,7 @@ zig build run -- run --vm FILE.rg  # execute on the bytecode VM instead
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (281 as of writing)
+zig build test                  # run every test (283 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -252,17 +252,20 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   compile too: the type name binds to a `type` value (callable to construct, and the
   target for `Type.member`); static vars live in a per-`RtType` `statics` map (initialized
   once after globals exist, shared with subclasses by walking `ancestors`), static methods
-  are closures stored there, and inside a static method a bare own-static name resolves via
-  a pushed type value + `get_member`. (As in the interpreter, an *instance* method reaches
-  statics only through the type name, not by bare name.)
+  are closures stored there, and inside a static method a bare static name (own or
+  inherited) resolves via a pushed type value + `get_member`. (As in the interpreter, an
+  *instance* method reaches statics only through the type name, not by bare name.)
 - **Not yet compiled** (reported as a clear "the --vm backend does not support …"
   diagnostic, so the tree-walker stays the full-featured default): modules (so no
   cross-module inheritance or imported bases/traits) and signals.
 
 ### Known gaps / future work
-- A subclass's own **static method** doesn't see an inherited static by bare name
-  (only via the type name); `static` argument checks against a static method's
-  parameters are the same as any call.
+- A subclass's own **static method** now sees an inherited static by bare name (both
+  backends walk the type's ancestors: the interpreter via `current_static_ti` +
+  `staticsEnvFor`, the VM via `TypeDef.isStatic` + `get_member`/`staticSlot`). An
+  *instance* method still reaches statics only through the type name, matching both
+  backends. `static` argument checks against a static method's parameters are the same
+  as any call.
 - Collection **element types are analyzer-only** and not runtime-enforced (values
   stay dynamically typed). Element assignability is covariant (unsound under
   mutation, but matches the lenient design). The element-aware builtins are

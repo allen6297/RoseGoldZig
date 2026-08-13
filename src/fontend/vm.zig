@@ -347,8 +347,12 @@ const TypeDef = struct {
     fn isMember(self: *const TypeDef, name: []const u8) bool {
         return self.fields.contains(name) or self.methods.contains(name);
     }
-    fn isOwnStatic(self: *const TypeDef, name: []const u8) bool {
-        return self.own_statics.contains(name);
+    /// True if `name` is a static member of this type or a base (so a subclass's
+    /// static method can reach an inherited static by bare name).
+    fn isStatic(self: *const TypeDef, name: []const u8) bool {
+        if (self.own_statics.contains(name)) return true;
+        for (self.ancestors) |a| if (a.own_statics.contains(name)) return true;
+        return false;
     }
 };
 
@@ -940,7 +944,7 @@ const Compiler = struct {
                     try self.loadSelf(a.span);
                     try self.expr(a.value.*);
                     try self.emitGlobal(.set_field, id.name, a.span);
-                } else if (self.current_static_type != null and self.current_static_type.?.isOwnStatic(id.name)) {
+                } else if (self.current_static_type != null and self.current_static_type.?.isStatic(id.name)) {
                     // A bare static write inside a static method: [type, value] set_field.
                     try self.emitTypeConst(self.current_static_type.?, a.span);
                     try self.expr(a.value.*);
@@ -1108,7 +1112,7 @@ const Compiler = struct {
                     // the receiver.
                     try self.loadSelf(id.span);
                     try self.emitGlobal(.get_member, id.name, id.span);
-                } else if (self.current_static_type != null and self.current_static_type.?.isOwnStatic(id.name)) {
+                } else if (self.current_static_type != null and self.current_static_type.?.isStatic(id.name)) {
                     // A bare static name inside a static method resolves against
                     // the type.
                     try self.emitTypeConst(self.current_static_type.?, id.span);
@@ -2443,6 +2447,24 @@ test "vm: a subclass reaches and shares inherited statics" {
         \\    print(Base.n)
     ;
     try expectVMOutput(src, "2\n50\n");
+}
+
+test "vm: a subclass static method sees an inherited static by bare name" {
+    const src =
+        \\class Base:
+        \\    static var n: int = 0
+        \\
+        \\class Sub extends Base:
+        \\    static func bump() -> int:
+        \\        n = n + 1
+        \\        return n
+        \\
+        \\func main():
+        \\    print(Sub.bump())
+        \\    print(Sub.bump())
+        \\    print(Base.n)
+    ;
+    try expectVMOutput(src, "1\n2\n2\n");
 }
 
 test "vm: accessing an unknown member is a runtime error" {

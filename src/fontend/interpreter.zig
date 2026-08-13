@@ -398,6 +398,9 @@ const Interpreter = struct {
     /// The statics of the type whose `static` method is currently executing, so
     /// bare names inside it resolve to (and assign to) that type's static members.
     current_statics: ?*Env = null,
+    /// The type whose `static` method is running, so a bare name can resolve to a
+    /// static inherited from a base (walking ancestors), not just an own static.
+    current_static_ti: ?*const TypeInfo = null,
     /// Every class/struct by name, so supertypes can be resolved.
     types: std.StringHashMapUnmanaged(*TypeInfo) = .{},
     /// Current call-stack depth, so runaway recursion becomes a runtime error
@@ -439,7 +442,9 @@ const Interpreter = struct {
                 return .{ .bound_method = bm };
             }
         }
-        if (self.current_statics) |st| {
+        if (self.current_static_ti) |ti| {
+            if (self.staticsEnvFor(ti, name)) |senv| return senv.vars.get(name).?;
+        } else if (self.current_statics) |st| {
             if (st.vars.get(name)) |v| return v;
         }
         if (self.globals.vars.get(name)) |v| return v;
@@ -463,7 +468,12 @@ const Interpreter = struct {
                 return true;
             }
         }
-        if (self.current_statics) |st| {
+        if (self.current_static_ti) |ti| {
+            if (self.staticsEnvFor(ti, name)) |senv| {
+                senv.vars.getPtr(name).?.* = value;
+                return true;
+            }
+        } else if (self.current_statics) |st| {
             if (st.vars.getPtr(name)) |slot| {
                 slot.* = value;
                 return true;
@@ -547,15 +557,18 @@ const Interpreter = struct {
         const saved_env = self.env;
         const saved_recv = self.current_receiver;
         const saved_statics = self.current_statics;
+        const saved_static_ti = self.current_static_ti;
         const saved_globals = self.globals;
         self.globals = ti.module;
         self.env = ti.module;
         self.current_receiver = null;
         self.current_statics = ti.statics;
+        self.current_static_ti = ti;
         defer {
             self.env = saved_env;
             self.current_receiver = saved_recv;
             self.current_statics = saved_statics;
+            self.current_static_ti = saved_static_ti;
             self.globals = saved_globals;
         }
         for (ti.static_fields) |f| {
@@ -689,11 +702,13 @@ const Interpreter = struct {
         const saved_env = self.env;
         const saved_recv = self.current_receiver;
         const saved_statics = self.current_statics;
+        const saved_static_ti = self.current_static_ti;
         const saved_globals = self.globals;
         self.globals = ti.module;
         self.env = ti.module;
         self.current_receiver = inst;
         self.current_statics = null;
+        self.current_static_ti = null;
         for (ti.all_fields) |f| {
             const v = if (f.value) |val| try self.eval(val.*) else Value.nil;
             try inst.fields.put(self.arena, f.name, v);
@@ -701,6 +716,7 @@ const Interpreter = struct {
         self.env = saved_env;
         self.current_receiver = saved_recv;
         self.current_statics = saved_statics;
+        self.current_static_ti = saved_static_ti;
         self.globals = saved_globals;
 
         // Each instance gets its own signals, reached via `inst.name`.
@@ -1056,9 +1072,11 @@ const Interpreter = struct {
         const saved_globals = self.globals;
         const saved_recv = self.current_receiver;
         const saved_statics = self.current_statics;
+        const saved_static_ti = self.current_static_ti;
         self.globals = fv.module;
         self.current_receiver = null;
         self.current_statics = null;
+        self.current_static_ti = null;
         const call_env = try self.newEnv(self.globals);
         for (func.params, args) |p, arg| try self.define(call_env, p.name, arg);
 
@@ -1072,6 +1090,7 @@ const Interpreter = struct {
             self.globals = saved_globals;
             self.current_receiver = saved_recv;
             self.current_statics = saved_statics;
+            self.current_static_ti = saved_static_ti;
         }
         const flow = try self.execBlock(func.body);
         return if (flow == .returned) self.ret_value else Value.nil;
@@ -1091,9 +1110,11 @@ const Interpreter = struct {
         const saved_globals = self.globals;
         const saved_recv = self.current_receiver;
         const saved_statics = self.current_statics;
+        const saved_static_ti = self.current_static_ti;
         self.globals = cl.module;
         self.current_receiver = cl.receiver;
         self.current_statics = cl.statics;
+        self.current_static_ti = null;
         const call_env = try self.newEnv(cl.env);
         for (params, args) |p, arg| try self.define(call_env, p.name, arg);
 
@@ -1107,6 +1128,7 @@ const Interpreter = struct {
             self.globals = saved_globals;
             self.current_receiver = saved_recv;
             self.current_statics = saved_statics;
+            self.current_static_ti = saved_static_ti;
         }
         const flow = try self.execBlock(cl.lambda.body);
         return if (flow == .returned) self.ret_value else Value.nil;
@@ -1130,15 +1152,18 @@ const Interpreter = struct {
         const saved_ret = self.ret_value;
         const saved_recv = self.current_receiver;
         const saved_statics = self.current_statics;
+        const saved_static_ti = self.current_static_ti;
         self.env = call_env;
         self.ret_value = .nil;
         self.current_receiver = receiver;
         self.current_statics = null;
+        self.current_static_ti = null;
         defer {
             self.env = saved_env;
             self.ret_value = saved_ret;
             self.current_receiver = saved_recv;
             self.current_statics = saved_statics;
+            self.current_static_ti = saved_static_ti;
             self.globals = saved_globals;
         }
         const flow = try self.execBlock(func.body);
@@ -1158,9 +1183,11 @@ const Interpreter = struct {
         const saved_globals = self.globals;
         const saved_recv = self.current_receiver;
         const saved_statics = self.current_statics;
+        const saved_static_ti = self.current_static_ti;
         self.globals = sm.ti.module;
         self.current_receiver = null;
         self.current_statics = sm.ti.statics;
+        self.current_static_ti = sm.ti;
         const call_env = try self.newEnv(self.globals);
         for (func.params, args) |p, arg| try self.define(call_env, p.name, arg);
 
@@ -1174,6 +1201,7 @@ const Interpreter = struct {
             self.globals = saved_globals;
             self.current_receiver = saved_recv;
             self.current_statics = saved_statics;
+            self.current_static_ti = saved_static_ti;
         }
         const flow = try self.execBlock(func.body);
         return if (flow == .returned) self.ret_value else Value.nil;
@@ -2596,6 +2624,24 @@ test "a subclass reaches and shares inherited statics" {
         \\    print(Base.n)
     ;
     try expectOutput(src, "2\n50\n");
+}
+
+test "a subclass static method sees an inherited static by bare name" {
+    const src =
+        \\class Base:
+        \\    static var n: int = 0
+        \\
+        \\class Sub extends Base:
+        \\    static func bump() -> int:
+        \\        n = n + 1
+        \\        return n
+        \\
+        \\func main():
+        \\    print(Sub.bump())
+        \\    print(Sub.bump())
+        \\    print(Base.n)
+    ;
+    try expectOutput(src, "1\n2\n2\n");
 }
 
 test "static fields are not instance fields" {
