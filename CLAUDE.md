@@ -233,10 +233,13 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   nested lambdas), string interpolation (`"a ${expr} b"`, each hole stringified and
   concatenated via an `interp` opcode), and the full stdlib of builtins (`print`/`len`/
   `str`/`range`/`push`/`keys`/…/`sort`/`split`/`join`/`find`/`replace`/`trim`/`abs`/
-  `min`/`max`/…) — everything except the signal builtins `connect`/`emit`.
+  `min`/`max`/…) — everything except the signal builtins `connect`/`emit`. Optionals
+  (`?T`/`nil`) need no special runtime support and already work. `match` on
+  literal/`_`/binding patterns compiles too (the subject lives in a slot found via a
+  compile-time stack pointer, `FnState.stack_top`); enum-case arms await enums.
 - **Not yet compiled** (reported as a clear "the --vm backend does not support …"
   diagnostic, so the tree-walker stays the full-featured default): classes/structs/
-  enums, modules, signals, statics, and optionals/`match`.
+  enums (and so enum-case `match` arms), modules, signals, and statics.
 
 ### Known gaps / future work
 - A subclass's own **static method** doesn't see an inherited static by bare name

@@ -241,6 +241,10 @@ const FnState = struct {
     func: *Function,
     locals: std.ArrayList(Local) = .empty,
     scope_depth: u32 = 0,
+    /// Compile-time stack height (values above `frame.base`). Reset to the live
+    /// local count at each statement and advanced one-per-expression; `match`
+    /// reads it to find the absolute slot of its subject temporary.
+    stack_top: usize = 0,
     upvalues: std.ArrayList(Upvalue) = .empty,
     loops: std.ArrayList(*Loop) = .empty,
     enclosing: ?*FnState = null,
@@ -281,18 +285,22 @@ const Compiler = struct {
             try funcs.put(self.alloc, decl.func.name, f);
         };
 
-        // The script body: bind functions/globals, then call main().
-        for (module.decls) |decl| switch (decl) {
-            .func => |fd| {
-                try self.emitClosure(funcs.get(fd.name).?, fd.span);
-                try self.defineGlobal(fd.name, fd.span);
-            },
-            .var_decl => |v| {
-                if (v.value) |val| try self.expr(val.*) else try self.emit(.nil, v.span);
-                try self.defineGlobal(v.name, v.span);
-            },
-            else => {},
-        };
+        // The script body: bind functions/globals, then call main(). Top-level
+        // values become globals (not locals), so each starts from a clean stack.
+        for (module.decls) |decl| {
+            self.cur.stack_top = 0;
+            switch (decl) {
+                .func => |fd| {
+                    try self.emitClosure(funcs.get(fd.name).?, fd.span);
+                    try self.defineGlobal(fd.name, fd.span);
+                },
+                .var_decl => |v| {
+                    if (v.value) |val| try self.expr(val.*) else try self.emit(.nil, v.span);
+                    try self.defineGlobal(v.name, v.span);
+                },
+                else => {},
+            }
+        }
         if (funcs.get("main")) |_| {
             try self.emitGlobal(.get_global, "main", zeroSpan);
             try self.emit(.call, zeroSpan);
@@ -339,6 +347,77 @@ const Compiler = struct {
         try self.emitClosure(func, lam.span);
     }
 
+    /// Compile a `match` expression. The subject is evaluated once into an
+    /// anonymous local slot; each arm reads it back for its equality test (or
+    /// binds it), and the winning arm's body value replaces it as the result.
+    fn compileMatch(self: *Compiler, m: Expr.Match) Error!void {
+        // The subject lands at the current stack top; its absolute slot is the
+        // stack height captured *before* we push it.
+        const subj: usize = self.cur.stack_top;
+        try self.expr(m.subject.*);
+
+        // A binding pattern names the subject, so its local slot must equal the
+        // subject's stack slot. Pad the locals array up to that index (the pad
+        // entries shadow live temporaries below the subject and are never named).
+        const orig_len = self.cur.locals.items.len;
+        while (self.cur.locals.items.len < subj) {
+            try self.cur.locals.append(self.alloc, .{ .name = "$m", .depth = self.cur.scope_depth });
+        }
+        try self.cur.locals.append(self.alloc, .{ .name = "$match", .depth = self.cur.scope_depth });
+        defer self.cur.locals.shrinkRetainingCapacity(orig_len);
+
+        var end_jumps: std.ArrayList(usize) = .empty;
+        for (m.arms) |arm| switch (arm.pattern) {
+            .wildcard => {
+                try self.expr(arm.body.*);
+                try end_jumps.append(self.alloc, try self.emitJump(.jump, arm.span));
+            },
+            .binding => |bd| {
+                // The subject *is* the bound value: rename its slot so the body
+                // resolves the binding name to it, then restore the name.
+                const saved = self.cur.locals.items[subj].name;
+                self.cur.locals.items[subj].name = bd.name;
+                try self.expr(arm.body.*);
+                self.cur.locals.items[subj].name = saved;
+                try end_jumps.append(self.alloc, try self.emitJump(.jump, arm.span));
+            },
+            .enum_case => return self.fail(arm.span, "the --vm backend does not support enum-case match patterns yet", .{}),
+            else => {
+                try self.emitLocal(.get_local, subj, arm.span);
+                try self.patternConst(arm.pattern);
+                try self.emit(.eq, arm.span);
+                const next = try self.emitJump(.jump_if_false, arm.span);
+                try self.expr(arm.body.*);
+                try end_jumps.append(self.alloc, try self.emitJump(.jump, arm.span));
+                self.patchJump(next);
+            },
+        };
+        // No arm matched -> nil (mirrors the interpreter).
+        try self.emit(.nil, m.span);
+        for (end_jumps.items) |j| self.patchJump(j);
+
+        // Collapse [subject, result] to just [result] at the subject's slot.
+        try self.emitLocal(.set_local, subj, m.span);
+        try self.emit(.pop, m.span);
+    }
+
+    /// Push a literal pattern's value as a constant (for the arm's `==` test).
+    fn patternConst(self: *Compiler, p: parser.Pattern) Error!void {
+        switch (p) {
+            .int_literal => |lit| {
+                const n = std.fmt.parseInt(i64, lit.text, 10) catch return self.fail(lit.span, "invalid integer '{s}'", .{lit.text});
+                try self.emitConst(.{ .int = n }, lit.span);
+            },
+            .float_literal => |lit| {
+                const f = std.fmt.parseFloat(f64, lit.text) catch return self.fail(lit.span, "invalid float '{s}'", .{lit.text});
+                try self.emitConst(.{ .float = f }, lit.span);
+            },
+            .string_literal => |lit| try self.emitConst(.{ .str = try self.unquote(lit.text) }, lit.span),
+            .bool_literal => |b| try self.emit(if (b.value) .true_ else .false_, b.span),
+            else => unreachable,
+        }
+    }
+
     /// Resolve `name` as an upvalue of `fs`: a local of the enclosing function
     /// (captured directly), or an upvalue of it (captured transitively). Returns
     /// the upvalue index in `fs`, or null if `name` is not an enclosing local.
@@ -380,6 +459,9 @@ const Compiler = struct {
     }
 
     fn stmt(self: *Compiler, s: Stmt) Error!void {
+        // Statements begin with a balanced stack: the height is exactly the live
+        // local count. (Expressions restore this themselves; see `expr`.)
+        self.cur.stack_top = self.cur.locals.items.len;
         switch (s) {
             .pass => {},
             .var_decl => |v| {
@@ -546,7 +628,17 @@ const Compiler = struct {
 
     // --- expressions ---------------------------------------------------------
 
+    /// Compile an expression. Every expression nets exactly one value on the
+    /// stack, so we snapshot the height on entry and restore `before + 1` on
+    /// exit — that keeps `stack_top` an accurate compile-time stack pointer even
+    /// across branchy sub-expressions, which `match` needs to locate its subject.
     fn expr(self: *Compiler, e: Expr) Error!void {
+        const before = self.cur.stack_top;
+        try self.exprInner(e);
+        self.cur.stack_top = before + 1;
+    }
+
+    fn exprInner(self: *Compiler, e: Expr) Error!void {
         switch (e) {
             .int_literal => |lit| {
                 const n = std.fmt.parseInt(i64, lit.text, 10) catch return self.fail(lit.span, "invalid integer '{s}'", .{lit.text});
@@ -617,6 +709,7 @@ const Compiler = struct {
                 try self.emitU16(@intCast(it.parts.len), it.span);
             },
             .lambda => |lam| try self.compileLambda(lam),
+            .match => |m| try self.compileMatch(m),
             else => return self.fail(parser.exprSpan(e), "the --vm backend does not support this expression yet", .{}),
         }
     }
@@ -1503,6 +1596,52 @@ test "vm: stdlib builtins" {
 
 test "vm: short-circuit logical operators" {
     try expectVMOutput("func main():\n    print(true and false, false or true, not false)", "false true true\n");
+}
+
+test "vm: match with literal, binding, and wildcard patterns" {
+    const src =
+        \\func describe(n: int) -> str:
+        \\    return match n {
+        \\        0: "zero"
+        \\        1: "one"
+        \\        other: "many (${other})"
+        \\    }
+        \\
+        \\func grade(score: int) -> str:
+        \\    return match score {
+        \\        100: "perfect"
+        \\        _: "keep going"
+        \\    }
+        \\
+        \\func main():
+        \\    for i in 0..4:
+        \\        print(describe(i))
+        \\    print(grade(100), grade(50))
+    ;
+    try expectVMOutput(src, "zero\none\nmany (2)\nmany (3)\nperfect keep going\n");
+}
+
+test "vm: match nested mid-expression tracks the subject slot" {
+    // The match sits inside a call argument list, so its subject temporary is
+    // above the live locals — this exercises the compile-time stack pointer.
+    const src =
+        \\func main():
+        \\    var base = 100
+        \\    var k = 2
+        \\    print(base, k, match k { 1: "a" 2: "b" n: "n${n}" })
+        \\    print(base + match k { 2: 20 _: 0 })
+    ;
+    try expectVMOutput(src, "100 2 b\n120\n");
+}
+
+test "vm: match on strings and bools" {
+    const src =
+        \\func main():
+        \\    var s = "b"
+        \\    print(match s { "a": 1 "b": 2 _: 0 })
+        \\    print(match true { true: "yes" false: "no" })
+    ;
+    try expectVMOutput(src, "2\nyes\n");
 }
 
 test "vm: string interpolation" {
