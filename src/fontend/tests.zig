@@ -8,4 +8,5 @@ test {
     _ = @import("interpreter.zig");
     _ = @import("loader.zig");
     _ = @import("formatter.zig");
+    _ = @import("vm.zig");
 }

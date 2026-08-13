@@ -18,11 +18,12 @@ uniform. See `examples/demo.rg` (single file) and `examples/app.rg` (imports
 
 ```bash
 zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
-zig build run -- run FILE.rg    # parse, analyze, and execute FILE
+zig build run -- run FILE.rg    # parse, analyze, and execute FILE (tree-walker)
+zig build run -- run --vm FILE.rg  # execute on the bytecode VM instead
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (258 as of writing)
+zig build test                  # run every test (264 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -49,7 +50,8 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/fontend/parser.zig` | Recursive-descent parser → AST (all `pub`). Owns the AST node types. |
 | `src/fontend/loader.zig` | Module loader: reads + parses the entry file and its transitive imports into a dependency-ordered `Graph`; path resolution, dedup, cycle detection. |
 | `src/fontend/analyzer.zig` | Combined name resolution + type checking over the AST. |
-| `src/fontend/interpreter.zig` | Tree-walking evaluator. |
+| `src/fontend/interpreter.zig` | Tree-walking evaluator (the default backend, full language). |
+| `src/fontend/vm.zig` | Alternative backend behind `run --vm`: a bytecode compiler + stack VM for the core language (see below). |
 | `src/fontend/formatter.zig` | Canonical source printer (AST → formatted text) behind `fmt`; re-emits `##` line comments by line. |
 | `src/fontend/tests.zig` | Test aggregator; the `zig build test` frontend target roots here. |
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
@@ -214,6 +216,21 @@ drives the loader, then the analyzer and interpreter over the loaded module set
 - The checker resolves names at **definition time** (unlike the interpreter's
   call-time binding), so a forward reference to a not-yet-defined name is reported —
   define callees first, or put mutually-recursive definitions in one entry.
+
+### Bytecode VM (`run --vm`)
+- An alternative execution backend (`vm.zig`): a compiler lowers each function to a
+  `Chunk` of stack-machine opcodes + constants, and a `VM` runs it over a value stack
+  with a call-frame stack. It has its **own** small `Value` type (no coupling to the
+  interpreter) and produces byte-identical output to the tree-walker on the programs it
+  supports.
+- **Covers the core:** functions (recursion), locals + globals, arithmetic/comparison,
+  short-circuit `and`/`or`, `if`/`elif`/`else`, `while`, single-binding `for` (over a
+  list), `break`/`continue` (with proper stack cleanup), list literals + indexing, and
+  the builtins `print`/`echo`/`len`/`str`/`int`/`float`/`range`/`push`/`pop`.
+- **Not yet compiled** (reported as a clear "the --vm backend does not support …"
+  diagnostic, so the tree-walker stays the full-featured default): classes/structs/
+  enums, closures/lambdas, modules, signals, statics, optionals/`match`, maps, string
+  interpolation, ranges, and two-variable `for`.
 
 ### Known gaps / future work
 - A subclass's own **static method** doesn't see an inherited static by bare name

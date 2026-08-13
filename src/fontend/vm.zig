@@ -1,0 +1,1098 @@
+//! A bytecode compiler + stack VM: an alternative execution backend to the
+//! tree-walking interpreter, reached via `run --vm`. It covers the core of the
+//! language — expressions, control flow, functions (with recursion), locals and
+//! globals, lists, and the common builtins — enough to run programs like `fib`
+//! and list/loop processing. Constructs it does not compile (classes, closures,
+//! modules, signals, `match`, member access, …) are reported as unsupported, so
+//! the tree-walker remains the full-featured default.
+//!
+//! Design: each function compiles to a `Chunk` of opcodes + constants; the VM
+//! runs a `Chunk` over a value stack with a frame stack for calls.
+
+const std = @import("std");
+const parser = @import("parser.zig");
+const lexer = @import("lexer.zig");
+
+const Decl = parser.Decl;
+const Stmt = parser.Stmt;
+const Expr = parser.Expr;
+const BinaryOp = parser.BinaryOp;
+const Span = lexer.Span;
+const Module = parser.Module;
+
+const Error = std.mem.Allocator.Error || error{Compile};
+
+// --- values ------------------------------------------------------------------
+
+const List = std.ArrayList(Value);
+
+const Builtin = enum { print, echo, len, str, int, float, range, push, pop };
+
+const builtin_names = [_][]const u8{ "print", "echo", "len", "str", "int", "float", "range", "push", "pop" };
+
+const Function = struct {
+    name: []const u8,
+    arity: usize,
+    chunk: Chunk,
+};
+
+const Value = union(enum) {
+    nil,
+    int: i64,
+    float: f64,
+    bool: bool,
+    str: []const u8,
+    list: *List,
+    func: *const Function,
+    builtin: Builtin,
+};
+
+fn isTruthy(v: Value) bool {
+    return switch (v) {
+        .nil => false,
+        .bool => |b| b,
+        .int => |n| n != 0,
+        .float => |f| f != 0,
+        .str => |s| s.len != 0,
+        else => true,
+    };
+}
+
+fn toFloat(v: Value) ?f64 {
+    return switch (v) {
+        .int => |n| @floatFromInt(n),
+        .float => |f| f,
+        else => null,
+    };
+}
+
+fn valuesEqual(a: Value, b: Value) bool {
+    return switch (a) {
+        .nil => b == .nil,
+        .int => |x| switch (b) {
+            .int => |y| x == y,
+            .float => |y| @as(f64, @floatFromInt(x)) == y,
+            else => false,
+        },
+        .float => |x| switch (b) {
+            .int => |y| x == @as(f64, @floatFromInt(y)),
+            .float => |y| x == y,
+            else => false,
+        },
+        .bool => |x| b == .bool and b.bool == x,
+        .str => |x| b == .str and std.mem.eql(u8, x, b.str),
+        .list => |x| b == .list and x == b.list,
+        .func => |x| b == .func and x == b.func,
+        .builtin => |x| b == .builtin and x == b.builtin,
+    };
+}
+
+// --- bytecode ----------------------------------------------------------------
+
+const Op = enum(u8) {
+    constant, // u16 const index
+    nil,
+    true_,
+    false_,
+    pop,
+    negate,
+    not,
+    add,
+    sub,
+    mul,
+    div,
+    mod,
+    eq,
+    ne,
+    lt,
+    le,
+    gt,
+    ge,
+    get_local, // u8 slot
+    set_local, // u8 slot (stores top, keeps it on the stack)
+    get_global, // u16 name-const index
+    set_global, // u16
+    define_global, // u16
+    jump, // u16 (absolute target)
+    jump_if_false, // u16
+    call, // u8 argc
+    ret,
+    build_list, // u16 count
+    index_get,
+    index_set,
+    len, // list/str length (for `for`)
+    print_top, // debug/unused
+};
+
+const Chunk = struct {
+    code: std.ArrayList(u8) = .empty,
+    lines: std.ArrayList(u32) = .empty,
+    constants: std.ArrayList(Value) = .empty,
+};
+
+// --- result ------------------------------------------------------------------
+
+pub const RuntimeError = struct { message: []const u8, line: u32, col: u32 };
+
+pub const Result = struct {
+    arena: std.heap.ArenaAllocator,
+    output: []const u8,
+    runtime_error: ?RuntimeError,
+    diagnostics: []const lexer.Diagnostic,
+
+    pub fn deinit(self: *Result) void {
+        self.arena.deinit();
+    }
+};
+
+/// Compile and run `module` on the VM. Diagnostics is non-empty if a construct
+/// could not be compiled; otherwise output/runtime_error report execution.
+pub fn run(gpa: std.mem.Allocator, module: Module) Error!Result {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+
+    var diagnostics: std.ArrayList(lexer.Diagnostic) = .empty;
+
+    var c = Compiler{ .alloc = alloc, .diagnostics = &diagnostics };
+    const program = c.compileModule(module) catch |e| switch (e) {
+        error.Compile => {
+            return .{ .arena = arena, .output = "", .runtime_error = null, .diagnostics = try diagnostics.toOwnedSlice(alloc) };
+        },
+        else => return e,
+    };
+    if (diagnostics.items.len > 0) {
+        return .{ .arena = arena, .output = "", .runtime_error = null, .diagnostics = try diagnostics.toOwnedSlice(alloc) };
+    }
+
+    var output: std.ArrayList(u8) = .empty;
+    var vm = VM{ .alloc = alloc, .output = &output };
+    vm.run(program) catch |e| switch (e) {
+        error.Runtime => return .{ .arena = arena, .output = try output.toOwnedSlice(alloc), .runtime_error = vm.runtime_error, .diagnostics = &.{} },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    return .{ .arena = arena, .output = try output.toOwnedSlice(alloc), .runtime_error = null, .diagnostics = &.{} };
+}
+
+const Program = struct { script: *Function };
+
+// --- compiler ----------------------------------------------------------------
+
+const Local = struct { name: []const u8, depth: u32 };
+
+const Loop = struct {
+    /// Local count at loop entry, so `break`/`continue` can pop body locals.
+    local_count: usize,
+    /// Jumps to patch: to the end (breaks) and to the continue target (continues).
+    breaks: std.ArrayList(usize) = .empty,
+    continues: std.ArrayList(usize) = .empty,
+};
+
+const Compiler = struct {
+    alloc: std.mem.Allocator,
+    diagnostics: *std.ArrayList(lexer.Diagnostic),
+    chunk: *Chunk = undefined,
+    locals: std.ArrayList(Local) = .empty,
+    scope_depth: u32 = 0,
+    loops: std.ArrayList(*Loop) = .empty,
+
+    fn fail(self: *Compiler, span: Span, comptime fmt: []const u8, args: anytype) Error {
+        const msg = try std.fmt.allocPrint(self.alloc, fmt, args);
+        try self.diagnostics.append(self.alloc, .{ .message = msg, .line = span.line, .col = span.col });
+        return error.Compile;
+    }
+
+    fn compileModule(self: *Compiler, module: Module) Error!Program {
+        // Reject unsupported top-level constructs early with a clear message.
+        for (module.decls) |decl| switch (decl) {
+            .func, .var_decl => {},
+            else => return self.fail(declSpan(decl), "the --vm backend does not support this construct yet; use the default interpreter", .{}),
+        };
+
+        // Compile each function to a Function object.
+        var funcs: std.StringHashMapUnmanaged(*Function) = .{};
+        for (module.decls) |decl| if (decl == .func) {
+            const f = try self.compileFunction(decl.func);
+            try funcs.put(self.alloc, decl.func.name, f);
+        };
+
+        // The script chunk: bind functions/globals, then call main().
+        const script = try self.alloc.create(Function);
+        script.* = .{ .name = "<script>", .arity = 0, .chunk = .{} };
+        self.chunk = &script.chunk;
+        self.locals = .empty;
+        self.scope_depth = 0;
+
+        for (module.decls) |decl| switch (decl) {
+            .func => |fd| {
+                try self.emitConst(.{ .func = funcs.get(fd.name).? }, fd.span);
+                try self.defineGlobal(fd.name, fd.span);
+            },
+            .var_decl => |v| {
+                if (v.value) |val| try self.expr(val.*) else try self.emit(.nil, v.span);
+                try self.defineGlobal(v.name, v.span);
+            },
+            else => {},
+        };
+        if (funcs.get("main")) |_| {
+            try self.emitGlobal(.get_global, "main", zeroSpan);
+            try self.emit(.call, zeroSpan);
+            try self.emitByte(0, zeroSpan); // argc
+            try self.emit(.pop, zeroSpan);
+        }
+        try self.emit(.nil, zeroSpan); // the script's return value
+        try self.emit(.ret, zeroSpan);
+
+        return .{ .script = script };
+    }
+
+    fn compileFunction(self: *Compiler, f: Decl.Func) Error!*Function {
+        const func = try self.alloc.create(Function);
+        func.* = .{ .name = f.name, .arity = f.params.len, .chunk = .{} };
+
+        const saved_chunk = self.chunk;
+        const saved_locals = self.locals;
+        const saved_depth = self.scope_depth;
+        self.chunk = &func.chunk;
+        self.locals = .empty;
+        self.scope_depth = 0;
+        defer {
+            self.chunk = saved_chunk;
+            self.locals = saved_locals;
+            self.scope_depth = saved_depth;
+        }
+
+        // Parameters occupy the first local slots.
+        for (f.params) |p| try self.locals.append(self.alloc, .{ .name = p.name, .depth = 0 });
+        try self.block(f.body);
+        // Implicit `return nil` if the body falls off the end.
+        try self.emit(.nil, f.span);
+        try self.emit(.ret, f.span);
+        return func;
+    }
+
+    // --- statements ----------------------------------------------------------
+
+    fn block(self: *Compiler, stmts: []const Stmt) Error!void {
+        self.scope_depth += 1;
+        for (stmts) |s| try self.stmt(s);
+        try self.endScope();
+    }
+
+    fn endScope(self: *Compiler) Error!void {
+        self.scope_depth -= 1;
+        while (self.locals.items.len > 0 and self.locals.items[self.locals.items.len - 1].depth > self.scope_depth) {
+            _ = self.locals.pop();
+            try self.emit(.pop, zeroSpan);
+        }
+    }
+
+    fn stmt(self: *Compiler, s: Stmt) Error!void {
+        switch (s) {
+            .pass => {},
+            .var_decl => |v| {
+                if (v.value) |val| try self.expr(val.*) else try self.emit(.nil, v.span);
+                try self.locals.append(self.alloc, .{ .name = v.name, .depth = self.scope_depth });
+            },
+            .expr_stmt => |e| {
+                try self.expr(e.*);
+                try self.emit(.pop, parser.exprSpan(e.*));
+            },
+            .return_stmt => |r| {
+                if (r.value) |v| try self.expr(v.*) else try self.emit(.nil, r.span);
+                try self.emit(.ret, r.span);
+            },
+            .assign => |a| try self.assign(a),
+            .if_stmt => |x| try self.ifStmt(x),
+            .while_stmt => |x| try self.whileStmt(x),
+            .for_stmt => |x| try self.forStmt(x),
+            .break_stmt => |sp| {
+                const loop = self.currentLoop() orelse return self.fail(sp, "'break' outside a loop", .{});
+                try self.popLocalsTo(loop.local_count, sp);
+                const j = try self.emitJump(.jump, sp);
+                try loop.breaks.append(self.alloc, j);
+            },
+            .continue_stmt => |sp| {
+                const loop = self.currentLoop() orelse return self.fail(sp, "'continue' outside a loop", .{});
+                try self.popLocalsTo(loop.local_count, sp);
+                const j = try self.emitJump(.jump, sp);
+                try loop.continues.append(self.alloc, j);
+            },
+        }
+    }
+
+    fn assign(self: *Compiler, a: Stmt.Assign) Error!void {
+        switch (a.target.*) {
+            .identifier => |id| {
+                try self.expr(a.value.*);
+                if (self.resolveLocal(id.name)) |slot| {
+                    try self.emit(.set_local, a.span);
+                    try self.emitByte(@intCast(slot), a.span);
+                } else {
+                    try self.emitGlobal(.set_global, id.name, a.span);
+                }
+                try self.emit(.pop, a.span);
+            },
+            .index => |idx| {
+                try self.expr(idx.object.*);
+                try self.expr(idx.index.*);
+                try self.expr(a.value.*);
+                try self.emit(.index_set, a.span);
+            },
+            else => return self.fail(a.span, "the --vm backend does not support this assignment target", .{}),
+        }
+    }
+
+    fn ifStmt(self: *Compiler, x: Stmt.If) Error!void {
+        try self.expr(x.cond.*);
+        const else_jump = try self.emitJump(.jump_if_false, parser.exprSpan(x.cond.*));
+        try self.block(x.then_body);
+        const end_jumps = try self.compileElse(x, else_jump);
+        for (end_jumps.items) |j| self.patchJump(j);
+    }
+
+    /// Compile the elif/else chain; returns the list of jumps that skip to the
+    /// end of the whole `if`.
+    fn compileElse(self: *Compiler, x: Stmt.If, first_else: usize) Error!std.ArrayList(usize) {
+        var end_jumps: std.ArrayList(usize) = .empty;
+        const skip = try self.emitJump(.jump, x.span); // after the then-body, skip the rest
+        try end_jumps.append(self.alloc, skip);
+        self.patchJump(first_else); // a false condition lands at the elif/else chain
+
+        for (x.elifs) |e| {
+            try self.expr(e.cond.*);
+            const ej = try self.emitJump(.jump_if_false, parser.exprSpan(e.cond.*));
+            try self.block(e.body);
+            const sj = try self.emitJump(.jump, x.span);
+            try end_jumps.append(self.alloc, sj);
+            self.patchJump(ej);
+        }
+        if (x.else_body) |eb| try self.block(eb);
+        return end_jumps;
+    }
+
+    fn whileStmt(self: *Compiler, x: Stmt.While) Error!void {
+        const start = self.here();
+        var loop = Loop{ .local_count = self.locals.items.len };
+        try self.loops.append(self.alloc, &loop);
+        defer _ = self.loops.pop();
+
+        try self.expr(x.cond.*);
+        const exit = try self.emitJump(.jump_if_false, parser.exprSpan(x.cond.*));
+        try self.block(x.body);
+        try self.emitLoopJump(start, x.span);
+        self.patchJump(exit);
+        for (loop.breaks.items) |j| self.patchJump(j);
+        for (loop.continues.items) |j| self.patchJumpTo(j, start); // continue re-checks the condition
+    }
+
+    fn forStmt(self: *Compiler, x: Stmt.For) Error!void {
+        if (x.value_binding != null) return self.fail(x.span, "the --vm backend does not support two-variable 'for' yet", .{});
+        // Desugar `for v in iter:` to index iteration over a list, using two
+        // hidden locals for the list and the index.
+        self.scope_depth += 1;
+        try self.expr(x.iter.*);
+        const list_slot = self.locals.items.len;
+        try self.locals.append(self.alloc, .{ .name = "$list", .depth = self.scope_depth });
+        try self.emitConst(.{ .int = 0 }, x.span);
+        const idx_slot = self.locals.items.len;
+        try self.locals.append(self.alloc, .{ .name = "$idx", .depth = self.scope_depth });
+        const v_slot = self.locals.items.len;
+        try self.locals.append(self.alloc, .{ .name = x.binding, .depth = self.scope_depth });
+        try self.emit(.nil, x.span); // placeholder for the loop var
+
+        var loop = Loop{ .local_count = self.locals.items.len };
+        try self.loops.append(self.alloc, &loop);
+        defer _ = self.loops.pop();
+
+        const start = self.here();
+        // idx < len(list)
+        try self.emitLocal(.get_local, idx_slot, x.span);
+        try self.emitLocal(.get_local, list_slot, x.span);
+        try self.emit(.len, x.span);
+        try self.emit(.lt, x.span);
+        const exit = try self.emitJump(.jump_if_false, x.span);
+        // v = list[idx]
+        try self.emitLocal(.get_local, list_slot, x.span);
+        try self.emitLocal(.get_local, idx_slot, x.span);
+        try self.emit(.index_get, x.span);
+        try self.emitLocal(.set_local, v_slot, x.span);
+        try self.emit(.pop, x.span);
+        // body
+        try self.block(x.body);
+        // increment (the continue target): idx = idx + 1
+        const inc = self.here();
+        try self.emitLocal(.get_local, idx_slot, x.span);
+        try self.emitConst(.{ .int = 1 }, x.span);
+        try self.emit(.add, x.span);
+        try self.emitLocal(.set_local, idx_slot, x.span);
+        try self.emit(.pop, x.span);
+        try self.emitLoopJump(start, x.span);
+        self.patchJump(exit);
+        for (loop.breaks.items) |j| self.patchJump(j);
+        for (loop.continues.items) |j| self.patchJumpTo(j, inc);
+        try self.endScope(); // pops the loop var, $idx, $list
+    }
+
+    // --- expressions ---------------------------------------------------------
+
+    fn expr(self: *Compiler, e: Expr) Error!void {
+        switch (e) {
+            .int_literal => |lit| {
+                const n = std.fmt.parseInt(i64, lit.text, 10) catch return self.fail(lit.span, "invalid integer '{s}'", .{lit.text});
+                try self.emitConst(.{ .int = n }, lit.span);
+            },
+            .float_literal => |lit| {
+                const f = std.fmt.parseFloat(f64, lit.text) catch return self.fail(lit.span, "invalid float '{s}'", .{lit.text});
+                try self.emitConst(.{ .float = f }, lit.span);
+            },
+            .string_literal => |lit| try self.emitConst(.{ .str = try self.unquote(lit.text) }, lit.span),
+            .bool_literal => |b| try self.emit(if (b.value) .true_ else .false_, b.span),
+            .nil_literal => |sp| try self.emit(.nil, sp),
+            .identifier => |id| {
+                if (self.resolveLocal(id.name)) |slot| {
+                    try self.emitLocal(.get_local, slot, id.span);
+                } else {
+                    try self.emitGlobal(.get_global, id.name, id.span);
+                }
+            },
+            .unary => |u| {
+                try self.expr(u.operand.*);
+                try self.emit(switch (u.op) {
+                    .neg => .negate,
+                    .not => .not,
+                }, u.span);
+            },
+            .binary => |b| try self.binary(b),
+            .call => |c| {
+                try self.expr(c.callee.*);
+                for (c.args) |arg| try self.expr(arg.*);
+                try self.emit(.call, c.span);
+                try self.emitByte(@intCast(c.args.len), c.span);
+            },
+            .index => |idx| {
+                try self.expr(idx.object.*);
+                try self.expr(idx.index.*);
+                try self.emit(.index_get, idx.span);
+            },
+            .array => |a| {
+                for (a.elements) |el| try self.expr(el.*);
+                try self.emit(.build_list, a.span);
+                try self.emitU16(@intCast(a.elements.len), a.span);
+            },
+            .range => |r| {
+                // Build the list [start, end) with a small inline loop is complex
+                // in bytecode; instead call the `range`-like path via ADD isn't
+                // available, so unsupported unless both are simple — reject.
+                return self.fail(r.span, "the --vm backend does not support ranges yet; use range(n)", .{});
+            },
+            else => return self.fail(parser.exprSpan(e), "the --vm backend does not support this expression yet", .{}),
+        }
+    }
+
+    fn binary(self: *Compiler, b: Expr.Binary) Error!void {
+        // Logical operators short-circuit (and pop the left operand on the
+        // short-circuit path), so they compile to jumps rather than an opcode.
+        if (b.op == .logical_and or b.op == .logical_or) {
+            try self.expr(b.lhs.*);
+            try self.shortCircuit(b);
+            return;
+        }
+        try self.expr(b.lhs.*);
+        try self.expr(b.rhs.*);
+        try self.emit(switch (b.op) {
+            .add => .add,
+            .sub => .sub,
+            .mul => .mul,
+            .div => .div,
+            .mod => .mod,
+            .eq => .eq,
+            .ne => .ne,
+            .lt => .lt,
+            .le => .le,
+            .gt => .gt,
+            .ge => .ge,
+            else => unreachable,
+        }, b.span);
+    }
+
+    /// `a and b` / `a or b` without a DUP opcode: evaluate lhs; on the
+    /// short-circuit path push the constant result, otherwise evaluate rhs.
+    fn shortCircuit(self: *Compiler, b: Expr.Binary) Error!void {
+        // lhs already evaluated by caller.
+        if (b.op == .logical_and) {
+            const to_false = try self.emitJump(.jump_if_false, b.span); // pops lhs
+            try self.expr(b.rhs.*);
+            const done = try self.emitJump(.jump, b.span);
+            self.patchJump(to_false);
+            try self.emit(.false_, b.span);
+            self.patchJump(done);
+        } else {
+            // or: if lhs is false -> rhs ; else -> true
+            const to_rhs = try self.emitJump(.jump_if_false, b.span); // pops lhs
+            try self.emit(.true_, b.span);
+            const done = try self.emitJump(.jump, b.span);
+            self.patchJump(to_rhs);
+            try self.expr(b.rhs.*);
+            self.patchJump(done);
+        }
+    }
+
+    fn unquote(self: *Compiler, text: []const u8) Error![]const u8 {
+        const inner = if (text.len >= 2) text[1 .. text.len - 1] else text;
+        var buf: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < inner.len) : (i += 1) {
+            if (inner[i] == '\\' and i + 1 < inner.len) {
+                i += 1;
+                try buf.append(self.alloc, switch (inner[i]) {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '0' => 0,
+                    else => inner[i],
+                });
+            } else try buf.append(self.alloc, inner[i]);
+        }
+        return buf.toOwnedSlice(self.alloc);
+    }
+
+    // --- locals / loops ------------------------------------------------------
+
+    fn resolveLocal(self: *Compiler, name: []const u8) ?usize {
+        var i = self.locals.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.locals.items[i].name, name)) return i;
+        }
+        return null;
+    }
+
+    fn currentLoop(self: *Compiler) ?*Loop {
+        if (self.loops.items.len == 0) return null;
+        return self.loops.items[self.loops.items.len - 1];
+    }
+
+    // --- emit ----------------------------------------------------------------
+
+    fn here(self: *Compiler) usize {
+        return self.chunk.code.items.len;
+    }
+
+    fn emit(self: *Compiler, op: Op, span: Span) Error!void {
+        try self.emitByte(@intFromEnum(op), span);
+    }
+
+    fn emitByte(self: *Compiler, byte: u8, span: Span) Error!void {
+        try self.chunk.code.append(self.alloc, byte);
+        try self.chunk.lines.append(self.alloc, span.line);
+    }
+
+    fn emitU16(self: *Compiler, v: u16, span: Span) Error!void {
+        try self.emitByte(@intCast(v >> 8), span);
+        try self.emitByte(@intCast(v & 0xff), span);
+    }
+
+    fn emitConst(self: *Compiler, v: Value, span: Span) Error!void {
+        const idx = self.chunk.constants.items.len;
+        try self.chunk.constants.append(self.alloc, v);
+        try self.emit(.constant, span);
+        try self.emitU16(@intCast(idx), span);
+    }
+
+    fn emitLocal(self: *Compiler, op: Op, slot: usize, span: Span) Error!void {
+        try self.emit(op, span);
+        try self.emitByte(@intCast(slot), span);
+    }
+
+    fn emitGlobal(self: *Compiler, op: Op, name: []const u8, span: Span) Error!void {
+        const idx = self.chunk.constants.items.len;
+        try self.chunk.constants.append(self.alloc, .{ .str = name });
+        try self.emit(op, span);
+        try self.emitU16(@intCast(idx), span);
+    }
+
+    fn defineGlobal(self: *Compiler, name: []const u8, span: Span) Error!void {
+        try self.emitGlobal(.define_global, name, span);
+    }
+
+    /// Emit a jump with a placeholder target; returns the operand offset to patch.
+    fn emitJump(self: *Compiler, op: Op, span: Span) Error!usize {
+        try self.emit(op, span);
+        const at = self.here();
+        try self.emitU16(0xffff, span);
+        return at;
+    }
+
+    fn patchJump(self: *Compiler, at: usize) void {
+        self.patchJumpTo(at, self.here());
+    }
+
+    fn patchJumpTo(self: *Compiler, at: usize, target: usize) void {
+        const t: u16 = @intCast(target);
+        self.chunk.code.items[at] = @intCast(t >> 8);
+        self.chunk.code.items[at + 1] = @intCast(t & 0xff);
+    }
+
+    /// Emit a POP for each local declared past `count` (for break/continue).
+    fn popLocalsTo(self: *Compiler, count: usize, sp: Span) Error!void {
+        var n = self.locals.items.len;
+        while (n > count) : (n -= 1) try self.emit(.pop, sp);
+    }
+
+    /// Emit an unconditional jump back to `target`.
+    fn emitLoopJump(self: *Compiler, target: usize, span: Span) Error!void {
+        try self.emit(.jump, span);
+        try self.emitU16(@intCast(target), span);
+    }
+};
+
+const zeroSpan: Span = .{ .start = 0, .end = 0, .line = 0, .col = 0 };
+
+fn declSpan(d: Decl) Span {
+    return switch (d) {
+        .import => |x| x.span,
+        .var_decl => |x| x.span,
+        .func => |x| x.span,
+        .class => |x| x.span,
+        .struct_decl => |x| x.span,
+        .enum_decl => |x| x.span,
+        .signal => |x| x.span,
+    };
+}
+
+// --- VM ----------------------------------------------------------------------
+
+const VMError = std.mem.Allocator.Error || error{Runtime};
+
+const Frame = struct { func: *const Function, ip: usize, base: usize };
+
+const VM = struct {
+    alloc: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    stack: std.ArrayList(Value) = .empty,
+    frames: std.ArrayList(Frame) = .empty,
+    globals: std.StringHashMapUnmanaged(Value) = .{},
+    runtime_error: ?RuntimeError = null,
+
+    fn fail(self: *VM, comptime fmt: []const u8, args: anytype) VMError {
+        const line = self.currentLine();
+        self.runtime_error = .{
+            .message = std.fmt.allocPrint(self.alloc, fmt, args) catch "out of memory",
+            .line = line,
+            .col = 1,
+        };
+        return error.Runtime;
+    }
+
+    fn currentLine(self: *VM) u32 {
+        if (self.frames.items.len == 0) return 0;
+        const fr = self.frames.items[self.frames.items.len - 1];
+        const ip = if (fr.ip > 0) fr.ip - 1 else 0;
+        if (ip < fr.func.chunk.lines.items.len) return fr.func.chunk.lines.items[ip];
+        return 0;
+    }
+
+    fn run(self: *VM, program: Program) VMError!void {
+        // Register builtins as globals.
+        inline for (builtin_names, 0..) |name, i| {
+            try self.globals.put(self.alloc, name, .{ .builtin = @enumFromInt(i) });
+        }
+        try self.frames.append(self.alloc, .{ .func = program.script, .ip = 0, .base = 0 });
+        try self.exec();
+    }
+
+    fn push(self: *VM, v: Value) VMError!void {
+        try self.stack.append(self.alloc, v);
+    }
+
+    fn pop(self: *VM) Value {
+        return self.stack.pop().?;
+    }
+
+    fn peek(self: *VM, distance: usize) Value {
+        return self.stack.items[self.stack.items.len - 1 - distance];
+    }
+
+    fn exec(self: *VM) VMError!void {
+        var frame = &self.frames.items[self.frames.items.len - 1];
+        while (true) {
+            const chunk = &frame.func.chunk;
+            const op: Op = @enumFromInt(chunk.code.items[frame.ip]);
+            frame.ip += 1;
+            switch (op) {
+                .constant => try self.push(chunk.constants.items[self.readU16(frame)]),
+                .nil => try self.push(.nil),
+                .true_ => try self.push(.{ .bool = true }),
+                .false_ => try self.push(.{ .bool = false }),
+                .pop => _ = self.pop(),
+                .negate => {
+                    const v = self.pop();
+                    switch (v) {
+                        .int => |n| try self.push(.{ .int = -n }),
+                        .float => |f| try self.push(.{ .float = -f }),
+                        else => return self.fail("cannot negate {s}", .{@tagName(v)}),
+                    }
+                },
+                .not => try self.push(.{ .bool = !isTruthy(self.pop()) }),
+                .add, .sub, .mul, .div, .mod => try self.arith(op),
+                .eq => {
+                    const b = self.pop();
+                    const a = self.pop();
+                    try self.push(.{ .bool = valuesEqual(a, b) });
+                },
+                .ne => {
+                    const b = self.pop();
+                    const a = self.pop();
+                    try self.push(.{ .bool = !valuesEqual(a, b) });
+                },
+                .lt, .le, .gt, .ge => try self.compare(op),
+                .get_local => {
+                    const slot = self.readByte(frame);
+                    try self.push(self.stack.items[frame.base + slot]);
+                },
+                .set_local => {
+                    const slot = self.readByte(frame);
+                    self.stack.items[frame.base + slot] = self.peek(0);
+                },
+                .get_global => {
+                    const name = chunk.constants.items[self.readU16(frame)].str;
+                    if (self.globals.get(name)) |v| try self.push(v) else return self.fail("undefined name '{s}'", .{name});
+                },
+                .set_global => {
+                    const name = chunk.constants.items[self.readU16(frame)].str;
+                    if (self.globals.getPtr(name)) |slot| slot.* = self.peek(0) else return self.fail("undefined name '{s}'", .{name});
+                },
+                .define_global => {
+                    const name = chunk.constants.items[self.readU16(frame)].str;
+                    try self.globals.put(self.alloc, name, self.pop());
+                },
+                .jump => frame.ip = self.readU16(frame),
+                .jump_if_false => {
+                    const target = self.readU16(frame);
+                    if (!isTruthy(self.pop())) frame.ip = target;
+                },
+                .call => {
+                    const argc = self.readByte(frame);
+                    try self.call(argc);
+                    frame = &self.frames.items[self.frames.items.len - 1];
+                },
+                .ret => {
+                    const result = self.pop();
+                    const finished = self.frames.pop().?;
+                    if (self.frames.items.len == 0) return; // script returned
+                    // Drop the frame's locals AND the callee that sat just below.
+                    self.stack.shrinkRetainingCapacity(finished.base - 1);
+                    try self.push(result);
+                    frame = &self.frames.items[self.frames.items.len - 1];
+                },
+                .build_list => {
+                    const count = self.readU16(frame);
+                    const l = try self.alloc.create(List);
+                    l.* = .empty;
+                    const start = self.stack.items.len - count;
+                    try l.appendSlice(self.alloc, self.stack.items[start..]);
+                    self.stack.shrinkRetainingCapacity(start);
+                    try self.push(.{ .list = l });
+                },
+                .index_get => {
+                    const key = self.pop();
+                    const container = self.pop();
+                    try self.push(try self.indexGet(container, key));
+                },
+                .index_set => {
+                    const value = self.pop();
+                    const key = self.pop();
+                    const container = self.pop();
+                    try self.indexSet(container, key, value);
+                },
+                .len => {
+                    const v = self.pop();
+                    switch (v) {
+                        .list => |l| try self.push(.{ .int = @intCast(l.items.len) }),
+                        .str => |s| try self.push(.{ .int = @intCast(s.len) }),
+                        else => return self.fail("len expects a list or string", .{}),
+                    }
+                },
+                .print_top => {},
+            }
+        }
+    }
+
+    fn readByte(self: *VM, frame: *Frame) u8 {
+        _ = self;
+        const b = frame.func.chunk.code.items[frame.ip];
+        frame.ip += 1;
+        return b;
+    }
+
+    fn readU16(self: *VM, frame: *Frame) usize {
+        const hi = self.readByte(frame);
+        const lo = self.readByte(frame);
+        return (@as(usize, hi) << 8) | lo;
+    }
+
+    fn arith(self: *VM, op: Op) VMError!void {
+        const b = self.pop();
+        const a = self.pop();
+        if (op == .add and a == .str and b == .str) {
+            try self.push(.{ .str = try std.mem.concat(self.alloc, u8, &.{ a.str, b.str }) });
+            return;
+        }
+        if (a == .int and b == .int) {
+            const x = a.int;
+            const y = b.int;
+            try self.push(.{ .int = switch (op) {
+                .add => x + y,
+                .sub => x - y,
+                .mul => x * y,
+                .div => if (y == 0) return self.fail("division by zero", .{}) else @divTrunc(x, y),
+                .mod => if (y == 0) return self.fail("division by zero", .{}) else @rem(x, y),
+                else => unreachable,
+            } });
+            return;
+        }
+        const x = toFloat(a) orelse return self.fail("cannot apply arithmetic to {s}", .{@tagName(a)});
+        const y = toFloat(b) orelse return self.fail("cannot apply arithmetic to {s}", .{@tagName(b)});
+        try self.push(.{ .float = switch (op) {
+            .add => x + y,
+            .sub => x - y,
+            .mul => x * y,
+            .div => if (y == 0) return self.fail("division by zero", .{}) else x / y,
+            .mod => @rem(x, y),
+            else => unreachable,
+        } });
+    }
+
+    fn compare(self: *VM, op: Op) VMError!void {
+        const b = self.pop();
+        const a = self.pop();
+        const x = toFloat(a);
+        const y = toFloat(b);
+        if (x != null and y != null) {
+            try self.push(.{ .bool = switch (op) {
+                .lt => x.? < y.?,
+                .le => x.? <= y.?,
+                .gt => x.? > y.?,
+                .ge => x.? >= y.?,
+                else => unreachable,
+            } });
+            return;
+        }
+        if (a == .str and b == .str) {
+            const ord = std.mem.order(u8, a.str, b.str);
+            try self.push(.{ .bool = switch (op) {
+                .lt => ord == .lt,
+                .le => ord != .gt,
+                .gt => ord == .gt,
+                .ge => ord != .lt,
+                else => unreachable,
+            } });
+            return;
+        }
+        return self.fail("cannot order {s} and {s}", .{ @tagName(a), @tagName(b) });
+    }
+
+    fn call(self: *VM, argc: usize) VMError!void {
+        const callee = self.peek(argc);
+        switch (callee) {
+            .func => |f| {
+                if (argc != f.arity) return self.fail("{s} expects {d} argument(s), got {d}", .{ f.name, f.arity, argc });
+                // The callee sits just below the arguments; use it as slot 0 base.
+                const base = self.stack.items.len - argc;
+                try self.frames.append(self.alloc, .{ .func = f, .ip = 0, .base = base });
+            },
+            .builtin => |bi| {
+                const base = self.stack.items.len - argc;
+                const args = self.stack.items[base..];
+                const result = try self.callBuiltin(bi, args);
+                self.stack.shrinkRetainingCapacity(base - 1); // drop callee + args
+                try self.push(result);
+            },
+            else => return self.fail("{s} is not callable", .{@tagName(callee)}),
+        }
+    }
+
+    fn callBuiltin(self: *VM, b: Builtin, args: []const Value) VMError!Value {
+        switch (b) {
+            .print, .echo => {
+                for (args, 0..) |arg, i| {
+                    if (i > 0) try self.output.append(self.alloc, ' ');
+                    try self.appendValue(arg);
+                }
+                try self.output.append(self.alloc, '\n');
+                return .nil;
+            },
+            .len => {
+                if (args.len != 1) return self.fail("len expects 1 argument", .{});
+                return switch (args[0]) {
+                    .list => |l| .{ .int = @intCast(l.items.len) },
+                    .str => |s| .{ .int = @intCast(s.len) },
+                    else => self.fail("len expects a list or string", .{}),
+                };
+            },
+            .str => {
+                if (args.len != 1) return self.fail("str expects 1 argument", .{});
+                var buf: std.ArrayList(u8) = .empty;
+                try self.appendValueTo(&buf, args[0]);
+                return .{ .str = try buf.toOwnedSlice(self.alloc) };
+            },
+            .int => {
+                if (args.len != 1) return self.fail("int expects 1 argument", .{});
+                return switch (args[0]) {
+                    .int => args[0],
+                    .float => |f| .{ .int = @intFromFloat(f) },
+                    .bool => |bl| .{ .int = if (bl) 1 else 0 },
+                    .str => |s| .{ .int = std.fmt.parseInt(i64, std.mem.trim(u8, s, " "), 10) catch return self.fail("cannot convert '{s}' to int", .{s}) },
+                    else => self.fail("int expects a number, bool, or string", .{}),
+                };
+            },
+            .float => {
+                if (args.len != 1) return self.fail("float expects 1 argument", .{});
+                return switch (args[0]) {
+                    .float => args[0],
+                    .int => |n| .{ .float = @floatFromInt(n) },
+                    .str => |s| .{ .float = std.fmt.parseFloat(f64, std.mem.trim(u8, s, " ")) catch return self.fail("cannot convert '{s}' to float", .{s}) },
+                    else => self.fail("float expects a number or string", .{}),
+                };
+            },
+            .range => {
+                if (args.len != 1 or args[0] != .int) return self.fail("range expects one int", .{});
+                const l = try self.alloc.create(List);
+                l.* = .empty;
+                var i: i64 = 0;
+                while (i < args[0].int) : (i += 1) try l.append(self.alloc, .{ .int = i });
+                return .{ .list = l };
+            },
+            .push => {
+                if (args.len != 2 or args[0] != .list) return self.fail("push expects a list and a value", .{});
+                try args[0].list.append(self.alloc, args[1]);
+                return .nil;
+            },
+            .pop => {
+                if (args.len != 1 or args[0] != .list) return self.fail("pop expects a list", .{});
+                return args[0].list.pop() orelse self.fail("pop from an empty list", .{});
+            },
+        }
+    }
+
+    fn indexGet(self: *VM, container: Value, key: Value) VMError!Value {
+        switch (container) {
+            .list => |l| {
+                if (key != .int) return self.fail("list index must be an int", .{});
+                if (key.int < 0 or key.int >= l.items.len) return self.fail("list index {d} out of range", .{key.int});
+                return l.items[@intCast(key.int)];
+            },
+            .str => |s| {
+                if (key != .int) return self.fail("string index must be an int", .{});
+                if (key.int < 0 or key.int >= s.len) return self.fail("string index {d} out of range", .{key.int});
+                return .{ .str = s[@intCast(key.int)..][0..1] };
+            },
+            else => return self.fail("cannot index {s}", .{@tagName(container)}),
+        }
+    }
+
+    fn indexSet(self: *VM, container: Value, key: Value, value: Value) VMError!void {
+        switch (container) {
+            .list => |l| {
+                if (key != .int) return self.fail("list index must be an int", .{});
+                if (key.int < 0 or key.int >= l.items.len) return self.fail("list index {d} out of range", .{key.int});
+                l.items[@intCast(key.int)] = value;
+            },
+            else => return self.fail("cannot index-assign {s}", .{@tagName(container)}),
+        }
+    }
+
+    fn appendValue(self: *VM, v: Value) VMError!void {
+        try self.appendValueTo(self.output, v);
+    }
+
+    fn appendValueTo(self: *VM, buf: *std.ArrayList(u8), v: Value) VMError!void {
+        switch (v) {
+            .nil => try buf.appendSlice(self.alloc, "nil"),
+            .int => |n| try buf.print(self.alloc, "{d}", .{n}),
+            .float => |f| try buf.print(self.alloc, "{d}", .{f}),
+            .bool => |b| try buf.appendSlice(self.alloc, if (b) "true" else "false"),
+            .str => |s| try buf.appendSlice(self.alloc, s),
+            .list => |l| {
+                try buf.append(self.alloc, '[');
+                for (l.items, 0..) |item, i| {
+                    if (i > 0) try buf.appendSlice(self.alloc, ", ");
+                    try self.appendValueTo(buf, item);
+                }
+                try buf.append(self.alloc, ']');
+            },
+            .func, .builtin => try buf.appendSlice(self.alloc, "<function>"),
+        }
+    }
+};
+
+// --- tests -------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn runSource(gpa: std.mem.Allocator, src: []const u8) !Result {
+    var tree = try parser.parse(gpa, src);
+    defer tree.deinit();
+    return run(gpa, tree.module);
+}
+
+fn expectVMOutput(src: []const u8, expected: []const u8) !void {
+    var result = try runSource(testing.allocator, src);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.diagnostics.len);
+    try testing.expect(result.runtime_error == null);
+    try testing.expectEqualStrings(expected, result.output);
+}
+
+test "vm: arithmetic and precedence" {
+    try expectVMOutput("func main():\n    print(1 + 2 * 3 - 4)", "3\n");
+}
+
+test "vm: recursion" {
+    const src =
+        \\func fib(n: int) -> int:
+        \\    if n < 2:
+        \\        return n
+        \\    return fib(n - 1) + fib(n - 2)
+        \\
+        \\func main():
+        \\    print(fib(10))
+    ;
+    try expectVMOutput(src, "55\n");
+}
+
+test "vm: loops, locals, and lists" {
+    const src =
+        \\func main():
+        \\    var xs = [1, 2, 3, 4]
+        \\    var total = 0
+        \\    for x in xs:
+        \\        total = total + x
+        \\    print(total)
+        \\    var i = 0
+        \\    while i < 3:
+        \\        push(xs, i)
+        \\        i = i + 1
+        \\    print(len(xs))
+    ;
+    try expectVMOutput(src, "10\n7\n");
+}
+
+test "vm: short-circuit logical operators" {
+    try expectVMOutput("func main():\n    print(true and false, false or true, not false)", "false true true\n");
+}
+
+test "vm: reports unsupported constructs" {
+    var result = try runSource(testing.allocator, "class C:\n    var x: int = 0\n\nfunc main():\n    pass");
+    defer result.deinit();
+    try testing.expect(result.diagnostics.len > 0);
+    try testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, "does not support") != null);
+}
+
+test "vm: runtime error surfaces" {
+    var result = try runSource(testing.allocator, "func main():\n    print(1 / 0)");
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "division by zero") != null);
+}

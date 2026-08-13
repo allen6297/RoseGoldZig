@@ -14,11 +14,13 @@ const Loader = @import("fontend/loader.zig");
 const Analyzer = @import("fontend/analyzer.zig");
 const Interpreter = @import("fontend/interpreter.zig");
 const Formatter = @import("fontend/formatter.zig");
+const Vm = @import("fontend/vm.zig");
 
 const usage =
     \\Usage: rosegold [run|check|repl|fmt] [<file.rg>]
     \\
-    \\  run     parse, analyze, and execute the program (the default)
+    \\  run     parse, analyze, and execute the program (the default; `--vm`
+    \\          runs it on the bytecode VM instead of the tree-walker)
     \\  check   parse and analyze only, then report any problems
     \\  repl    start an interactive session (also the default with no file)
     \\  fmt     re-format the file in canonical style (stdout; `-w` rewrites it)
@@ -77,7 +79,7 @@ fn handle(
         return fmtCmd(arena, io, out, err, args[file_index], write);
     }
 
-    // Parse arguments: an optional subcommand followed by a file path.
+    // Parse arguments: an optional subcommand, an optional `--vm`, then a file.
     var mode: Mode = .run;
     var arg_index: usize = 1;
     if (std.mem.eql(u8, args[1], "run")) {
@@ -86,6 +88,11 @@ fn handle(
     } else if (std.mem.eql(u8, args[1], "check")) {
         mode = .check;
         arg_index = 2;
+    }
+    var use_vm = false;
+    if (arg_index < args.len and std.mem.eql(u8, args[arg_index], "--vm")) {
+        use_vm = true;
+        arg_index += 1;
     }
     if (arg_index >= args.len) {
         try err.writeAll(usage);
@@ -127,6 +134,28 @@ fn handle(
 
     if (mode == .check) {
         try out.print("{s}: no problems found\n", .{path});
+        return 0;
+    }
+
+    // The bytecode VM backend: single-module programs only.
+    if (use_vm) {
+        const entry = graph.units[graph.units.len - 1];
+        if (graph.units.len > 1) {
+            try err.print("error: the --vm backend does not support modules yet\n", .{});
+            return 1;
+        }
+        const vm_result = try Vm.run(arena, entry.module);
+        if (vm_result.diagnostics.len > 0) {
+            for (vm_result.diagnostics) |d| {
+                try render(err, "error", entry.path, entry.src, d.message, d.line, d.col);
+            }
+            return 1;
+        }
+        try out.writeAll(vm_result.output);
+        if (vm_result.runtime_error) |re| {
+            try render(err, "runtime error", entry.path, entry.src, re.message, re.line, re.col);
+            return 1;
+        }
         return 0;
     }
 
