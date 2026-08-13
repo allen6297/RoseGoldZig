@@ -23,7 +23,7 @@ zig build run -- run --vm FILE.rg  # execute on the bytecode VM instead
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (270 as of writing)
+zig build test                  # run every test (277 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -223,6 +223,16 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   with a call-frame stack. It has its **own** small `Value` type (no coupling to the
   interpreter) and produces byte-identical output to the tree-walker on the programs it
   supports.
+- **Classes/structs** compile too: construction (`Name(...)` binds the type name to a
+  synthetic constructor closure that creates the instance via a `new_instance` opcode,
+  runs field defaults with the instance as receiver, then calls `init`), field get/set
+  (`get_member`/`set_field`), methods (compiled once with the receiver as slot 0 `$self`;
+  a bound method splices the receiver in below the args on call), bare-name field/method
+  resolution inside a method (`loadSelf` + `get_member`, so nested lambdas capture `$self`
+  as an upvalue), and `extends`/`uses` inheritance — fields base-first, methods resolved
+  with overrides, virtual dispatch through the receiver's runtime type. A compile-time
+  `TypeDef` registry (two-phase: register names, then `resolveInheritance`) mirrors the
+  interpreter's model; each `RtType` carries the ordered field names + method table.
 - **Covers the core:** functions (recursion), locals + globals, arithmetic/comparison,
   short-circuit `and`/`or`, `if`/`elif`/`else`, `while`, `for` over a list/map/string
   with one or two bindings (a small `iter_*` opcode protocol), `break`/`continue` (with
@@ -238,8 +248,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   literal/`_`/binding patterns compiles too (the subject lives in a slot found via a
   compile-time stack pointer, `FnState.stack_top`); enum-case arms await enums.
 - **Not yet compiled** (reported as a clear "the --vm backend does not support …"
-  diagnostic, so the tree-walker stays the full-featured default): classes/structs/
-  enums (and so enum-case `match` arms), modules, signals, and statics.
+  diagnostic, so the tree-walker stays the full-featured default): enums (and so
+  enum-case `match` arms), `static` members, modules (so no cross-module inheritance or
+  imported bases/traits), and signals.
 
 ### Known gaps / future work
 - A subclass's own **static method** doesn't see an inherited static by bare name

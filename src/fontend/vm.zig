@@ -2,10 +2,11 @@
 //! tree-walking interpreter, reached via `run --vm`. It covers the core of the
 //! language — expressions, control flow, functions (with recursion), locals and
 //! globals, lists/maps/ranges, lambdas with by-reference closures (upvalues),
-//! string interpolation, and the common builtins — enough to run programs like
-//! `fib` and list/loop processing. Constructs it does not compile (classes,
-//! modules, signals, `match`, member access, …) are reported as unsupported, so
-//! the tree-walker remains the full-featured default.
+//! string interpolation, `match`, and classes/structs (construction, fields,
+//! methods, single/`uses` inheritance with virtual dispatch), plus the common
+//! builtins. Constructs it does not compile (enums, statics, modules, signals,
+//! …) are reported as unsupported, so the tree-walker remains the full-featured
+//! default.
 //!
 //! Design: each function compiles to a `Chunk` of opcodes + constants; the VM
 //! runs a `Chunk` over a value stack with a frame stack for calls.
@@ -61,6 +62,25 @@ const UpvalueObj = struct { stack_index: ?usize, value: Value = .nil };
 /// A function paired with the upvalues it captured where it was created.
 const Closure = struct { func: *const Function, upvalues: []*UpvalueObj };
 
+/// The runtime shape of a class or struct: its printable name, its fields in
+/// construction/print order (base-first), and its methods (own + inherited,
+/// overrides applied). Built once at compile time.
+const RtType = struct {
+    name: []const u8,
+    field_names: []const []const u8,
+    methods: std.StringHashMapUnmanaged(*const Function) = .{},
+};
+
+/// A live class/struct instance: its type plus its own field storage.
+const Instance = struct {
+    type: *const RtType,
+    fields: std.StringHashMapUnmanaged(Value) = .{},
+};
+
+/// A method paired with the instance it was reached on; calling it runs the
+/// method with that instance as the receiver (slot 0).
+const BoundMethod = struct { recv: *Instance, func: *const Function };
+
 const Value = union(enum) {
     nil,
     int: i64,
@@ -71,6 +91,8 @@ const Value = union(enum) {
     map: *Map,
     closure: *Closure,
     builtin: Builtin,
+    instance: *Instance,
+    bound_method: *BoundMethod,
 };
 
 fn isTruthy(v: Value) bool {
@@ -111,6 +133,8 @@ fn valuesEqual(a: Value, b: Value) bool {
         .map => |x| b == .map and x == b.map,
         .closure => |x| b == .closure and x == b.closure,
         .builtin => |x| b == .builtin and x == b.builtin,
+        .instance => |x| b == .instance and x == b.instance,
+        .bound_method => |x| b == .bound_method and x == b.bound_method,
     };
 }
 
@@ -159,6 +183,9 @@ const Op = enum(u8) {
     build_list, // u16 count
     build_map, // u16 entry count (2*count values popped)
     interp, // u16 part count -> concat the parts as strings
+    new_instance, // u16 rttype index -> push a fresh instance (fields nil)
+    get_member, // u16 name-const index -> instance field, or bound method
+    set_field, // u16 name-const index (pops value, instance)
     make_range, // pop end, start -> list [start, end)
     index_get,
     index_set,
@@ -175,6 +202,8 @@ const Chunk = struct {
     constants: std.ArrayList(Value) = .empty,
     /// Nested function prototypes referenced by the `closure` opcode.
     functions: std.ArrayList(*const Function) = .empty,
+    /// Class/struct shapes referenced by the `new_instance` opcode.
+    rttypes: std.ArrayList(*const RtType) = .empty,
 };
 
 // --- result ------------------------------------------------------------------
@@ -250,10 +279,48 @@ const FnState = struct {
     enclosing: ?*FnState = null,
 };
 
+/// Compile-time model of a class/struct: its declaration, resolved supertypes,
+/// and (after `resolveInheritance`) its full field list and method table. The
+/// runtime `RtType` and constructor `Function` are filled in during compilation.
+const TypeDef = struct {
+    name: []const u8,
+    span: Span,
+    members: []const Decl,
+    super_names: []const []const u8,
+    /// Transitive supertypes, most-derived first (for method/field resolution).
+    ancestors: []const *TypeDef = &.{},
+    /// All fields, base-first, deduped (construction + print order).
+    field_names: std.ArrayList([]const u8) = .empty,
+    field_defaults: std.StringHashMapUnmanaged(?*const Expr) = .{},
+    fields: std.StringHashMapUnmanaged(void) = .{},
+    /// All methods (own + inherited), keyed by name; the value's `owner` says
+    /// which type's compiled body to use (so overrides resolve correctly).
+    methods: std.StringHashMapUnmanaged(MethodEntry) = .{},
+    /// This type's own methods, compiled once (keyed by name).
+    own_compiled: std.StringHashMapUnmanaged(*Function) = .{},
+    rttype: *RtType = undefined,
+    constructor: *Function = undefined,
+    init_arity: usize = 0,
+    resolved: bool = false,
+
+    const MethodEntry = struct { decl: *const Decl.Func, owner: *TypeDef };
+
+    fn isField(self: *const TypeDef, name: []const u8) bool {
+        return self.fields.contains(name);
+    }
+    fn isMember(self: *const TypeDef, name: []const u8) bool {
+        return self.fields.contains(name) or self.methods.contains(name);
+    }
+};
+
 const Compiler = struct {
     alloc: std.mem.Allocator,
     diagnostics: *std.ArrayList(lexer.Diagnostic),
     cur: *FnState = undefined,
+    types: std.StringHashMapUnmanaged(*TypeDef) = .{},
+    /// The type whose method/constructor/field-default is being compiled, so a
+    /// bare name can resolve to a field or method of the receiver.
+    current_type: ?*TypeDef = null,
 
     fn chunk(self: *Compiler) *Chunk {
         return &self.cur.func.chunk;
@@ -268,15 +335,37 @@ const Compiler = struct {
     fn compileModule(self: *Compiler, module: Module) Error!Program {
         // Reject unsupported top-level constructs early with a clear message.
         for (module.decls) |decl| switch (decl) {
-            .func, .var_decl => {},
+            .func, .var_decl, .class, .struct_decl => {},
             else => return self.fail(declSpan(decl), "the --vm backend does not support this construct yet; use the default interpreter", .{}),
         };
+
+        // Register class/struct declarations (names first) so they can reference
+        // each other, then resolve inheritance across the whole set.
+        for (module.decls) |decl| switch (decl) {
+            .class => |c| try self.registerType(c.name, c.span, c.members, c.extends, c.uses),
+            .struct_decl => |s| try self.registerType(s.name, s.span, s.members, null, &.{}),
+            else => {},
+        };
+        var type_it = self.types.valueIterator();
+        while (type_it.next()) |t| try self.resolveInheritance(t.*);
 
         // The script runs as a function with no enclosing scope.
         const script = try self.alloc.create(Function);
         script.* = .{ .name = "<script>", .arity = 0 };
         var script_fs = FnState{ .func = script, .enclosing = null };
         self.cur = &script_fs;
+
+        // Compile the types in phases: allocate each runtime shape first (so a
+        // method that constructs any type has a target), compile method bodies,
+        // wire up method tables, then build the constructors.
+        type_it = self.types.valueIterator();
+        while (type_it.next()) |t| t.*.rttype = try self.alloc.create(RtType);
+        type_it = self.types.valueIterator();
+        while (type_it.next()) |t| try self.compileOwnMethods(t.*);
+        type_it = self.types.valueIterator();
+        while (type_it.next()) |t| try self.buildRtType(t.*);
+        type_it = self.types.valueIterator();
+        while (type_it.next()) |t| try self.compileConstructor(t.*);
 
         // Compile each top-level function (they capture nothing — no enclosing).
         var funcs: std.StringHashMapUnmanaged(*Function) = .{};
@@ -298,6 +387,13 @@ const Compiler = struct {
                     if (v.value) |val| try self.expr(val.*) else try self.emit(.nil, v.span);
                     try self.defineGlobal(v.name, v.span);
                 },
+                .class, .struct_decl => {
+                    // The type name binds to its constructor closure.
+                    const name = if (decl == .class) decl.class.name else decl.struct_decl.name;
+                    const t = self.types.get(name).?;
+                    try self.emitClosure(t.constructor, t.span);
+                    try self.defineGlobal(name, t.span);
+                },
                 else => {},
             }
         }
@@ -311,6 +407,202 @@ const Compiler = struct {
         try self.emit(.ret, zeroSpan);
 
         return .{ .script = script };
+    }
+
+    // --- classes / structs ---------------------------------------------------
+
+    fn registerType(
+        self: *Compiler,
+        name: []const u8,
+        span: Span,
+        members: []const Decl,
+        extends: ?parser.TypeRef,
+        uses: []const parser.TypeRef,
+    ) Error!void {
+        var supers: std.ArrayList([]const u8) = .empty;
+        if (extends) |e| {
+            if (e.module != null) return self.fail(span, "the --vm backend does not support inheriting an imported type", .{});
+            try supers.append(self.alloc, e.name);
+        }
+        for (uses) |u| {
+            if (u.module != null) return self.fail(span, "the --vm backend does not support imported traits", .{});
+            try supers.append(self.alloc, u.name);
+        }
+        // Reject members the VM can't compile yet, with a clear message.
+        for (members) |m| switch (m) {
+            .var_decl => |v| if (v.is_static) return self.fail(v.span, "the --vm backend does not support static members yet", .{}),
+            .func => |f| if (f.is_static) return self.fail(f.span, "the --vm backend does not support static methods yet", .{}),
+            .signal => |s| return self.fail(s.span, "the --vm backend does not support signals", .{}),
+            else => return self.fail(declSpan(m), "the --vm backend does not support this class member", .{}),
+        };
+        const t = try self.alloc.create(TypeDef);
+        t.* = .{ .name = name, .span = span, .members = members, .super_names = try supers.toOwnedSlice(self.alloc) };
+        try self.types.put(self.alloc, name, t);
+    }
+
+    /// Compute a type's ancestors, full field list (base-first), and method
+    /// table (own + inherited, overrides applied).
+    fn resolveInheritance(self: *Compiler, t: *TypeDef) Error!void {
+        if (t.ancestors.len > 0 or t.fields.count() > 0 or t.super_names.len == 0) {
+            // Either done, or a root with no supers — still compute below once.
+        }
+        if (t.resolved) return;
+        t.resolved = true;
+
+        var ancestors: std.ArrayList(*TypeDef) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .{};
+        try self.collectAncestors(t, &ancestors, &seen);
+        t.ancestors = try ancestors.toOwnedSlice(self.alloc);
+
+        // Fields base-first (ancestors most-derived-first, so iterate in reverse),
+        // then own; dedup by name keeping the first (base) occurrence.
+        var i = t.ancestors.len;
+        while (i > 0) : (i -= 1) try self.addFieldsAndMethods(t, t.ancestors[i - 1], false);
+        try self.addFieldsAndMethods(t, t, false);
+        // Methods with override: same base-first order, but later wins.
+        i = t.ancestors.len;
+        while (i > 0) : (i -= 1) try self.addFieldsAndMethods(t, t.ancestors[i - 1], true);
+        try self.addFieldsAndMethods(t, t, true);
+
+        if (t.methods.get("init")) |me| t.init_arity = me.decl.params.len;
+    }
+
+    fn addFieldsAndMethods(self: *Compiler, t: *TypeDef, src: *TypeDef, methods_pass: bool) Error!void {
+        for (src.members, 0..) |m, i| switch (m) {
+            .var_decl => |v| {
+                if (methods_pass) continue;
+                if (t.fields.contains(v.name)) continue;
+                try t.fields.put(self.alloc, v.name, {});
+                try t.field_names.append(self.alloc, v.name);
+                try t.field_defaults.put(self.alloc, v.name, v.value);
+            },
+            .func => |f| {
+                if (!methods_pass) continue;
+                // Point at the member in the owner's stable slice, not the loop copy.
+                try t.methods.put(self.alloc, f.name, .{ .decl = &src.members[i].func, .owner = src });
+            },
+            else => {},
+        };
+    }
+
+    fn collectAncestors(
+        self: *Compiler,
+        t: *TypeDef,
+        out: *std.ArrayList(*TypeDef),
+        seen: *std.StringHashMapUnmanaged(void),
+    ) Error!void {
+        for (t.super_names) |sn| {
+            const sup = self.types.get(sn) orelse continue;
+            if ((try seen.getOrPut(self.alloc, sn)).found_existing) continue;
+            try out.append(self.alloc, sup);
+            try self.collectAncestors(sup, out, seen);
+        }
+    }
+
+    /// Compile one type's own methods into `Function`s (keyed by name).
+    fn compileOwnMethods(self: *Compiler, t: *TypeDef) Error!void {
+        const saved_type = self.current_type;
+        self.current_type = t;
+        defer self.current_type = saved_type;
+        for (t.members) |m| if (m == .func) {
+            const f = try self.compileMethod(t, m.func);
+            try t.own_compiled.put(self.alloc, m.func.name, f);
+        };
+    }
+
+    fn compileMethod(self: *Compiler, t: *TypeDef, f: Decl.Func) Error!*Function {
+        _ = t;
+        const func = try self.alloc.create(Function);
+        func.* = .{ .name = f.name, .arity = f.params.len };
+        var fs = FnState{ .func = func, .enclosing = null };
+        const saved = self.cur;
+        self.cur = &fs;
+        defer self.cur = saved;
+        // Slot 0 is the receiver; the declared parameters follow.
+        try fs.locals.append(self.alloc, .{ .name = "$self", .depth = 0 });
+        for (f.params) |p| try fs.locals.append(self.alloc, .{ .name = p.name, .depth = 0 });
+        try self.block(f.body);
+        try self.emit(.nil, f.span);
+        try self.emit(.ret, f.span);
+        func.upvalues = try fs.upvalues.toOwnedSlice(self.alloc);
+        return func;
+    }
+
+    /// Build a type's runtime shape: the printable name, ordered field names, and
+    /// method table (each name pointing at its owning type's compiled body).
+    fn buildRtType(self: *Compiler, t: *TypeDef) Error!void {
+        const rt = t.rttype;
+        rt.* = .{ .name = t.name, .field_names = t.field_names.items };
+        var it = t.methods.iterator();
+        while (it.next()) |e| {
+            const owner = e.value_ptr.owner;
+            const compiled = owner.own_compiled.get(e.key_ptr.*).?;
+            try rt.methods.put(self.alloc, e.key_ptr.*, compiled);
+        }
+    }
+
+    /// Compile the synthetic constructor `<T>`: create the instance, evaluate
+    /// field defaults with it as the receiver, run `init` (if any), return it.
+    fn compileConstructor(self: *Compiler, t: *TypeDef) Error!void {
+        const func = try self.alloc.create(Function);
+        func.* = .{ .name = t.name, .arity = t.init_arity };
+        var fs = FnState{ .func = func, .enclosing = null };
+        const saved = self.cur;
+        self.cur = &fs;
+        defer self.cur = saved;
+        const saved_type = self.current_type;
+        self.current_type = t;
+        defer self.current_type = saved_type;
+
+        // init's parameters occupy slots 0..init_arity-1; the fresh instance is
+        // the next slot ($self), which field defaults and the init call read.
+        const init_me = t.methods.get("init");
+        if (init_me) |me| for (me.decl.params) |p| try fs.locals.append(self.alloc, .{ .name = p.name, .depth = 0 });
+        try self.emitNewInstance(t, t.span);
+        try fs.locals.append(self.alloc, .{ .name = "$self", .depth = 0 });
+
+        for (t.field_names.items) |fname| {
+            self.cur.stack_top = self.cur.locals.items.len;
+            try self.loadSelf(t.span);
+            if (t.field_defaults.get(fname).?) |d| try self.expr(d.*) else try self.emit(.nil, t.span);
+            try self.emitGlobal(.set_field, fname, t.span);
+        }
+
+        if (init_me != null) {
+            self.cur.stack_top = self.cur.locals.items.len;
+            try self.loadSelf(t.span);
+            try self.emitGlobal(.get_member, "init", t.span);
+            var i: usize = 0;
+            while (i < t.init_arity) : (i += 1) try self.emitLocal(.get_local, i, t.span);
+            try self.emit(.call, t.span);
+            try self.emitByte(@intCast(t.init_arity), t.span);
+            try self.emit(.pop, t.span);
+        }
+
+        try self.loadSelf(t.span);
+        try self.emit(.ret, t.span);
+        func.upvalues = &.{};
+        t.constructor = func;
+    }
+
+    fn emitNewInstance(self: *Compiler, t: *TypeDef, span: Span) Error!void {
+        const idx = self.chunk().rttypes.items.len;
+        try self.chunk().rttypes.append(self.alloc, t.rttype);
+        try self.emit(.new_instance, span);
+        try self.emitU16(@intCast(idx), span);
+        self.cur.stack_top += 1;
+    }
+
+    /// Load the current receiver ($self, slot 0 of a method / constructor) — as a
+    /// local directly, or captured as an upvalue inside a nested lambda.
+    fn loadSelf(self: *Compiler, span: Span) Error!void {
+        if (self.resolveLocal("$self")) |slot| {
+            try self.emitLocal(.get_local, slot, span);
+        } else if (try self.resolveUpvalue(self.cur, "$self")) |up| {
+            try self.emit(.get_upvalue, span);
+            try self.emitByte(up, span);
+        } else return self.fail(span, "no receiver in scope", .{});
+        self.cur.stack_top += 1;
     }
 
     fn compileFunction(self: *Compiler, f: Decl.Func, enclosing: ?*FnState) Error!*Function {
@@ -498,23 +790,37 @@ const Compiler = struct {
     fn assign(self: *Compiler, a: Stmt.Assign) Error!void {
         switch (a.target.*) {
             .identifier => |id| {
-                try self.expr(a.value.*);
                 if (self.resolveLocal(id.name)) |slot| {
+                    try self.expr(a.value.*);
                     try self.emit(.set_local, a.span);
                     try self.emitByte(@intCast(slot), a.span);
+                    try self.emit(.pop, a.span);
                 } else if (try self.resolveUpvalue(self.cur, id.name)) |up| {
+                    try self.expr(a.value.*);
                     try self.emit(.set_upvalue, a.span);
                     try self.emitByte(up, a.span);
+                    try self.emit(.pop, a.span);
+                } else if (self.current_type != null and self.current_type.?.isField(id.name)) {
+                    // A bare field write inside a method: [receiver, value] set_field.
+                    try self.loadSelf(a.span);
+                    try self.expr(a.value.*);
+                    try self.emitGlobal(.set_field, id.name, a.span);
                 } else {
+                    try self.expr(a.value.*);
                     try self.emitGlobal(.set_global, id.name, a.span);
+                    try self.emit(.pop, a.span);
                 }
-                try self.emit(.pop, a.span);
             },
             .index => |idx| {
                 try self.expr(idx.object.*);
                 try self.expr(idx.index.*);
                 try self.expr(a.value.*);
                 try self.emit(.index_set, a.span);
+            },
+            .member => |mem| {
+                try self.expr(mem.object.*);
+                try self.expr(a.value.*);
+                try self.emitGlobal(.set_field, mem.name, a.span);
             },
             else => return self.fail(a.span, "the --vm backend does not support this assignment target", .{}),
         }
@@ -657,6 +963,11 @@ const Compiler = struct {
                 } else if (try self.resolveUpvalue(self.cur, id.name)) |up| {
                     try self.emit(.get_upvalue, id.span);
                     try self.emitByte(up, id.span);
+                } else if (self.current_type != null and self.current_type.?.isMember(id.name)) {
+                    // A bare field/method name inside a method resolves against
+                    // the receiver.
+                    try self.loadSelf(id.span);
+                    try self.emitGlobal(.get_member, id.name, id.span);
                 } else {
                     try self.emitGlobal(.get_global, id.name, id.span);
                 }
@@ -679,6 +990,10 @@ const Compiler = struct {
                 try self.expr(idx.object.*);
                 try self.expr(idx.index.*);
                 try self.emit(.index_get, idx.span);
+            },
+            .member => |mem| {
+                try self.expr(mem.object.*);
+                try self.emitGlobal(.get_member, mem.name, mem.span);
             },
             .array => |a| {
                 for (a.elements) |el| try self.expr(el.*);
@@ -710,7 +1025,6 @@ const Compiler = struct {
             },
             .lambda => |lam| try self.compileLambda(lam),
             .match => |m| try self.compileMatch(m),
-            else => return self.fail(parser.exprSpan(e), "the --vm backend does not support this expression yet", .{}),
         }
     }
 
@@ -912,7 +1226,10 @@ fn declSpan(d: Decl) Span {
 
 const VMError = std.mem.Allocator.Error || error{Runtime};
 
-const Frame = struct { closure: *Closure, ip: usize, base: usize };
+/// One call frame. `func` is the running prototype and `upvalues` the captured
+/// cells (empty for plain functions, methods, and the script); a lambda supplies
+/// its closure's upvalues. `base` is the stack index of slot 0.
+const Frame = struct { func: *const Function, upvalues: []*UpvalueObj, ip: usize, base: usize };
 
 const VM = struct {
     alloc: std.mem.Allocator,
@@ -937,7 +1254,7 @@ const VM = struct {
         if (self.frames.items.len == 0) return 0;
         const fr = self.frames.items[self.frames.items.len - 1];
         const ip = if (fr.ip > 0) fr.ip - 1 else 0;
-        const lines = fr.closure.func.chunk.lines.items;
+        const lines = fr.func.chunk.lines.items;
         if (ip < lines.len) return lines[ip];
         return 0;
     }
@@ -947,9 +1264,7 @@ const VM = struct {
         inline for (builtin_names, 0..) |name, i| {
             try self.globals.put(self.alloc, name, .{ .builtin = @enumFromInt(i) });
         }
-        const script_cl = try self.alloc.create(Closure);
-        script_cl.* = .{ .func = program.script, .upvalues = &.{} };
-        try self.frames.append(self.alloc, .{ .closure = script_cl, .ip = 0, .base = 0 });
+        try self.frames.append(self.alloc, .{ .func = program.script, .upvalues = &.{}, .ip = 0, .base = 0 });
         try self.exec();
     }
 
@@ -968,7 +1283,7 @@ const VM = struct {
     fn exec(self: *VM) VMError!void {
         var frame = &self.frames.items[self.frames.items.len - 1];
         while (true) {
-            const chunk = &frame.closure.func.chunk;
+            const chunk = &frame.func.chunk;
             const op: Op = @enumFromInt(chunk.code.items[frame.ip]);
             frame.ip += 1;
             switch (op) {
@@ -1020,12 +1335,12 @@ const VM = struct {
                 },
                 .get_upvalue => {
                     const idx = self.readByte(frame);
-                    const up = frame.closure.upvalues[idx];
+                    const up = frame.upvalues[idx];
                     try self.push(if (up.stack_index) |si| self.stack.items[si] else up.value);
                 },
                 .set_upvalue => {
                     const idx = self.readByte(frame);
-                    const up = frame.closure.upvalues[idx];
+                    const up = frame.upvalues[idx];
                     if (up.stack_index) |si| self.stack.items[si] = self.peek(0) else up.value = self.peek(0);
                 },
                 .closure => {
@@ -1036,7 +1351,7 @@ const VM = struct {
                         ups[i] = if (uv.is_local)
                             try self.captureUpvalue(frame.base + uv.index)
                         else
-                            frame.closure.upvalues[uv.index];
+                            frame.upvalues[uv.index];
                     }
                     cl.* = .{ .func = f, .upvalues = ups };
                     try self.push(.{ .closure = cl });
@@ -1094,6 +1409,35 @@ const VM = struct {
                     self.stack.shrinkRetainingCapacity(start);
                     try self.push(.{ .str = try buf.toOwnedSlice(self.alloc) });
                 },
+                .new_instance => {
+                    const ty = frame.func.chunk.rttypes.items[self.readU16(frame)];
+                    const inst = try self.alloc.create(Instance);
+                    inst.* = .{ .type = ty };
+                    for (ty.field_names) |fname| try inst.fields.put(self.alloc, fname, .nil);
+                    try self.push(.{ .instance = inst });
+                },
+                .get_member => {
+                    const name = chunk.constants.items[self.readU16(frame)].str;
+                    const obj = self.pop();
+                    if (obj != .instance) return self.fail("cannot access member '{s}' of {s}", .{ name, @tagName(obj) });
+                    const inst = obj.instance;
+                    if (inst.fields.get(name)) |v| {
+                        try self.push(v);
+                    } else if (inst.type.methods.get(name)) |m| {
+                        const bm = try self.alloc.create(BoundMethod);
+                        bm.* = .{ .recv = inst, .func = m };
+                        try self.push(.{ .bound_method = bm });
+                    } else return self.fail("type '{s}' has no member '{s}'", .{ inst.type.name, name });
+                },
+                .set_field => {
+                    const name = chunk.constants.items[self.readU16(frame)].str;
+                    const value = self.pop();
+                    const obj = self.pop();
+                    if (obj != .instance) return self.fail("cannot assign member '{s}' of {s}", .{ name, @tagName(obj) });
+                    if (obj.instance.fields.getPtr(name)) |slot| {
+                        slot.* = value;
+                    } else return self.fail("type '{s}' has no field '{s}'", .{ obj.instance.type.name, name });
+                },
                 .make_range => {
                     const end = self.pop();
                     const startv = self.pop();
@@ -1131,7 +1475,7 @@ const VM = struct {
 
     fn readByte(self: *VM, frame: *Frame) u8 {
         _ = self;
-        const b = frame.closure.func.chunk.code.items[frame.ip];
+        const b = frame.func.chunk.code.items[frame.ip];
         frame.ip += 1;
         return b;
     }
@@ -1241,7 +1585,16 @@ const VM = struct {
                 if (argc != f.arity) return self.fail("{s} expects {d} argument(s), got {d}", .{ f.name, f.arity, argc });
                 // The callee sits just below the arguments; use it as slot 0 base.
                 const base = self.stack.items.len - argc;
-                try self.frames.append(self.alloc, .{ .closure = cl, .ip = 0, .base = base });
+                try self.frames.append(self.alloc, .{ .func = f, .upvalues = cl.upvalues, .ip = 0, .base = base });
+            },
+            .bound_method => |bm| {
+                const f = bm.func;
+                if (argc != f.arity) return self.fail("{s} expects {d} argument(s), got {d}", .{ f.name, f.arity, argc });
+                // A method takes the receiver as slot 0: splice it in below the
+                // arguments, so slot 0 is the receiver and slots 1.. are the args.
+                const base = self.stack.items.len - argc;
+                try self.stack.insert(self.alloc, base, .{ .instance = bm.recv });
+                try self.frames.append(self.alloc, .{ .func = f, .upvalues = &.{}, .ip = 0, .base = base });
             },
             .builtin => |bi| {
                 const base = self.stack.items.len - argc;
@@ -1504,7 +1857,18 @@ const VM = struct {
                 }
                 try buf.append(self.alloc, '}');
             },
-            .closure, .builtin => try buf.appendSlice(self.alloc, "<function>"),
+            .closure, .builtin, .bound_method => try buf.appendSlice(self.alloc, "<function>"),
+            .instance => |inst| {
+                try buf.appendSlice(self.alloc, inst.type.name);
+                try buf.appendSlice(self.alloc, " {");
+                for (inst.type.field_names, 0..) |fname, i| {
+                    try buf.appendSlice(self.alloc, if (i > 0) ", " else " ");
+                    try buf.appendSlice(self.alloc, fname);
+                    try buf.appendSlice(self.alloc, ": ");
+                    try self.appendValueTo(buf, inst.fields.get(fname) orelse .nil);
+                }
+                try buf.appendSlice(self.alloc, " }");
+            },
         }
     }
 };
@@ -1711,8 +2075,130 @@ test "vm: nested closures capture transitively" {
     try expectVMOutput(src, "321\n");
 }
 
+test "vm: struct construction, fields, and printing" {
+    const src =
+        \\struct Point:
+        \\    var x: int = 0
+        \\    var y: int = 0
+        \\
+        \\func main():
+        \\    var p = Point()
+        \\    p.x = 3
+        \\    p.y = 4
+        \\    print(p.x + p.y)
+        \\    print(p)
+    ;
+    try expectVMOutput(src, "7\nPoint { x: 3, y: 4 }\n");
+}
+
+test "vm: methods, bare-name fields, sibling calls, and init" {
+    const src =
+        \\class Counter:
+        \\    var count: int = 0
+        \\    func bump():
+        \\        count = count + 1
+        \\    func get() -> int:
+        \\        return count
+        \\
+        \\class Box:
+        \\    var w: int = 0
+        \\    func init(width: int):
+        \\        w = width
+        \\    func area() -> int:
+        \\        return side() * side()
+        \\    func side() -> int:
+        \\        return w
+        \\
+        \\func main():
+        \\    var c = Counter()
+        \\    c.bump()
+        \\    c.bump()
+        \\    print(c.get())
+        \\    var b = Box(5)
+        \\    print(b.area())
+    ;
+    try expectVMOutput(src, "2\n25\n");
+}
+
+test "vm: inheritance, override, uses, and virtual dispatch" {
+    const src =
+        \\class Animal:
+        \\    var legs: int = 4
+        \\    func count() -> int:
+        \\        return legs
+        \\    func speak() -> str:
+        \\        return "..."
+        \\    func describe() -> str:
+        \\        return speak()
+        \\
+        \\class Dog extends Animal:
+        \\    var name: str = "rex"
+        \\    func speak() -> str:
+        \\        return "woof"
+        \\
+        \\class Damageable:
+        \\    var hp: int = 100
+        \\    func hurt(amount: int):
+        \\        hp = hp - amount
+        \\
+        \\class Player uses Damageable:
+        \\    var tag: str = "hero"
+        \\
+        \\func main():
+        \\    var d = Dog()
+        \\    print(d.legs, d.count(), d.speak(), d.describe())
+        \\    print(d)
+        \\    var p = Player()
+        \\    p.hurt(30)
+        \\    print(p.hp)
+    ;
+    try expectVMOutput(src, "4 4 woof woof\nDog { legs: 4, name: rex }\n70\n");
+}
+
+test "vm: an inherited init runs as the constructor" {
+    const src =
+        \\class Base:
+        \\    var x: int = 0
+        \\    func init(v: int):
+        \\        x = v
+        \\
+        \\class Derived extends Base:
+        \\    var y: int = 9
+        \\
+        \\func main():
+        \\    var d = Derived(7)
+        \\    print(d.x, d.y)
+        \\    print(d)
+    ;
+    try expectVMOutput(src, "7 9\nDerived { x: 7, y: 9 }\n");
+}
+
+test "vm: a lambda in a method captures the receiver" {
+    const src =
+        \\class Adder:
+        \\    var n: int = 0
+        \\    func make():
+        \\        return func(x): n + x
+        \\
+        \\func main():
+        \\    var a = Adder()
+        \\    a.n = 10
+        \\    var f = a.make()
+        \\    print(f(5))
+    ;
+    try expectVMOutput(src, "15\n");
+}
+
+test "vm: accessing an unknown member is a runtime error" {
+    var result = try runSource(testing.allocator, "struct S:\n    var a: int = 0\n\nfunc main():\n    var s = S()\n    print(s.missing)");
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "no member 'missing'") != null);
+}
+
 test "vm: reports unsupported constructs" {
-    var result = try runSource(testing.allocator, "class C:\n    var x: int = 0\n\nfunc main():\n    pass");
+    // A top-level signal is not compilable by the VM backend.
+    var result = try runSource(testing.allocator, "signal ping()\n\nfunc main():\n    pass");
     defer result.deinit();
     try testing.expect(result.diagnostics.len > 0);
     try testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, "does not support") != null);
