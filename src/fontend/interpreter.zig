@@ -122,6 +122,16 @@ const FuncValue = struct { decl: *const Decl.Func, module: *Env };
 /// bare names against that type's statics (and its module).
 const StaticMethod = struct { ti: *const TypeInfo, func: *const Decl.Func };
 
+/// A closure: an anonymous function plus the environment (and receiver/statics
+/// and module) captured where it was created, so it resolves outer names later.
+const Closure = struct {
+    lambda: *const Expr.Lambda,
+    env: *Env,
+    module: *Env,
+    receiver: ?*Instance,
+    statics: ?*Env,
+};
+
 /// An enum type: its name and the set of member names it declares.
 const EnumType = struct {
     name: []const u8,
@@ -152,6 +162,7 @@ pub const Value = union(enum) {
     instance: *Instance,
     bound_method: *BoundMethod,
     static_method: *const StaticMethod,
+    closure: *const Closure,
     type_ref: *const TypeInfo,
     enum_type: *const EnumType,
     enum_value: *const EnumValue,
@@ -201,6 +212,7 @@ fn valuesEqual(a: Value, b: Value) bool {
         .instance => |x| b == .instance and x == b.instance,
         .bound_method => |x| b == .bound_method and x == b.bound_method,
         .static_method => |x| b == .static_method and x == b.static_method,
+        .closure => |x| b == .closure and x == b.closure,
         .type_ref => |x| b == .type_ref and x == b.type_ref,
         .enum_type => |x| b == .enum_type and x == b.enum_type,
         .enum_value => |x| b == .enum_value and
@@ -1013,6 +1025,38 @@ const Interpreter = struct {
         return if (flow == .returned) self.ret_value else Value.nil;
     }
 
+    /// Call a closure: run its body with the captured environment as the parent
+    /// scope (and the captured module/receiver/statics restored), so it still
+    /// resolves the outer names it closed over.
+    fn callClosure(self: *Interpreter, cl: *const Closure, args: []const Value, span: Span) Error!Value {
+        const params = cl.lambda.params;
+        if (args.len != params.len) {
+            return self.fail(span, "lambda expects {d} argument(s), got {d}", .{ params.len, args.len });
+        }
+        const saved_globals = self.globals;
+        const saved_recv = self.current_receiver;
+        const saved_statics = self.current_statics;
+        self.globals = cl.module;
+        self.current_receiver = cl.receiver;
+        self.current_statics = cl.statics;
+        const call_env = try self.newEnv(cl.env);
+        for (params, args) |p, arg| try self.define(call_env, p.name, arg);
+
+        const saved_env = self.env;
+        const saved_ret = self.ret_value;
+        self.env = call_env;
+        self.ret_value = .nil;
+        defer {
+            self.env = saved_env;
+            self.ret_value = saved_ret;
+            self.globals = saved_globals;
+            self.current_receiver = saved_recv;
+            self.current_statics = saved_statics;
+        }
+        const flow = try self.execBlock(cl.lambda.body);
+        return if (flow == .returned) self.ret_value else Value.nil;
+    }
+
     fn callMethod(self: *Interpreter, func: *const Decl.Func, owner: *const TypeInfo, receiver: *Instance, args: []const Value, span: Span) Error!Value {
         if (args.len != func.params.len) {
             return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
@@ -1261,6 +1305,18 @@ const Interpreter = struct {
             .map => |m| try self.evalMap(m),
             .match => |m| try self.evalMatch(m),
             .member => |m| try self.evalMember(m),
+            .lambda => |lam| blk: {
+                // Capture the current environment and context.
+                const cl = try self.arena.create(Closure);
+                cl.* = .{
+                    .lambda = lam,
+                    .env = self.env,
+                    .module = self.globals,
+                    .receiver = self.current_receiver,
+                    .statics = self.current_statics,
+                };
+                break :blk .{ .closure = cl };
+            },
         };
     }
 
@@ -1369,6 +1425,7 @@ const Interpreter = struct {
             .builtin => |b| try self.callBuiltin(b, args, span),
             .bound_method => |bm| try self.callMethod(bm.func, bm.owner, bm.receiver, args, span),
             .static_method => |sm| try self.callStaticMethod(sm, args, span),
+            .closure => |cl| try self.callClosure(cl, args, span),
             .type_ref => |ti| try self.construct(ti, args, span),
             else => self.fail(span, "{s} is not callable", .{@tagName(callee)}),
         };
@@ -1534,7 +1591,7 @@ const Interpreter = struct {
                 }
                 try buf.append(self.arena, '}');
             },
-            .func, .builtin, .bound_method, .static_method => try buf.appendSlice(self.arena, "<function>"),
+            .func, .builtin, .bound_method, .static_method, .closure => try buf.appendSlice(self.arena, "<function>"),
             .module => try buf.appendSlice(self.arena, "<module>"),
             .signal => |s| {
                 try buf.appendSlice(self.arena, "<signal ");
@@ -2262,6 +2319,59 @@ test "string and collection stdlib builtins" {
         \\    print(abs(-5), min(3, 7), max(3, 7))
     ;
     try expectOutput(src, "HI bye\n[a, b, c]\nx-y-z\ntrue true\n[1, 2, 3] [3, 2, 1]\n5 3 7\n");
+}
+
+test "a lambda captures a local by reference" {
+    const src =
+        \\func main():
+        \\    var n = 10
+        \\    var add = func(x): x + n
+        \\    print(add(5))
+        \\    n = 100
+        \\    print(add(5))
+    ;
+    try expectOutput(src, "15\n105\n");
+}
+
+test "a lambda is a first-class higher-order argument" {
+    const src =
+        \\func apply(f, x):
+        \\    return f(x)
+        \\
+        \\func main():
+        \\    print(apply(func(n): n * n, 7))
+    ;
+    try expectOutput(src, "49\n");
+}
+
+test "a lambda works as a signal handler and captures a local" {
+    const src =
+        \\signal ping(msg)
+        \\
+        \\func main():
+        \\    var seen = []
+        \\    connect(ping, func(m): push(seen, m))
+        \\    emit(ping, "a")
+        \\    emit(ping, "b")
+        \\    print(seen)
+    ;
+    try expectOutput(src, "[a, b]\n");
+}
+
+test "a lambda in a method captures the receiver" {
+    const src =
+        \\class Counter:
+        \\    var n = 0
+        \\    func adder():
+        \\        return func(x): n + x
+        \\
+        \\func main():
+        \\    var c = Counter()
+        \\    c.n = 10
+        \\    var f = c.adder()
+        \\    print(f(5))
+    ;
+    try expectOutput(src, "15\n");
 }
 
 test "the REPL keeps state across entries" {

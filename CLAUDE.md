@@ -21,7 +21,7 @@ zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
-zig build test                  # run every test (231 as of writing)
+zig build test                  # run every test (237 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -102,7 +102,9 @@ loader, then the analyzer and interpreter over the loaded module set.
   bodies.
 - **Expressions:** literals (incl. `nil`), identifiers, `and`/`or`/`not`,
   arithmetic/comparison with precedence, calls, indexing `a[i]`, member access `x.f`,
-  array `[...]` and map `{k: v}` literals, and `match subj { pattern: body, ... }`
+  array `[...]` and map `{k: v}` literals, anonymous functions `func(params): expr`
+  (single expression, implicitly returned; or `func(params):` + an indented block)
+  that close over the surrounding scope, and `match subj { pattern: body, ... }`
   (patterns: literals, `_`, a binding name, or an enum case `Enum.CASE` — covering
   every case is exhaustive without a `_`).
 - **Types:** `int`, `float`, `str`, `bool`, `void`, `any`, `list`/`map` (optionally
@@ -132,7 +134,10 @@ loader, then the analyzer and interpreter over the loaded module set.
   the type (`TypeInfo.statics`): static vars are one shared cell, static methods run with
   no receiver but see the type's statics by bare name; both are reached via `Type.member`.
   Enum cases are distinct
-  values printing as `Enum.CASE`. **Signals** are real events: a `signal` is a value
+  values printing as `Enum.CASE`. A **lambda** evaluates to a closure that captures
+  the current environment, module, and receiver/statics, so it resolves outer names
+  (and mutations to captured locals are visible) when called later — anywhere a
+  callable is expected, including signal handlers. **Signals** are real events: a `signal` is a value
   holding a handler list — top-level signals are shared globals, a class signal is made
   fresh per instance (inherited, reached via `inst.name`) — and `connect(sig, handler)`
   / `emit(sig, args…)` register and fire handlers (any callable). Builtins

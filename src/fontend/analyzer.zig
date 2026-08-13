@@ -1291,7 +1291,42 @@ const Analyzer = struct {
                 break :blk try self.makeMap(kt orelse .unknown, vt orelse .unknown);
             },
             .match => |m| try self.typeMatch(m),
+            .lambda => |lam| try self.typeLambda(lam),
         };
+    }
+
+    /// A lambda has a function type: its parameters (annotated, else `any`) and a
+    /// return type inferred from a single-expression body (else `any`). The body
+    /// is analyzed in a child scope so its own errors are still reported.
+    fn typeLambda(self: *Analyzer, lam: *const Expr.Lambda) Error!Type {
+        const fn_scope = try self.newScope(self.current);
+        const param_types = try self.arena.alloc(Type, lam.params.len);
+        for (lam.params, 0..) |p, i| {
+            const pty: Type = if (p.type) |ann| blk: {
+                try self.checkType(ann);
+                break :blk try self.annotationType(ann);
+            } else .any;
+            param_types[i] = pty;
+            try self.declareIn(fn_scope, p.name, .parameter, pty, p.span);
+        }
+        const saved = self.current;
+        const saved_ret = self.current_ret;
+        self.current = fn_scope;
+        self.current_ret = null; // lambdas don't declare a return type
+        defer {
+            self.current = saved;
+            self.current_ret = saved_ret;
+        }
+        var ret: Type = .any;
+        if (lam.body.len == 1 and lam.body[0] == .return_stmt and lam.body[0].return_stmt.value != null) {
+            // Single-expression body: its type is the result (and checks the expr).
+            ret = try self.typeOf(lam.body[0].return_stmt.value.?.*);
+        } else {
+            try self.analyzeStmts(lam.body);
+        }
+        const sig = try self.arena.create(FuncSig);
+        sig.* = .{ .params = param_types, .ret = ret };
+        return .{ .func = sig };
     }
 
     fn typeUnary(self: *Analyzer, u: Expr.Unary) Error!Type {
@@ -2909,6 +2944,12 @@ test "a stdlib builtin's result type is checked" {
     var sp = try analyzeSource(testing.allocator, "func main():\n    var n: int = split(\"a,b\", \",\")[0]");
     defer sp.deinit();
     try expectMessageContains(sp, "cannot assign str to int");
+}
+
+test "a lambda body is type-checked with its parameters" {
+    var analysis = try analyzeSource(testing.allocator, "func main():\n    var f = func(x: int): x + \"s\"");
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot be applied to int and str");
 }
 
 test "a local shadowing a builtin is not treated as the builtin" {

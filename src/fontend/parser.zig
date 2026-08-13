@@ -86,6 +86,7 @@ pub const Expr = union(enum) {
     array: Array,
     map: Map,
     match: Match,
+    lambda: *const Lambda,
 
     pub const Literal = struct { text: []const u8, span: Span };
     pub const Bool = struct { value: bool, span: Span };
@@ -98,6 +99,9 @@ pub const Expr = union(enum) {
     pub const Array = struct { elements: []const *Expr, span: Span };
     pub const Map = struct { entries: []const MapEntry, span: Span };
     pub const Match = struct { subject: *Expr, arms: []const MatchArm, span: Span };
+    /// An anonymous function `func(params): expr` (single expression, implicitly
+    /// returned) or `func(params):` + an indented block.
+    pub const Lambda = struct { params: []const Param, body: []const Stmt, span: Span };
 };
 
 pub const MatchArm = struct {
@@ -247,6 +251,7 @@ pub fn exprSpan(e: Expr) Span {
         .array => |a| a.span,
         .map => |m| m.span,
         .match => |m| m.span,
+        .lambda => |l| l.span,
     };
 }
 
@@ -626,10 +631,35 @@ const Parser = struct {
         };
     }
 
+    /// Parse an anonymous function expression: `func(params): expr` (single
+    /// expression, implicitly returned) or `func(params):` + an indented block.
+    fn parseLambda(self: *Parser) Error!*Expr {
+        const kw = try self.expect(.kw_func, "expected 'func'");
+        const params = try self.parseParamList();
+        _ = try self.expect(.colon, "expected ':' after lambda parameters");
+        var body: []const Stmt = undefined;
+        if (self.at(.newline)) {
+            body = try self.parseIndentedStmts();
+        } else {
+            const e = try self.parseExpr();
+            const stmts = try self.alloc.alloc(Stmt, 1);
+            stmts[0] = .{ .return_stmt = .{ .value = e, .span = exprSpan(e.*) } };
+            body = stmts;
+        }
+        const lam = try self.alloc.create(Expr.Lambda);
+        lam.* = .{ .params = params, .body = body, .span = joinSpan(kw.span, self.prev().span) };
+        return self.mkExpr(.{ .lambda = lam });
+    }
+
     // --- blocks --------------------------------------------------------------
 
     fn parseColonStmtBlock(self: *Parser) Error![]const Stmt {
         _ = try self.expect(.colon, "expected ':' to open a block");
+        return self.parseIndentedStmts();
+    }
+
+    /// Parse an indented statement block, assuming the opening `:` is consumed.
+    fn parseIndentedStmts(self: *Parser) Error![]const Stmt {
         self.skipNewlines();
         _ = try self.expect(.indent, "expected an indented block");
         var stmts: std.ArrayList(Stmt) = .empty;
@@ -930,6 +960,7 @@ const Parser = struct {
                 _ = self.advance();
                 return self.mkExpr(.{ .identifier = .{ .name = t.text, .span = t.span } });
             },
+            .kw_func => return self.parseLambda(),
             .kw_match => return self.mkExpr(.{ .match = try self.parseMatch() }),
             .l_bracket => return self.mkExpr(.{ .array = try self.parseArrayLiteral() }),
             .l_brace => return self.mkExpr(.{ .map = try self.parseMapLiteral() }),
@@ -1223,6 +1254,19 @@ test "parses generic collection type arguments" {
     try testing.expectEqualStrings("list", ty.args[1].name);
     try testing.expectEqual(@as(usize, 1), ty.args[1].args.len);
     try testing.expectEqualStrings("int", ty.args[1].args[0].name);
+}
+
+test "parses a single-expression lambda" {
+    var tree = try parse(testing.allocator, "var f = func(x): x * 2");
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const val = tree.module.decls[0].var_decl.value.?;
+    try testing.expect(val.* == .lambda);
+    const lam = val.lambda;
+    try testing.expectEqual(@as(usize, 1), lam.params.len);
+    try testing.expectEqualStrings("x", lam.params[0].name);
+    try testing.expectEqual(@as(usize, 1), lam.body.len);
+    try testing.expect(lam.body[0] == .return_stmt); // single expr becomes a return
 }
 
 test "compound assignment desugars to an assign" {
