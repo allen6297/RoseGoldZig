@@ -271,6 +271,19 @@ fn precedence(kind: TokenKind) u8 {
     };
 }
 
+/// The arithmetic op behind a compound-assignment token (`+=` → `add`, …), or
+/// null if the token isn't one.
+fn compoundOp(kind: TokenKind) ?BinaryOp {
+    return switch (kind) {
+        .plus_eq => .add,
+        .minus_eq => .sub,
+        .star_eq => .mul,
+        .slash_eq => .div,
+        .percent_eq => .mod,
+        else => null,
+    };
+}
+
 fn binaryOp(kind: TokenKind) BinaryOp {
     return switch (kind) {
         .plus => .add,
@@ -690,6 +703,16 @@ const Parser = struct {
                         .value = value,
                         .span = joinSpan(exprSpan(expr.*), exprSpan(value.*)),
                     } };
+                }
+                // Compound assignment `x <op>= e` desugars to `x = x <op> e`,
+                // reusing the target node as the operator's left operand.
+                if (compoundOp(self.peekKind())) |op| {
+                    _ = self.advance();
+                    const rhs = try self.parseExpr();
+                    const span = joinSpan(exprSpan(expr.*), exprSpan(rhs.*));
+                    const bin = try self.alloc.create(Expr);
+                    bin.* = .{ .binary = .{ .op = op, .lhs = expr, .rhs = rhs, .span = span } };
+                    return .{ .assign = .{ .target = expr, .value = bin, .span = span } };
                 }
                 return .{ .expr_stmt = expr };
             },
@@ -1203,6 +1226,18 @@ test "parses generic collection type arguments" {
     try testing.expectEqualStrings("list", ty.args[1].name);
     try testing.expectEqual(@as(usize, 1), ty.args[1].args.len);
     try testing.expectEqualStrings("int", ty.args[1].args[0].name);
+}
+
+test "compound assignment desugars to an assign" {
+    var tree = try parse(testing.allocator, "func main():\n    x += 1");
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const body = tree.module.decls[0].func.body;
+    try testing.expect(body[0] == .assign);
+    const val = body[0].assign.value;
+    try testing.expect(val.* == .binary);
+    try testing.expect(val.binary.op == .add);
+    try testing.expect(val.binary.lhs == body[0].assign.target); // target reused as lhs
 }
 
 test "parses a module-qualified type" {

@@ -1944,6 +1944,46 @@ test "a static factory sees statics and constructs instances" {
     try expectOutput(src, "100 101 102\n");
 }
 
+test "compound assignment updates a variable" {
+    const src =
+        \\func main():
+        \\    var n: int = 10
+        \\    n += 5
+        \\    n -= 2
+        \\    n *= 3
+        \\    print(n)
+    ;
+    try expectOutput(src, "39\n");
+}
+
+test "compound assignment on a list element and map value" {
+    const src =
+        \\func main():
+        \\    var xs: list<int> = [1, 2, 3]
+        \\    xs[1] += 10
+        \\    var m: map<str, int> = {"a": 1}
+        \\    m["a"] += 5
+        \\    print(xs, m["a"])
+    ;
+    try expectOutput(src, "[1, 12, 3] 6\n");
+}
+
+test "compound assignment on a field via a method" {
+    const src =
+        \\class C:
+        \\    var v: int = 0
+        \\    func bump():
+        \\        v += 7
+        \\
+        \\func main():
+        \\    var c: C = C()
+        \\    c.bump()
+        \\    c.bump()
+        \\    print(c.v)
+    ;
+    try expectOutput(src, "14\n");
+}
+
 test "the REPL keeps state across entries" {
     const gpa = testing.allocator;
     var repl = try replInit(gpa);

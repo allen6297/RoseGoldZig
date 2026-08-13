@@ -76,6 +76,11 @@ pub const TokenKind = enum {
     slash,
     percent,
     assign,
+    plus_eq,
+    minus_eq,
+    star_eq,
+    slash_eq,
+    percent_eq,
     eq,
     bang_eq,
     lt,
@@ -408,6 +413,16 @@ pub const Lexer = struct {
         try self.emit(keywords.get(text) orelse .identifier, start, start_col);
     }
 
+    /// After consuming a one-char operator, return `with_eq` if a `=` follows
+    /// (consuming it too), else `single`.
+    fn oneOrEq(self: *Lexer, single: TokenKind, with_eq: TokenKind) TokenKind {
+        if (self.peek() == '=') {
+            self.pos += 1;
+            return with_eq;
+        }
+        return single;
+    }
+
     fn lexOperator(self: *Lexer) !void {
         const start = self.pos;
         const start_col = self.col();
@@ -419,10 +434,10 @@ pub const Lexer = struct {
             ',' => .comma,
             '.' => .dot,
             '?' => .question,
-            '+' => .plus,
-            '*' => .star,
-            '/' => .slash,
-            '%' => .percent,
+            '+' => self.oneOrEq(.plus, .plus_eq),
+            '*' => self.oneOrEq(.star, .star_eq),
+            '/' => self.oneOrEq(.slash, .slash_eq),
+            '%' => self.oneOrEq(.percent, .percent_eq),
             '(' => blk: {
                 try self.pushBracket('(', start_col);
                 break :blk .l_paren;
@@ -451,6 +466,10 @@ pub const Lexer = struct {
                 if (self.peek() == '>') {
                     self.pos += 1;
                     break :blk .arrow;
+                }
+                if (self.peek() == '=') {
+                    self.pos += 1;
+                    break :blk .minus_eq;
                 }
                 break :blk .minus;
             },
