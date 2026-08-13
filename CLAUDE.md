@@ -23,7 +23,7 @@ zig build run -- run --vm FILE.rg  # execute on the bytecode VM instead
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (265 as of writing)
+zig build test                  # run every test (266 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -227,8 +227,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   short-circuit `and`/`or`, `if`/`elif`/`else`, `while`, `for` over a list/map/string
   with one or two bindings (a small `iter_*` opcode protocol), `break`/`continue` (with
   proper stack cleanup), ranges (`a..b`), list and map literals + indexing, and the
-  builtins `print`/`echo`/`len`/`str`/`int`/`float`/`range`/`push`/`pop`/`keys`/`values`/
-  `has`.
+  full stdlib of builtins (`print`/`len`/`str`/`range`/`push`/`keys`/…/`sort`/`split`/
+  `join`/`find`/`replace`/`trim`/`abs`/`min`/`max`/…) — everything except the
+  signal builtins `connect`/`emit`.
 - **Not yet compiled** (reported as a clear "the --vm backend does not support …"
   diagnostic, so the tree-walker stays the full-featured default): classes/structs/
   enums, closures/lambdas, modules, signals, statics, optionals/`match`, and string

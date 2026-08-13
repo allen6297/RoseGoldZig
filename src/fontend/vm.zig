@@ -28,9 +28,17 @@ const List = std.ArrayList(Value);
 const MapEntry = struct { key: Value, value: Value };
 const Map = struct { entries: std.ArrayList(MapEntry) = .empty };
 
-const Builtin = enum { print, echo, len, str, int, float, range, push, pop, keys, values, has };
+const Builtin = enum {
+    print,   echo,  len,   str,   int,   float, range, push, pop, keys, values, has,
+    abs,     min,   max,   upper, lower, split, join,  contains, sort, reverse,
+    trim,    starts_with, ends_with, find, replace,
+};
 
-const builtin_names = [_][]const u8{ "print", "echo", "len", "str", "int", "float", "range", "push", "pop", "keys", "values", "has" };
+const builtin_names = [_][]const u8{
+    "print", "echo", "len", "str", "int", "float", "range", "push", "pop", "keys", "values", "has",
+    "abs",   "min",  "max", "upper", "lower", "split", "join", "contains", "sort", "reverse",
+    "trim",  "starts_with", "ends_with", "find", "replace",
+};
 
 const Function = struct {
     name: []const u8,
@@ -89,6 +97,14 @@ fn valuesEqual(a: Value, b: Value) bool {
         .func => |x| b == .func and x == b.func,
         .builtin => |x| b == .builtin and x == b.builtin,
     };
+}
+
+fn valueLess(_: void, a: Value, b: Value) bool {
+    if (toFloat(a)) |fa| {
+        if (toFloat(b)) |fb| return fa < fb;
+    }
+    if (a == .str and b == .str) return std.mem.order(u8, a.str, b.str) == .lt;
+    return false;
 }
 
 // --- bytecode ----------------------------------------------------------------
@@ -1038,6 +1054,90 @@ const VM = struct {
                 if (args.len != 1 or args[0] != .list) return self.fail("pop expects a list", .{});
                 return args[0].list.pop() orelse self.fail("pop from an empty list", .{});
             },
+            .abs => {
+                if (args.len != 1) return self.fail("abs expects 1 argument", .{});
+                return switch (args[0]) {
+                    .int => |n| .{ .int = if (n < 0) -n else n },
+                    .float => |f| .{ .float = @abs(f) },
+                    else => self.fail("abs expects a number", .{}),
+                };
+            },
+            .min, .max => {
+                if (args.len != 2) return self.fail("{s} expects 2 arguments", .{@tagName(b)});
+                const a0 = toFloat(args[0]) orelse return self.fail("{s} expects numbers", .{@tagName(b)});
+                const a1 = toFloat(args[1]) orelse return self.fail("{s} expects numbers", .{@tagName(b)});
+                const first = if (b == .min) a0 <= a1 else a0 >= a1;
+                return if (first) args[0] else args[1];
+            },
+            .upper, .lower => {
+                if (args.len != 1 or args[0] != .str) return self.fail("{s} expects a string", .{@tagName(b)});
+                const s = args[0].str;
+                const out = try self.alloc.alloc(u8, s.len);
+                for (s, 0..) |ch, i| out[i] = if (b == .upper) std.ascii.toUpper(ch) else std.ascii.toLower(ch);
+                return .{ .str = out };
+            },
+            .split => {
+                if (args.len != 2 or args[0] != .str or args[1] != .str) return self.fail("split expects two strings", .{});
+                const l = try self.alloc.create(List);
+                l.* = .empty;
+                if (args[1].str.len == 0) {
+                    var i: usize = 0;
+                    while (i < args[0].str.len) : (i += 1) try l.append(self.alloc, .{ .str = args[0].str[i..][0..1] });
+                } else {
+                    var it = std.mem.splitSequence(u8, args[0].str, args[1].str);
+                    while (it.next()) |part| try l.append(self.alloc, .{ .str = part });
+                }
+                return .{ .list = l };
+            },
+            .join => {
+                if (args.len != 2 or args[0] != .list or args[1] != .str) return self.fail("join expects a list and a string", .{});
+                var buf: std.ArrayList(u8) = .empty;
+                for (args[0].list.items, 0..) |item, i| {
+                    if (i > 0) try buf.appendSlice(self.alloc, args[1].str);
+                    try self.appendValueTo(&buf, item);
+                }
+                return .{ .str = try buf.toOwnedSlice(self.alloc) };
+            },
+            .contains, .find => {
+                if (args.len != 2) return self.fail("{s} expects 2 arguments", .{@tagName(b)});
+                var idx: i64 = -1;
+                switch (args[0]) {
+                    .str => |s| {
+                        if (args[1] != .str) return self.fail("{s} on a string expects a string", .{@tagName(b)});
+                        if (std.mem.indexOf(u8, s, args[1].str)) |i| idx = @intCast(i);
+                    },
+                    .list => |l| {
+                        for (l.items, 0..) |item, i| if (valuesEqual(item, args[1])) {
+                            idx = @intCast(i);
+                            break;
+                        };
+                    },
+                    else => return self.fail("{s} expects a string or list", .{@tagName(b)}),
+                }
+                return if (b == .contains) .{ .bool = idx >= 0 } else .{ .int = idx };
+            },
+            .sort, .reverse => {
+                if (args.len != 1 or args[0] != .list) return self.fail("{s} expects a list", .{@tagName(b)});
+                const l = try self.alloc.create(List);
+                l.* = .empty;
+                try l.appendSlice(self.alloc, args[0].list.items);
+                if (b == .sort) std.mem.sort(Value, l.items, {}, valueLess) else std.mem.reverse(Value, l.items);
+                return .{ .list = l };
+            },
+            .trim => {
+                if (args.len != 1 or args[0] != .str) return self.fail("trim expects a string", .{});
+                return .{ .str = std.mem.trim(u8, args[0].str, " \t\r\n") };
+            },
+            .starts_with, .ends_with => {
+                if (args.len != 2 or args[0] != .str or args[1] != .str) return self.fail("{s} expects two strings", .{@tagName(b)});
+                const yes = if (b == .starts_with) std.mem.startsWith(u8, args[0].str, args[1].str) else std.mem.endsWith(u8, args[0].str, args[1].str);
+                return .{ .bool = yes };
+            },
+            .replace => {
+                if (args.len != 3 or args[0] != .str or args[1] != .str or args[2] != .str) return self.fail("replace expects three strings", .{});
+                if (args[1].str.len == 0) return .{ .str = args[0].str };
+                return .{ .str = try std.mem.replaceOwned(u8, self.alloc, args[0].str, args[1].str, args[2].str) };
+            },
         }
     }
 
@@ -1205,6 +1305,20 @@ test "vm: maps, ranges, and generalized for" {
         \\        print(i, x)
     ;
     try expectVMOutput(src, "range sum: 10\nhas d? true size 4 d= 10\nkeys: [a, b, c, d] grand total: 26\n0 x\n1 y\n");
+}
+
+test "vm: stdlib builtins" {
+    const src =
+        \\func main():
+        \\    print(abs(-5), min(3, 7), max(3, 7))
+        \\    print(upper("hi"), lower("BYE"))
+        \\    print(sort([3, 1, 2]), reverse([1, 2, 3]))
+        \\    print(split("a,b,c", ","), join(["x", "y"], "-"))
+        \\    print(contains("hello", "ell"), find([10, 20], 20))
+        \\    print("[" + trim("  z  ") + "]", starts_with("hello", "he"))
+        \\    print(replace("a-b", "-", "+"))
+    ;
+    try expectVMOutput(src, "5 3 7\nHI bye\n[1, 2, 3] [3, 2, 1]\n[a, b, c] x-y\ntrue 1\n[z] true\na+b\n");
 }
 
 test "vm: short-circuit logical operators" {
