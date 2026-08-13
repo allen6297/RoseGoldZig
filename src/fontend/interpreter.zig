@@ -61,6 +61,7 @@ const Builtin = enum {
     abs,     min,   max,     upper, lower, split, join,
     contains, sort, reverse,
     trim,    starts_with, ends_with, find, replace,
+    map,     filter, reduce,
 };
 
 /// The names bound to each builtin. Shared with the analyzer (see analyzer.zig)
@@ -71,6 +72,7 @@ pub const builtin_names = [_][]const u8{
     "abs",      "min",  "max",     "upper",  "lower", "split", "join",
     "contains", "sort", "reverse",
     "trim",     "starts_with", "ends_with", "find", "replace",
+    "map",      "filter", "reduce",
 };
 
 /// A field declared on a class/struct, with its default-value expression.
@@ -1403,6 +1405,32 @@ const Interpreter = struct {
                 const out = try std.mem.replaceOwned(u8, self.arena, args[0].str, args[1].str, args[2].str);
                 return .{ .str = out };
             },
+            .map => {
+                if (args.len != 2 or args[0] != .list) return self.fail(span, "map expects a list and a function", .{});
+                const out = try self.arena.create(List);
+                out.* = .empty;
+                for (args[0].list.items) |item| {
+                    try out.append(self.arena, try self.callValue(args[1], &.{item}, span));
+                }
+                return .{ .list = out };
+            },
+            .filter => {
+                if (args.len != 2 or args[0] != .list) return self.fail(span, "filter expects a list and a predicate", .{});
+                const out = try self.arena.create(List);
+                out.* = .empty;
+                for (args[0].list.items) |item| {
+                    if (isTruthy(try self.callValue(args[1], &.{item}, span))) try out.append(self.arena, item);
+                }
+                return .{ .list = out };
+            },
+            .reduce => {
+                if (args.len != 3 or args[0] != .list) return self.fail(span, "reduce expects a list, a function, and an initial value", .{});
+                var acc = args[2];
+                for (args[0].list.items) |item| {
+                    acc = try self.callValue(args[1], &.{ acc, item }, span);
+                }
+                return acc;
+            },
         }
     }
 
@@ -2465,6 +2493,22 @@ test "string and collection stdlib builtins" {
         \\    print(abs(-5), min(3, 7), max(3, 7))
     ;
     try expectOutput(src, "HI bye\n[a, b, c]\nx-y-z\ntrue true\n[1, 2, 3] [3, 2, 1]\n5 3 7\n");
+}
+
+test "map, filter, and reduce apply a callback over a list" {
+    const src =
+        \\func triple(x: int) -> int:
+        \\    return x * 3
+        \\
+        \\func main():
+        \\    var xs = [1, 2, 3, 4, 5]
+        \\    print(map(xs, func(x): x * x))
+        \\    print(map(xs, triple))
+        \\    print(filter(xs, func(x): x % 2 == 0))
+        \\    print(reduce(xs, func(a, x): a + x, 0))
+        \\    print(reduce(["a", "b"], func(a, x): a + x, ""))
+    ;
+    try expectOutput(src, "[1, 4, 9, 16, 25]\n[3, 6, 9, 12, 15]\n[2, 4]\n15\nab\n");
 }
 
 test "runaway recursion is a runtime error, not a crash" {

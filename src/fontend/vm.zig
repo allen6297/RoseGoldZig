@@ -34,12 +34,14 @@ const Builtin = enum {
     print,   echo,  len,   str,   int,   float, range, push, pop, keys, values, has,
     abs,     min,   max,   upper, lower, split, join,  contains, sort, reverse,
     trim,    starts_with, ends_with, find, replace,
+    map,     filter, reduce,
 };
 
 const builtin_names = [_][]const u8{
     "print", "echo", "len", "str", "int", "float", "range", "push", "pop", "keys", "values", "has",
     "abs",   "min",  "max", "upper", "lower", "split", "join", "contains", "sort", "reverse",
     "trim",  "starts_with", "ends_with", "find", "replace",
+    "map",   "filter", "reduce",
 };
 
 /// A compile-time upvalue descriptor: `is_local` captures local slot `index` of
@@ -1430,6 +1432,13 @@ const VM = struct {
     }
 
     fn exec(self: *VM) VMError!void {
+        return self.execFrames(0);
+    }
+
+    /// Run the exec loop until the frame stack shrinks back to `stop_at` frames
+    /// (0 for the top-level script). `stop_at > 0` supports re-entrant calls: a
+    /// builtin can invoke a user callback and run just that call to completion.
+    fn execFrames(self: *VM, stop_at: usize) VMError!void {
         var frame = &self.frames.items[self.frames.items.len - 1];
         while (true) {
             const chunk = &frame.func.chunk;
@@ -1529,6 +1538,9 @@ const VM = struct {
                     // Drop the frame's locals AND the callee that sat just below.
                     self.stack.shrinkRetainingCapacity(finished.base - 1);
                     try self.push(result);
+                    // A re-entrant call (from a builtin) hands control back once its
+                    // own frame has returned; leave the result on the stack.
+                    if (self.frames.items.len == stop_at) return;
                     frame = &self.frames.items[self.frames.items.len - 1];
                 },
                 .build_list => {
@@ -1786,6 +1798,19 @@ const VM = struct {
         }
     }
 
+    /// Invoke `callee` with `args` and run it to completion, returning its value.
+    /// Used by higher-order builtins (`map`/`filter`/`reduce`) to call a user
+    /// callback: a closure/method/type pushes a frame that we run re-entrantly,
+    /// while a builtin callee resolves in place.
+    fn callValueSync(self: *VM, callee: Value, args: []const Value) VMError!Value {
+        const stop = self.frames.items.len;
+        try self.push(callee);
+        for (args) |a| try self.push(a);
+        try self.call(args.len);
+        if (self.frames.items.len > stop) try self.execFrames(stop);
+        return self.pop();
+    }
+
     fn callBuiltin(self: *VM, b: Builtin, args: []const Value) VMError!Value {
         switch (b) {
             .print, .echo => {
@@ -1942,6 +1967,45 @@ const VM = struct {
                 if (args.len != 3 or args[0] != .str or args[1] != .str or args[2] != .str) return self.fail("replace expects three strings", .{});
                 if (args[1].str.len == 0) return .{ .str = args[0].str };
                 return .{ .str = try std.mem.replaceOwned(u8, self.alloc, args[0].str, args[1].str, args[2].str) };
+            },
+            // Higher-order builtins call a user callback via `callValueSync`, which
+            // may grow the stack — so capture the source list + callable up front
+            // (the `args` slice points into the stack and can be invalidated).
+            .map => {
+                if (args.len != 2 or args[0] != .list) return self.fail("map expects a list and a function", .{});
+                const src = args[0].list;
+                const f = args[1];
+                const out = try self.alloc.create(List);
+                out.* = .empty;
+                var i: usize = 0;
+                while (i < src.items.len) : (i += 1) {
+                    try out.append(self.alloc, try self.callValueSync(f, &.{src.items[i]}));
+                }
+                return .{ .list = out };
+            },
+            .filter => {
+                if (args.len != 2 or args[0] != .list) return self.fail("filter expects a list and a predicate", .{});
+                const src = args[0].list;
+                const f = args[1];
+                const out = try self.alloc.create(List);
+                out.* = .empty;
+                var i: usize = 0;
+                while (i < src.items.len) : (i += 1) {
+                    const item = src.items[i];
+                    if (isTruthy(try self.callValueSync(f, &.{item}))) try out.append(self.alloc, item);
+                }
+                return .{ .list = out };
+            },
+            .reduce => {
+                if (args.len != 3 or args[0] != .list) return self.fail("reduce expects a list, a function, and an initial value", .{});
+                const src = args[0].list;
+                const f = args[1];
+                var acc = args[2];
+                var i: usize = 0;
+                while (i < src.items.len) : (i += 1) {
+                    acc = try self.callValueSync(f, &.{ acc, src.items[i] });
+                }
+                return acc;
             },
         }
     }
@@ -2142,6 +2206,34 @@ test "vm: stdlib builtins" {
         \\    print(replace("a-b", "-", "+"))
     ;
     try expectVMOutput(src, "5 3 7\nHI bye\n[1, 2, 3] [3, 2, 1]\n[a, b, c] x-y\ntrue 1\n[z] true\na+b\n");
+}
+
+test "vm: map, filter, and reduce with closures" {
+    const src =
+        \\func main():
+        \\    var xs = [1, 2, 3, 4, 5]
+        \\    print(map(xs, func(x): x * x))
+        \\    print(filter(xs, func(x): x % 2 == 1))
+        \\    print(reduce(xs, func(a, x): a + x, 0))
+        \\    print(reduce(["a", "b", "c"], func(a, x): a + x, ""))
+    ;
+    try expectVMOutput(src, "[1, 4, 9, 16, 25]\n[1, 3, 5]\n15\nabc\n");
+}
+
+test "vm: higher-order builtins accept methods and nest" {
+    const src =
+        \\class Scaler:
+        \\    var factor: int = 1
+        \\    func scale(x: int) -> int:
+        \\        return x * factor
+        \\
+        \\func main():
+        \\    var s = Scaler()
+        \\    s.factor = 10
+        \\    print(map([1, 2, 3], s.scale))
+        \\    print(map([1, 2], func(n): map([10, 20], func(m): n * m)))
+    ;
+    try expectVMOutput(src, "[10, 20, 30]\n[[10, 20], [20, 40]]\n");
 }
 
 test "vm: short-circuit logical operators" {

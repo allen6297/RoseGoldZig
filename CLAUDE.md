@@ -23,7 +23,7 @@ zig build run -- run --vm FILE.rg  # execute on the bytecode VM instead
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (283 as of writing)
+zig build test                  # run every test (286 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -167,7 +167,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `range`, `str`, `int`, `float`, `push`, `pop`, `keys`, `values`, `has`, `connect`,
   `emit`, and the stdlib `abs`, `min`, `max`, `upper`, `lower`, `split`, `join`,
   `contains`, `sort`, `reverse`, `trim`, `starts_with`, `ends_with`, `find`
-  (index of substring/element, `-1` if absent), `replace`.
+  (index of substring/element, `-1` if absent), `replace`, and the higher-order
+  list builtins `map(list, f)`, `filter(list, pred)`, `reduce(list, f, init)`
+  (each invokes a callback — any callable).
 
 ### Modules
 - **A module is a `.rg` file.** `import a.b` loads `a/b.rg` **relative to the importing
@@ -243,7 +245,10 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   nested lambdas), string interpolation (`"a ${expr} b"`, each hole stringified and
   concatenated via an `interp` opcode), and the full stdlib of builtins (`print`/`len`/
   `str`/`range`/`push`/`keys`/…/`sort`/`split`/`join`/`find`/`replace`/`trim`/`abs`/
-  `min`/`max`/…) — everything except the signal builtins `connect`/`emit`. Optionals
+  `min`/`max`/…) — including the higher-order `map`/`filter`/`reduce`, whose callbacks
+  run via a **re-entrant** `execFrames(stop_at)` (a builtin pushes the callback frame
+  and runs just that call to completion) — everything except the signal builtins
+  `connect`/`emit`. Optionals
   (`?T`/`nil`) need no special runtime support and already work. `match` on
   literal/`_`/binding patterns compiles too (the subject lives in a slot found via a
   compile-time stack pointer, `FnState.stack_top`). Enums compile too: the enum name

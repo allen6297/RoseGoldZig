@@ -1505,11 +1505,12 @@ const Analyzer = struct {
         // print/echo/emit are variadic; everything else has a fixed arity.
         if (eq(u8, name, "print") or eq(u8, name, "echo") or eq(u8, name, "emit")) return .unknown;
 
-        const three = eq(u8, name, "replace");
+        const three = eq(u8, name, "replace") or eq(u8, name, "reduce");
         const two = eq(u8, name, "push") or eq(u8, name, "has") or eq(u8, name, "connect") or
             eq(u8, name, "min") or eq(u8, name, "max") or eq(u8, name, "split") or
             eq(u8, name, "join") or eq(u8, name, "contains") or
-            eq(u8, name, "starts_with") or eq(u8, name, "ends_with") or eq(u8, name, "find");
+            eq(u8, name, "starts_with") or eq(u8, name, "ends_with") or eq(u8, name, "find") or
+            eq(u8, name, "map") or eq(u8, name, "filter");
         const arity: usize = if (three) 3 else if (two) 2 else 1;
         if (c.args.len != arity) {
             try self.report(c.span, "{s} expects {d} argument(s), got {d}", .{ name, arity, c.args.len });
@@ -1573,6 +1574,27 @@ const Analyzer = struct {
         if (eq(u8, name, "trim") or eq(u8, name, "replace")) return .str;
         if (eq(u8, name, "starts_with") or eq(u8, name, "ends_with")) return .bool;
         if (eq(u8, name, "find")) return .int;
+        // Higher-order list builtins: map -> list<any>, filter -> the same list,
+        // reduce -> the accumulator (initial-value) type.
+        if (eq(u8, name, "map")) {
+            if (args.len >= 1 and !isAnyish(args[0]) and tagOf(args[0]) != .list) {
+                try self.report(parser.exprSpan(c.args[0].*), "map expects a list, got {s}", .{typeName(args[0])});
+            }
+            return self.makeList(.any);
+        }
+        if (eq(u8, name, "filter")) {
+            if (args.len >= 1) {
+                if (tagOf(args[0]) == .list) return args[0];
+                if (!isAnyish(args[0])) {
+                    try self.report(parser.exprSpan(c.args[0].*), "filter expects a list, got {s}", .{typeName(args[0])});
+                }
+            }
+            return .unknown;
+        }
+        if (eq(u8, name, "reduce")) {
+            if (args.len == 3) return args[2];
+            return .unknown;
+        }
         return .unknown;
     }
 
