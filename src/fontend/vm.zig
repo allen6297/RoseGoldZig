@@ -25,10 +25,12 @@ const Error = std.mem.Allocator.Error || error{Compile};
 // --- values ------------------------------------------------------------------
 
 const List = std.ArrayList(Value);
+const MapEntry = struct { key: Value, value: Value };
+const Map = struct { entries: std.ArrayList(MapEntry) = .empty };
 
-const Builtin = enum { print, echo, len, str, int, float, range, push, pop };
+const Builtin = enum { print, echo, len, str, int, float, range, push, pop, keys, values, has };
 
-const builtin_names = [_][]const u8{ "print", "echo", "len", "str", "int", "float", "range", "push", "pop" };
+const builtin_names = [_][]const u8{ "print", "echo", "len", "str", "int", "float", "range", "push", "pop", "keys", "values", "has" };
 
 const Function = struct {
     name: []const u8,
@@ -43,6 +45,7 @@ const Value = union(enum) {
     bool: bool,
     str: []const u8,
     list: *List,
+    map: *Map,
     func: *const Function,
     builtin: Builtin,
 };
@@ -82,6 +85,7 @@ fn valuesEqual(a: Value, b: Value) bool {
         .bool => |x| b == .bool and b.bool == x,
         .str => |x| b == .str and std.mem.eql(u8, x, b.str),
         .list => |x| b == .list and x == b.list,
+        .map => |x| b == .map and x == b.map,
         .func => |x| b == .func and x == b.func,
         .builtin => |x| b == .builtin and x == b.builtin,
     };
@@ -118,10 +122,15 @@ const Op = enum(u8) {
     call, // u8 argc
     ret,
     build_list, // u16 count
+    build_map, // u16 entry count (2*count values popped)
+    make_range, // pop end, start -> list [start, end)
     index_get,
     index_set,
-    len, // list/str length (for `for`)
-    print_top, // debug/unused
+    // Iteration protocol (works over list/map/str), used to compile `for`:
+    iter_len, // pop iterable -> int length
+    iter_single, // (iterable, i) -> the single-binding value (list/str elem, map key)
+    iter_key, // (iterable, i) -> first-of-two (list/str index, map key)
+    iter_val, // (iterable, i) -> second-of-two (list/str elem, map value)
 };
 
 const Chunk = struct {
@@ -387,40 +396,46 @@ const Compiler = struct {
     }
 
     fn forStmt(self: *Compiler, x: Stmt.For) Error!void {
-        if (x.value_binding != null) return self.fail(x.span, "the --vm backend does not support two-variable 'for' yet", .{});
-        // Desugar `for v in iter:` to index iteration over a list, using two
-        // hidden locals for the list and the index.
+        // Index iteration over any iterable via the iter_* opcodes: hidden locals
+        // hold the iterable and the index; the binding(s) are set each round.
         self.scope_depth += 1;
         try self.expr(x.iter.*);
-        const list_slot = self.locals.items.len;
-        try self.locals.append(self.alloc, .{ .name = "$list", .depth = self.scope_depth });
+        const it_slot = self.locals.items.len;
+        try self.locals.append(self.alloc, .{ .name = "$it", .depth = self.scope_depth });
         try self.emitConst(.{ .int = 0 }, x.span);
         const idx_slot = self.locals.items.len;
         try self.locals.append(self.alloc, .{ .name = "$idx", .depth = self.scope_depth });
-        const v_slot = self.locals.items.len;
+        const first_slot = self.locals.items.len;
         try self.locals.append(self.alloc, .{ .name = x.binding, .depth = self.scope_depth });
-        try self.emit(.nil, x.span); // placeholder for the loop var
+        try self.emit(.nil, x.span);
+        var second_slot: usize = 0;
+        if (x.value_binding) |vb| {
+            second_slot = self.locals.items.len;
+            try self.locals.append(self.alloc, .{ .name = vb, .depth = self.scope_depth });
+            try self.emit(.nil, x.span);
+        }
 
         var loop = Loop{ .local_count = self.locals.items.len };
         try self.loops.append(self.alloc, &loop);
         defer _ = self.loops.pop();
 
         const start = self.here();
-        // idx < len(list)
+        // idx < iter_len(it)
         try self.emitLocal(.get_local, idx_slot, x.span);
-        try self.emitLocal(.get_local, list_slot, x.span);
-        try self.emit(.len, x.span);
+        try self.emitLocal(.get_local, it_slot, x.span);
+        try self.emit(.iter_len, x.span);
         try self.emit(.lt, x.span);
         const exit = try self.emitJump(.jump_if_false, x.span);
-        // v = list[idx]
-        try self.emitLocal(.get_local, list_slot, x.span);
-        try self.emitLocal(.get_local, idx_slot, x.span);
-        try self.emit(.index_get, x.span);
-        try self.emitLocal(.set_local, v_slot, x.span);
-        try self.emit(.pop, x.span);
+        // bind the loop variable(s)
+        if (x.value_binding != null) {
+            try self.emitBind(.iter_key, it_slot, idx_slot, first_slot, x.span);
+            try self.emitBind(.iter_val, it_slot, idx_slot, second_slot, x.span);
+        } else {
+            try self.emitBind(.iter_single, it_slot, idx_slot, first_slot, x.span);
+        }
         // body
         try self.block(x.body);
-        // increment (the continue target): idx = idx + 1
+        // increment (the continue target)
         const inc = self.here();
         try self.emitLocal(.get_local, idx_slot, x.span);
         try self.emitConst(.{ .int = 1 }, x.span);
@@ -431,7 +446,16 @@ const Compiler = struct {
         self.patchJump(exit);
         for (loop.breaks.items) |j| self.patchJump(j);
         for (loop.continues.items) |j| self.patchJumpTo(j, inc);
-        try self.endScope(); // pops the loop var, $idx, $list
+        try self.endScope(); // pops the binding(s), $idx, $it
+    }
+
+    /// Emit `dest = <iter_op>(it, idx)`.
+    fn emitBind(self: *Compiler, iter_op: Op, it_slot: usize, idx_slot: usize, dest: usize, span: Span) Error!void {
+        try self.emitLocal(.get_local, it_slot, span);
+        try self.emitLocal(.get_local, idx_slot, span);
+        try self.emit(iter_op, span);
+        try self.emitLocal(.set_local, dest, span);
+        try self.emit(.pop, span);
     }
 
     // --- expressions ---------------------------------------------------------
@@ -480,11 +504,18 @@ const Compiler = struct {
                 try self.emit(.build_list, a.span);
                 try self.emitU16(@intCast(a.elements.len), a.span);
             },
+            .map => |m| {
+                for (m.entries) |entry| {
+                    try self.expr(entry.key.*);
+                    try self.expr(entry.value.*);
+                }
+                try self.emit(.build_map, m.span);
+                try self.emitU16(@intCast(m.entries.len), m.span);
+            },
             .range => |r| {
-                // Build the list [start, end) with a small inline loop is complex
-                // in bytecode; instead call the `range`-like path via ADD isn't
-                // available, so unsupported unless both are simple — reject.
-                return self.fail(r.span, "the --vm backend does not support ranges yet; use range(n)", .{});
+                try self.expr(r.start.*);
+                try self.expr(r.end.*);
+                try self.emit(.make_range, r.span);
             },
             else => return self.fail(parser.exprSpan(e), "the --vm backend does not support this expression yet", .{}),
         }
@@ -795,6 +826,26 @@ const VM = struct {
                     self.stack.shrinkRetainingCapacity(start);
                     try self.push(.{ .list = l });
                 },
+                .build_map => {
+                    const count = self.readU16(frame);
+                    const m = try self.alloc.create(Map);
+                    m.* = .{};
+                    const start = self.stack.items.len - 2 * count;
+                    var i: usize = 0;
+                    while (i < count) : (i += 1) try self.mapSet(m, self.stack.items[start + 2 * i], self.stack.items[start + 2 * i + 1]);
+                    self.stack.shrinkRetainingCapacity(start);
+                    try self.push(.{ .map = m });
+                },
+                .make_range => {
+                    const end = self.pop();
+                    const startv = self.pop();
+                    if (startv != .int or end != .int) return self.fail("range bounds must be integers", .{});
+                    const l = try self.alloc.create(List);
+                    l.* = .empty;
+                    var i = startv.int;
+                    while (i < end.int) : (i += 1) try l.append(self.alloc, .{ .int = i });
+                    try self.push(.{ .list = l });
+                },
                 .index_get => {
                     const key = self.pop();
                     const container = self.pop();
@@ -806,15 +857,16 @@ const VM = struct {
                     const container = self.pop();
                     try self.indexSet(container, key, value);
                 },
-                .len => {
-                    const v = self.pop();
-                    switch (v) {
-                        .list => |l| try self.push(.{ .int = @intCast(l.items.len) }),
-                        .str => |s| try self.push(.{ .int = @intCast(s.len) }),
-                        else => return self.fail("len expects a list or string", .{}),
-                    }
+                .iter_len => {
+                    const it = self.pop();
+                    try self.push(.{ .int = @intCast(try self.iterLen(it)) });
                 },
-                .print_top => {},
+                .iter_single, .iter_key, .iter_val => {
+                    const i = self.pop();
+                    const it = self.pop();
+                    if (i != .int) return self.fail("iteration index must be an int", .{});
+                    try self.push(try self.iterAt(it, @intCast(i.int), op));
+                },
             }
         }
     }
@@ -928,8 +980,21 @@ const VM = struct {
                 return switch (args[0]) {
                     .list => |l| .{ .int = @intCast(l.items.len) },
                     .str => |s| .{ .int = @intCast(s.len) },
-                    else => self.fail("len expects a list or string", .{}),
+                    .map => |m| .{ .int = @intCast(m.entries.items.len) },
+                    else => self.fail("len expects a list, string, or map", .{}),
                 };
+            },
+            .keys, .values => {
+                if (args.len != 1 or args[0] != .map) return self.fail("{s} expects a map", .{@tagName(b)});
+                const l = try self.alloc.create(List);
+                l.* = .empty;
+                for (args[0].map.entries.items) |e| try l.append(self.alloc, if (b == .keys) e.key else e.value);
+                return .{ .list = l };
+            },
+            .has => {
+                if (args.len != 2 or args[0] != .map) return self.fail("has expects a map and a key", .{});
+                for (args[0].map.entries.items) |e| if (valuesEqual(e.key, args[1])) return .{ .bool = true };
+                return .{ .bool = false };
             },
             .str => {
                 if (args.len != 1) return self.fail("str expects 1 argument", .{});
@@ -988,6 +1053,10 @@ const VM = struct {
                 if (key.int < 0 or key.int >= s.len) return self.fail("string index {d} out of range", .{key.int});
                 return .{ .str = s[@intCast(key.int)..][0..1] };
             },
+            .map => |m| {
+                for (m.entries.items) |e| if (valuesEqual(e.key, key)) return e.value;
+                return .nil; // a missing key reads as nil
+            },
             else => return self.fail("cannot index {s}", .{@tagName(container)}),
         }
     }
@@ -999,7 +1068,37 @@ const VM = struct {
                 if (key.int < 0 or key.int >= l.items.len) return self.fail("list index {d} out of range", .{key.int});
                 l.items[@intCast(key.int)] = value;
             },
+            .map => |m| try self.mapSet(m, key, value),
             else => return self.fail("cannot index-assign {s}", .{@tagName(container)}),
+        }
+    }
+
+    fn mapSet(self: *VM, m: *Map, key: Value, value: Value) VMError!void {
+        for (m.entries.items) |*e| {
+            if (valuesEqual(e.key, key)) {
+                e.value = value;
+                return;
+            }
+        }
+        try m.entries.append(self.alloc, .{ .key = key, .value = value });
+    }
+
+    fn iterLen(self: *VM, it: Value) VMError!usize {
+        return switch (it) {
+            .list => |l| l.items.len,
+            .str => |s| s.len,
+            .map => |m| m.entries.items.len,
+            else => self.fail("cannot iterate over {s}", .{@tagName(it)}),
+        };
+    }
+
+    /// The i-th key or value of an iterable, per the requested iterator opcode.
+    fn iterAt(self: *VM, it: Value, i: usize, op: Op) VMError!Value {
+        switch (it) {
+            .list => |l| return if (op == .iter_key) .{ .int = @intCast(i) } else l.items[i],
+            .str => |s| return if (op == .iter_key) .{ .int = @intCast(i) } else .{ .str = s[i..][0..1] },
+            .map => |m| return if (op == .iter_val) m.entries.items[i].value else m.entries.items[i].key,
+            else => return self.fail("cannot iterate over {s}", .{@tagName(it)}),
         }
     }
 
@@ -1021,6 +1120,16 @@ const VM = struct {
                     try self.appendValueTo(buf, item);
                 }
                 try buf.append(self.alloc, ']');
+            },
+            .map => |m| {
+                try buf.append(self.alloc, '{');
+                for (m.entries.items, 0..) |e, i| {
+                    if (i > 0) try buf.appendSlice(self.alloc, ", ");
+                    try self.appendValueTo(buf, e.key);
+                    try buf.appendSlice(self.alloc, ": ");
+                    try self.appendValueTo(buf, e.value);
+                }
+                try buf.append(self.alloc, '}');
             },
             .func, .builtin => try buf.appendSlice(self.alloc, "<function>"),
         }
@@ -1077,6 +1186,25 @@ test "vm: loops, locals, and lists" {
         \\    print(len(xs))
     ;
     try expectVMOutput(src, "10\n7\n");
+}
+
+test "vm: maps, ranges, and generalized for" {
+    const src =
+        \\func main():
+        \\    var total = 0
+        \\    for i in 0..5:
+        \\        total = total + i
+        \\    print("range sum:", total)
+        \\    var m = {"a": 1, "b": 2, "c": 3}
+        \\    m["d"] = m["a"] + 9
+        \\    print("has d?", has(m, "d"), "size", len(m), "d=", m["d"])
+        \\    for k, v in m:
+        \\        total = total + v
+        \\    print("keys:", keys(m), "grand total:", total)
+        \\    for i, x in ["x", "y"]:
+        \\        print(i, x)
+    ;
+    try expectVMOutput(src, "range sum: 10\nhas d? true size 4 d= 10\nkeys: [a, b, c, d] grand total: 26\n0 x\n1 y\n");
 }
 
 test "vm: short-circuit logical operators" {
