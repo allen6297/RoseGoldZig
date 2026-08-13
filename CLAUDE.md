@@ -230,12 +230,13 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   **lambdas with by-reference closures** (Crafting-Interpreters-style upvalues: a
   captured local is shared while open, then closed into the closure when its slot goes
   out of scope — on function return or scope exit; captures chain transitively through
-  nested lambdas), and the full stdlib of builtins (`print`/`len`/`str`/`range`/`push`/
-  `keys`/…/`sort`/`split`/`join`/`find`/`replace`/`trim`/`abs`/`min`/`max`/…) —
-  everything except the signal builtins `connect`/`emit`.
+  nested lambdas), string interpolation (`"a ${expr} b"`, each hole stringified and
+  concatenated via an `interp` opcode), and the full stdlib of builtins (`print`/`len`/
+  `str`/`range`/`push`/`keys`/…/`sort`/`split`/`join`/`find`/`replace`/`trim`/`abs`/
+  `min`/`max`/…) — everything except the signal builtins `connect`/`emit`.
 - **Not yet compiled** (reported as a clear "the --vm backend does not support …"
   diagnostic, so the tree-walker stays the full-featured default): classes/structs/
-  enums, modules, signals, statics, optionals/`match`, and string interpolation.
+  enums, modules, signals, statics, and optionals/`match`.
 
 ### Known gaps / future work
 - A subclass's own **static method** doesn't see an inherited static by bare name

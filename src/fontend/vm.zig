@@ -2,10 +2,10 @@
 //! tree-walking interpreter, reached via `run --vm`. It covers the core of the
 //! language — expressions, control flow, functions (with recursion), locals and
 //! globals, lists/maps/ranges, lambdas with by-reference closures (upvalues),
-//! and the common builtins — enough to run programs like `fib` and list/loop
-//! processing. Constructs it does not compile (classes, modules, signals,
-//! `match`, member access, …) are reported as unsupported, so the tree-walker
-//! remains the full-featured default.
+//! string interpolation, and the common builtins — enough to run programs like
+//! `fib` and list/loop processing. Constructs it does not compile (classes,
+//! modules, signals, `match`, member access, …) are reported as unsupported, so
+//! the tree-walker remains the full-featured default.
 //!
 //! Design: each function compiles to a `Chunk` of opcodes + constants; the VM
 //! runs a `Chunk` over a value stack with a frame stack for calls.
@@ -158,6 +158,7 @@ const Op = enum(u8) {
     ret,
     build_list, // u16 count
     build_map, // u16 entry count (2*count values popped)
+    interp, // u16 part count -> concat the parts as strings
     make_range, // pop end, start -> list [start, end)
     index_get,
     index_set,
@@ -605,6 +606,16 @@ const Compiler = struct {
                 try self.expr(r.end.*);
                 try self.emit(.make_range, r.span);
             },
+            .interpolation => |it| {
+                // Push each part (literal run as a constant, hole as its value),
+                // then concatenate them all — stringified — into one string.
+                for (it.parts) |p| switch (p) {
+                    .literal => |lit| try self.emitConst(.{ .str = try self.unescape(lit) }, it.span),
+                    .expr => |pe| try self.expr(pe.*),
+                };
+                try self.emit(.interp, it.span);
+                try self.emitU16(@intCast(it.parts.len), it.span);
+            },
             .lambda => |lam| try self.compileLambda(lam),
             else => return self.fail(parser.exprSpan(e), "the --vm backend does not support this expression yet", .{}),
         }
@@ -660,6 +671,12 @@ const Compiler = struct {
 
     fn unquote(self: *Compiler, text: []const u8) Error![]const u8 {
         const inner = if (text.len >= 2) text[1 .. text.len - 1] else text;
+        return self.unescape(inner);
+    }
+
+    /// Resolve escape sequences in `inner` (a string body without quotes); used
+    /// for both plain literals and interpolation literal runs.
+    fn unescape(self: *Compiler, inner: []const u8) Error![]const u8 {
         var buf: std.ArrayList(u8) = .empty;
         var i: usize = 0;
         while (i < inner.len) : (i += 1) {
@@ -975,6 +992,14 @@ const VM = struct {
                     while (i < count) : (i += 1) try self.mapSet(m, self.stack.items[start + 2 * i], self.stack.items[start + 2 * i + 1]);
                     self.stack.shrinkRetainingCapacity(start);
                     try self.push(.{ .map = m });
+                },
+                .interp => {
+                    const count = self.readU16(frame);
+                    const start = self.stack.items.len - count;
+                    var buf: std.ArrayList(u8) = .empty;
+                    for (self.stack.items[start..]) |part| try self.appendValueTo(&buf, part);
+                    self.stack.shrinkRetainingCapacity(start);
+                    try self.push(.{ .str = try buf.toOwnedSlice(self.alloc) });
                 },
                 .make_range => {
                     const end = self.pop();
@@ -1478,6 +1503,17 @@ test "vm: stdlib builtins" {
 
 test "vm: short-circuit logical operators" {
     try expectVMOutput("func main():\n    print(true and false, false or true, not false)", "false true true\n");
+}
+
+test "vm: string interpolation" {
+    const src =
+        \\func main():
+        \\    var name = "world"
+        \\    var n = 3
+        \\    print("hi ${name}, ${n} + 1 = ${n + 1}")
+        \\    print("list ${[1, 2]} cost \$${n}")
+    ;
+    try expectVMOutput(src, "hi world, 3 + 1 = 4\nlist [1, 2] cost $3\n");
 }
 
 test "vm: a lambda captures a local by reference" {
