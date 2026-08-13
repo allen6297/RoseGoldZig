@@ -1268,6 +1268,19 @@ const Analyzer = struct {
         try self.report(span, "operator '{s}' cannot be applied to {s} and {s}", .{ opSymbol(op), typeName(lt), typeName(rt) });
     }
 
+    /// Check a call's argument count and types against a parameter list.
+    fn checkArgs(self: *Analyzer, c: Expr.Call, params: []const Type) Error!void {
+        if (c.args.len != params.len) {
+            try self.report(c.span, "expected {d} argument(s), got {d}", .{ params.len, c.args.len });
+        }
+        for (c.args, 0..) |arg, i| {
+            const at = try self.typeOf(arg.*);
+            if (i < params.len and !self.assignable(at, params[i])) {
+                try self.report(parser.exprSpan(arg.*), "argument {d}: cannot pass {s} where {s} is expected", .{ i + 1, typeName(at), typeName(params[i]) });
+            }
+        }
+    }
+
     fn typeCall(self: *Analyzer, c: Expr.Call) Error!Type {
         // Builtins are polymorphic (their result may depend on an argument's
         // element type), so type them specially — but only when the name really
@@ -1280,25 +1293,30 @@ const Analyzer = struct {
         const ct = try self.typeOf(c.callee.*);
         switch (ct) {
             .func => |sig| {
-                if (c.args.len != sig.params.len) {
-                    try self.report(c.span, "expected {d} argument(s), got {d}", .{ sig.params.len, c.args.len });
-                }
-                for (c.args, 0..) |arg, i| {
-                    const at = try self.typeOf(arg.*);
-                    if (i < sig.params.len and !self.assignable(at, sig.params[i])) {
-                        try self.report(parser.exprSpan(arg.*), "argument {d}: cannot pass {s} where {s} is expected", .{ i + 1, typeName(at), typeName(sig.params[i]) });
-                    }
-                }
+                try self.checkArgs(c, sig.params);
                 return sig.ret;
             },
             .any, .unknown => {
                 for (c.args) |arg| _ = try self.typeOf(arg.*);
                 return .unknown;
             },
-            // Calling a class/struct name constructs an instance of it. Argument
-            // checking against `init` is left lenient for now.
+            // Calling a class/struct name constructs an instance; its arguments
+            // are checked against the type's `init` (or must be empty if none).
             .type_ref => |type_name| {
-                for (c.args) |arg| _ = try self.typeOf(arg.*);
+                const scope = self.user_types.get(type_name);
+                const init_sym: ?Symbol = if (scope) |s| s.symbols.get("init") else null;
+                if (init_sym) |sym| {
+                    if (tagOf(sym.ty) == .func) {
+                        try self.checkArgs(c, sym.ty.func.params);
+                    } else {
+                        for (c.args) |arg| _ = try self.typeOf(arg.*);
+                    }
+                } else {
+                    for (c.args) |arg| _ = try self.typeOf(arg.*);
+                    if (c.args.len != 0) {
+                        try self.report(c.span, "{s} takes no constructor arguments", .{type_name});
+                    }
+                }
                 return .{ .named = type_name };
             },
             else => {
@@ -2532,6 +2550,66 @@ test "a qualified type on a non-module is reported" {
     var analysis = try analyzeSource(testing.allocator, "func main():\n    var p: foo.Bar");
     defer analysis.deinit();
     try expectMessageContains(analysis, "'foo' is not a module");
+}
+
+// constructor arguments
+
+test "construction checks argument count against init" {
+    const src =
+        \\class P:
+        \\    var name: str = ""
+        \\    func init(n: str):
+        \\        name = n
+        \\
+        \\func main():
+        \\    var p: P = P()
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "expected 1 argument(s), got 0");
+}
+
+test "construction checks argument types against init" {
+    const src =
+        \\class P:
+        \\    var n: int = 0
+        \\    func init(x: int):
+        \\        n = x
+        \\
+        \\func main():
+        \\    var p: P = P("hi")
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot pass str where int is expected");
+}
+
+test "a class without init takes no constructor arguments" {
+    const src =
+        \\class P:
+        \\    var x: int = 0
+        \\
+        \\func main():
+        \\    var p: P = P(1, 2)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "P takes no constructor arguments");
+}
+
+test "a correct construction is clean" {
+    const src =
+        \\class P:
+        \\    var n: int = 0
+        \\    func init(x: int):
+        \\        n = x
+        \\
+        \\func main():
+        \\    var p: P = P(5)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
 }
 
 // typed collections

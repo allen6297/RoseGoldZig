@@ -21,7 +21,7 @@ zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
-zig build test                  # run every test (214 as of writing)
+zig build test                  # run every test (218 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -112,7 +112,9 @@ loader, then the analyzer and interpreter over the loaded module set.
   value both fit `?T`; a `?T` must be unwrapped (e.g. narrowed via `if v != nil:`) before
   it's usable as `T`. `?T`-returning functions may fall off the end (yielding `nil`).
 - **Analyzer checks:** undefined names, duplicate declarations, unknown types,
-  init/return/operator/condition/assignment/call type compatibility, member access,
+  init/return/operator/condition/assignment/call type compatibility, construction
+  arguments (count + types against a class's `init`, or none if it has no `init`),
+  member access,
   enum-case validity (`Status.OK`), `match` exhaustiveness + unreachable arms +
   arm-type unification (arms unify to a common type; a `nil` arm makes it optional),
   `extends`/`uses` validity + inheritance-aware assignability, member access
@@ -173,7 +175,7 @@ loader, then the analyzer and interpreter over the loaded module set.
 
 ### Known gaps / future work
 - **Static** members are not inherited (reached only through their declaring type's
-  name) and constructor arguments still aren't checked against `init`.
+  name).
 - Collection **element types are analyzer-only** and not runtime-enforced (values
   stay dynamically typed). Element assignability is covariant (unsound under
   mutation, but matches the lenient design). The element-aware builtins are
