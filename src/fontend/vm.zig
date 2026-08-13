@@ -81,6 +81,12 @@ const Instance = struct {
 /// method with that instance as the receiver (slot 0).
 const BoundMethod = struct { recv: *Instance, func: *const Function };
 
+/// An enum type: its name and the set of member names it declares.
+const RtEnum = struct { name: []const u8, members: std.StringHashMapUnmanaged(void) = .{} };
+
+/// A single enum case, e.g. `Status.OK` — compared by identity (name + member).
+const EnumValue = struct { enum_name: []const u8, member: []const u8 };
+
 const Value = union(enum) {
     nil,
     int: i64,
@@ -93,6 +99,8 @@ const Value = union(enum) {
     builtin: Builtin,
     instance: *Instance,
     bound_method: *BoundMethod,
+    enum_type: *const RtEnum,
+    enum_value: *const EnumValue,
 };
 
 fn isTruthy(v: Value) bool {
@@ -135,6 +143,10 @@ fn valuesEqual(a: Value, b: Value) bool {
         .builtin => |x| b == .builtin and x == b.builtin,
         .instance => |x| b == .instance and x == b.instance,
         .bound_method => |x| b == .bound_method and x == b.bound_method,
+        .enum_type => |x| b == .enum_type and x == b.enum_type,
+        .enum_value => |x| b == .enum_value and
+            std.mem.eql(u8, x.enum_name, b.enum_value.enum_name) and
+            std.mem.eql(u8, x.member, b.enum_value.member),
     };
 }
 
@@ -318,6 +330,7 @@ const Compiler = struct {
     diagnostics: *std.ArrayList(lexer.Diagnostic),
     cur: *FnState = undefined,
     types: std.StringHashMapUnmanaged(*TypeDef) = .{},
+    enums: std.StringHashMapUnmanaged(*RtEnum) = .{},
     /// The type whose method/constructor/field-default is being compiled, so a
     /// bare name can resolve to a field or method of the receiver.
     current_type: ?*TypeDef = null,
@@ -335,13 +348,19 @@ const Compiler = struct {
     fn compileModule(self: *Compiler, module: Module) Error!Program {
         // Reject unsupported top-level constructs early with a clear message.
         for (module.decls) |decl| switch (decl) {
-            .func, .var_decl, .class, .struct_decl => {},
+            .func, .var_decl, .class, .struct_decl, .enum_decl => {},
             else => return self.fail(declSpan(decl), "the --vm backend does not support this construct yet; use the default interpreter", .{}),
         };
 
-        // Register class/struct declarations (names first) so they can reference
-        // each other, then resolve inheritance across the whole set.
+        // Register enum and class/struct declarations (names first) so they can
+        // reference each other, then resolve inheritance across the whole set.
         for (module.decls) |decl| switch (decl) {
+            .enum_decl => |e| {
+                const rt = try self.alloc.create(RtEnum);
+                rt.* = .{ .name = e.name };
+                for (e.members) |m| try rt.members.put(self.alloc, m.name, {});
+                try self.enums.put(self.alloc, e.name, rt);
+            },
             .class => |c| try self.registerType(c.name, c.span, c.members, c.extends, c.uses),
             .struct_decl => |s| try self.registerType(s.name, s.span, s.members, null, &.{}),
             else => {},
@@ -393,6 +412,12 @@ const Compiler = struct {
                     const t = self.types.get(name).?;
                     try self.emitClosure(t.constructor, t.span);
                     try self.defineGlobal(name, t.span);
+                },
+                .enum_decl => |e| {
+                    // The enum name binds to its enum-type value; `Enum.CASE`
+                    // reads a case off it via `get_member`.
+                    try self.emitConst(.{ .enum_type = self.enums.get(e.name).? }, e.span);
+                    try self.defineGlobal(e.name, e.span);
                 },
                 else => {},
             }
@@ -673,7 +698,6 @@ const Compiler = struct {
                 self.cur.locals.items[subj].name = saved;
                 try end_jumps.append(self.alloc, try self.emitJump(.jump, arm.span));
             },
-            .enum_case => return self.fail(arm.span, "the --vm backend does not support enum-case match patterns yet", .{}),
             else => {
                 try self.emitLocal(.get_local, subj, arm.span);
                 try self.patternConst(arm.pattern);
@@ -706,6 +730,11 @@ const Compiler = struct {
             },
             .string_literal => |lit| try self.emitConst(.{ .str = try self.unquote(lit.text) }, lit.span),
             .bool_literal => |b| try self.emit(if (b.value) .true_ else .false_, b.span),
+            .enum_case => |ec| {
+                const ev = try self.alloc.create(EnumValue);
+                ev.* = .{ .enum_name = ec.enum_name, .member = ec.case };
+                try self.emitConst(.{ .enum_value = ev }, ec.span);
+            },
             else => unreachable,
         }
     }
@@ -1419,15 +1448,24 @@ const VM = struct {
                 .get_member => {
                     const name = chunk.constants.items[self.readU16(frame)].str;
                     const obj = self.pop();
-                    if (obj != .instance) return self.fail("cannot access member '{s}' of {s}", .{ name, @tagName(obj) });
-                    const inst = obj.instance;
-                    if (inst.fields.get(name)) |v| {
-                        try self.push(v);
-                    } else if (inst.type.methods.get(name)) |m| {
-                        const bm = try self.alloc.create(BoundMethod);
-                        bm.* = .{ .recv = inst, .func = m };
-                        try self.push(.{ .bound_method = bm });
-                    } else return self.fail("type '{s}' has no member '{s}'", .{ inst.type.name, name });
+                    switch (obj) {
+                        .instance => |inst| {
+                            if (inst.fields.get(name)) |v| {
+                                try self.push(v);
+                            } else if (inst.type.methods.get(name)) |m| {
+                                const bm = try self.alloc.create(BoundMethod);
+                                bm.* = .{ .recv = inst, .func = m };
+                                try self.push(.{ .bound_method = bm });
+                            } else return self.fail("type '{s}' has no member '{s}'", .{ inst.type.name, name });
+                        },
+                        .enum_type => |et| {
+                            if (!et.members.contains(name)) return self.fail("enum '{s}' has no member '{s}'", .{ et.name, name });
+                            const ev = try self.alloc.create(EnumValue);
+                            ev.* = .{ .enum_name = et.name, .member = name };
+                            try self.push(.{ .enum_value = ev });
+                        },
+                        else => return self.fail("cannot access member '{s}' of {s}", .{ name, @tagName(obj) }),
+                    }
                 },
                 .set_field => {
                     const name = chunk.constants.items[self.readU16(frame)].str;
@@ -1858,6 +1896,12 @@ const VM = struct {
                 try buf.append(self.alloc, '}');
             },
             .closure, .builtin, .bound_method => try buf.appendSlice(self.alloc, "<function>"),
+            .enum_type => |et| try buf.appendSlice(self.alloc, et.name),
+            .enum_value => |ev| {
+                try buf.appendSlice(self.alloc, ev.enum_name);
+                try buf.append(self.alloc, '.');
+                try buf.appendSlice(self.alloc, ev.member);
+            },
             .instance => |inst| {
                 try buf.appendSlice(self.alloc, inst.type.name);
                 try buf.appendSlice(self.alloc, " {");
@@ -1996,6 +2040,25 @@ test "vm: match nested mid-expression tracks the subject slot" {
         \\    print(base + match k { 2: 20 _: 0 })
     ;
     try expectVMOutput(src, "100 2 b\n120\n");
+}
+
+test "vm: enums print, compare by identity, and match" {
+    const src =
+        \\enum Status { OK = 200, NOT_FOUND = 404 }
+        \\
+        \\func label(s: Status) -> str:
+        \\    return match s {
+        \\        Status.OK: "ok"
+        \\        Status.NOT_FOUND: "missing"
+        \\    }
+        \\
+        \\func main():
+        \\    var s = Status.OK
+        \\    print(s)
+        \\    print(s == Status.OK, s == Status.NOT_FOUND)
+        \\    print(label(s), label(Status.NOT_FOUND))
+    ;
+    try expectVMOutput(src, "Status.OK\ntrue false\nok missing\n");
 }
 
 test "vm: match on strings and bools" {
