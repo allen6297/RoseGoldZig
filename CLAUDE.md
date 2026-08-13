@@ -22,7 +22,7 @@ zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (257 as of writing)
+zig build test                  # run every test (258 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -164,7 +164,8 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   (`interpreter.builtin_names`, shared with the analyzer): `print`, `echo`, `len`,
   `range`, `str`, `int`, `float`, `push`, `pop`, `keys`, `values`, `has`, `connect`,
   `emit`, and the stdlib `abs`, `min`, `max`, `upper`, `lower`, `split`, `join`,
-  `contains`, `sort`, `reverse`.
+  `contains`, `sort`, `reverse`, `trim`, `starts_with`, `ends_with`, `find`
+  (index of substring/element, `-1` if absent), `replace`.
 
 ### Modules
 - **A module is a `.rg` file.** `import a.b` loads `a/b.rg` **relative to the importing

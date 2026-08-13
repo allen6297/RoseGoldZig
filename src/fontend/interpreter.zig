@@ -60,6 +60,7 @@ const Builtin = enum {
     push,    pop,   keys,    values, has, connect, emit,
     abs,     min,   max,     upper, lower, split, join,
     contains, sort, reverse,
+    trim,    starts_with, ends_with, find, replace,
 };
 
 /// The names bound to each builtin. Shared with the analyzer (see analyzer.zig)
@@ -69,6 +70,7 @@ pub const builtin_names = [_][]const u8{
     "push",     "pop",  "keys",    "values", "has",   "connect", "emit",
     "abs",      "min",  "max",     "upper",  "lower", "split", "join",
     "contains", "sort", "reverse",
+    "trim",     "starts_with", "ends_with", "find", "replace",
 };
 
 /// A field declared on a class/struct, with its default-value expression.
@@ -1343,6 +1345,36 @@ const Interpreter = struct {
                 if (b == .sort) std.mem.sort(Value, l.items, {}, valueLess) else std.mem.reverse(Value, l.items);
                 return .{ .list = l };
             },
+            .trim => {
+                if (args.len != 1 or args[0] != .str) return self.fail(span, "trim expects a string", .{});
+                return .{ .str = std.mem.trim(u8, args[0].str, " \t\r\n") };
+            },
+            .starts_with, .ends_with => {
+                if (args.len != 2 or args[0] != .str or args[1] != .str) return self.fail(span, "{s} expects two strings", .{@tagName(b)});
+                const yes = if (b == .starts_with) std.mem.startsWith(u8, args[0].str, args[1].str) else std.mem.endsWith(u8, args[0].str, args[1].str);
+                return .{ .bool = yes };
+            },
+            .find => {
+                if (args.len != 2) return self.fail(span, "find expects 2 arguments", .{});
+                switch (args[0]) {
+                    .str => |s| {
+                        if (args[1] != .str) return self.fail(span, "find on a string expects a string", .{});
+                        if (std.mem.indexOf(u8, s, args[1].str)) |i| return .{ .int = @intCast(i) };
+                        return .{ .int = -1 };
+                    },
+                    .list => |l| {
+                        for (l.items, 0..) |item, i| if (valuesEqual(item, args[1])) return .{ .int = @intCast(i) };
+                        return .{ .int = -1 };
+                    },
+                    else => return self.fail(span, "find expects a string or list", .{}),
+                }
+            },
+            .replace => {
+                if (args.len != 3 or args[0] != .str or args[1] != .str or args[2] != .str) return self.fail(span, "replace expects three strings", .{});
+                if (args[1].str.len == 0) return .{ .str = args[0].str };
+                const out = try std.mem.replaceOwned(u8, self.arena, args[0].str, args[1].str, args[2].str);
+                return .{ .str = out };
+            },
         }
     }
 
@@ -1859,16 +1891,16 @@ test "nil prints as nil" {
 
 test "an optional-returning function and nil checks" {
     const src =
-        \\func find(n: int) -> ?int:
+        \\func lookup(n: int) -> ?int:
         \\    if n > 0:
         \\        return n
         \\    return nil
         \\
         \\func main():
-        \\    var a = find(5)
+        \\    var a = lookup(5)
         \\    if a != nil:
         \\        print("found", a)
-        \\    var b = find(-1)
+        \\    var b = lookup(-1)
         \\    if b == nil:
         \\        print("none")
     ;
@@ -2380,6 +2412,18 @@ test "instance signals are independent per instance" {
         \\    print(hits)
     ;
     try expectOutput(src, "1\n");
+}
+
+test "string stdlib builtins" {
+    const src =
+        \\func main():
+        \\    var raw = "  hi  "
+        \\    print("[" + trim(raw) + "]")
+        \\    print(starts_with("hello", "he"), ends_with("hello", "lo"))
+        \\    print(find("hello", "ll"), find([10, 20, 30], 20), find("x", "y"))
+        \\    print(replace("a-b-c", "-", "+"))
+    ;
+    try expectOutput(src, "[hi]\ntrue true\n2 1 -1\na+b+c\n");
 }
 
 test "string and collection stdlib builtins" {

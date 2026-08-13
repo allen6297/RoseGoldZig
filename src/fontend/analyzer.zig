@@ -1505,10 +1505,12 @@ const Analyzer = struct {
         // print/echo/emit are variadic; everything else has a fixed arity.
         if (eq(u8, name, "print") or eq(u8, name, "echo") or eq(u8, name, "emit")) return .unknown;
 
+        const three = eq(u8, name, "replace");
         const two = eq(u8, name, "push") or eq(u8, name, "has") or eq(u8, name, "connect") or
             eq(u8, name, "min") or eq(u8, name, "max") or eq(u8, name, "split") or
-            eq(u8, name, "join") or eq(u8, name, "contains");
-        const arity: usize = if (two) 2 else 1;
+            eq(u8, name, "join") or eq(u8, name, "contains") or
+            eq(u8, name, "starts_with") or eq(u8, name, "ends_with") or eq(u8, name, "find");
+        const arity: usize = if (three) 3 else if (two) 2 else 1;
         if (c.args.len != arity) {
             try self.report(c.span, "{s} expects {d} argument(s), got {d}", .{ name, arity, c.args.len });
             // Still infer a plausible result type below (using whatever args exist).
@@ -1568,6 +1570,9 @@ const Analyzer = struct {
             if (args.len == 1 and tagOf(args[0]) == .list) return args[0];
             return .unknown;
         }
+        if (eq(u8, name, "trim") or eq(u8, name, "replace")) return .str;
+        if (eq(u8, name, "starts_with") or eq(u8, name, "ends_with")) return .bool;
+        if (eq(u8, name, "find")) return .int;
         return .unknown;
     }
 
@@ -2121,13 +2126,13 @@ test "an optional cannot be used where the bare type is expected" {
 }
 
 test "an optional-returning function may fall off the end" {
-    var a = try analyzeSource(testing.allocator, "func find() -> ?int:\n    pass");
+    var a = try analyzeSource(testing.allocator, "func lookup() -> ?int:\n    pass");
     defer a.deinit();
     try testing.expectEqual(@as(usize, 0), a.diagnostics.len);
 }
 
 test "a bare return in an optional function is allowed" {
-    var a = try analyzeSource(testing.allocator, "func find(n: int) -> ?int:\n    if n > 0:\n        return n\n    return");
+    var a = try analyzeSource(testing.allocator, "func lookup(n: int) -> ?int:\n    if n > 0:\n        return n\n    return");
     defer a.deinit();
     try testing.expectEqual(@as(usize, 0), a.diagnostics.len);
 }
@@ -3026,6 +3031,11 @@ test "a stdlib builtin's result type is checked" {
     var up = try analyzeSource(testing.allocator, "func main():\n    var n: int = upper(\"x\")");
     defer up.deinit();
     try expectMessageContains(up, "cannot assign str to int");
+
+    // find returns int; misusing it as a str is caught.
+    var fd = try analyzeSource(testing.allocator, "func main():\n    var s: str = find(\"ab\", \"b\")");
+    defer fd.deinit();
+    try expectMessageContains(fd, "cannot assign int to str");
 
     // split yields list<str>, so indexing it and misusing the element is caught.
     var sp = try analyzeSource(testing.allocator, "func main():\n    var n: int = split(\"a,b\", \",\")[0]");
