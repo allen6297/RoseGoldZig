@@ -3,11 +3,12 @@
 //! language — expressions, control flow, functions (with recursion), locals and
 //! globals, lists/maps/ranges, lambdas with by-reference closures (upvalues),
 //! string interpolation, `match`, enums, classes/structs (construction, fields,
-//! methods, single/`uses` inheritance with virtual dispatch, statics), modules
-//! (per-module globals; cross-module funcs/consts/types), and the common builtins
-//! (including the higher-order `map`/`filter`/`reduce`). Constructs it does not
-//! compile (signals, cross-module inheritance) are reported as unsupported, so
-//! the tree-walker remains the full-featured default.
+//! methods, single/`uses` inheritance with virtual dispatch, statics), signals
+//! (`connect`/`emit`), modules (per-module globals; cross-module funcs/consts/
+//! types), and the common builtins (including the higher-order `map`/`filter`/
+//! `reduce`). The one construct it does not compile — cross-module inheritance —
+//! is reported as unsupported, so the tree-walker remains the full-featured
+//! default.
 //!
 //! Design: each function compiles to a `Chunk` of opcodes + constants; the VM
 //! runs a `Chunk` over a value stack with a frame stack for calls.
@@ -36,6 +37,7 @@ const Builtin = enum {
     abs,     min,   max,   upper, lower, split, join,  contains, sort, reverse,
     trim,    starts_with, ends_with, find, replace,
     map,     filter, reduce,
+    connect, emit,
 };
 
 const builtin_names = [_][]const u8{
@@ -43,6 +45,7 @@ const builtin_names = [_][]const u8{
     "abs",   "min",  "max", "upper", "lower", "split", "join", "contains", "sort", "reverse",
     "trim",  "starts_with", "ends_with", "find", "replace",
     "map",   "filter", "reduce",
+    "connect", "emit",
 };
 
 /// A compile-time upvalue descriptor: `is_local` captures local slot `index` of
@@ -82,6 +85,9 @@ const Closure = struct { func: *const Function, upvalues: []*UpvalueObj };
 const RtType = struct {
     name: []const u8,
     field_names: []const []const u8,
+    /// Signal members (own + inherited, base-first); each instance gets its own
+    /// fresh signal per name, stored alongside its fields.
+    signal_names: []const []const u8 = &.{},
     methods: std.StringHashMapUnmanaged(*const Function) = .{},
     /// The synthetic constructor invoked when the type value is called.
     constructor: *const Function = undefined,
@@ -109,6 +115,10 @@ const Instance = struct {
 /// method with that instance as the receiver (slot 0).
 const BoundMethod = struct { recv: *Instance, func: *const Function };
 
+/// A live signal: an ordered list of handlers (any callable) fired on `emit`.
+/// A top-level signal is shared; a class signal is created fresh per instance.
+const Signal = struct { name: []const u8, handlers: std.ArrayList(Value) = .empty };
+
 /// An enum type: its name and the set of member names it declares.
 const RtEnum = struct { name: []const u8, members: std.StringHashMapUnmanaged(void) = .{} };
 
@@ -131,6 +141,7 @@ const Value = union(enum) {
     enum_type: *const RtEnum,
     enum_value: *const EnumValue,
     module: *RtModule,
+    signal: *Signal,
 };
 
 fn isTruthy(v: Value) bool {
@@ -179,6 +190,7 @@ fn valuesEqual(a: Value, b: Value) bool {
             std.mem.eql(u8, x.enum_name, b.enum_value.enum_name) and
             std.mem.eql(u8, x.member, b.enum_value.member),
         .module => |x| b == .module and x == b.module,
+        .signal => |x| b == .signal and x == b.signal,
     };
 }
 
@@ -362,6 +374,9 @@ const TypeDef = struct {
     field_names: std.ArrayList([]const u8) = .empty,
     field_defaults: std.StringHashMapUnmanaged(?*const Expr) = .{},
     fields: std.StringHashMapUnmanaged(void) = .{},
+    /// All signal members, base-first, deduped.
+    signal_names: std.ArrayList([]const u8) = .empty,
+    signals: std.StringHashMapUnmanaged(void) = .{},
     /// All methods (own + inherited), keyed by name; the value's `owner` says
     /// which type's compiled body to use (so overrides resolve correctly).
     methods: std.StringHashMapUnmanaged(MethodEntry) = .{},
@@ -386,7 +401,8 @@ const TypeDef = struct {
         return self.fields.contains(name);
     }
     fn isMember(self: *const TypeDef, name: []const u8) bool {
-        return self.fields.contains(name) or self.methods.contains(name);
+        // Signals live in the instance too, reachable by bare name in a method.
+        return self.fields.contains(name) or self.methods.contains(name) or self.signals.contains(name);
     }
     /// True if `name` is a static member of this type or a base (so a subclass's
     /// static method can reach an inherited static by bare name).
@@ -424,11 +440,9 @@ const Compiler = struct {
     }
 
     fn compileModule(self: *Compiler, module: Module, imports: []const ModuleImport, rtmods: []const *RtModule, is_entry: bool) Error!Program {
-        // Reject unsupported top-level constructs early with a clear message.
-        for (module.decls) |decl| switch (decl) {
-            .import, .func, .var_decl, .class, .struct_decl, .enum_decl => {},
-            else => return self.fail(declSpan(decl), "the --vm backend does not support this construct yet; use the default interpreter", .{}),
-        };
+        // Every top-level declaration kind now compiles; deeper constructs the VM
+        // can't handle (imported bases, unknown class members) are rejected where
+        // they're processed.
 
         // Register enum and class/struct declarations (names first) so they can
         // reference each other, then resolve inheritance across the whole set.
@@ -508,6 +522,14 @@ const Compiler = struct {
                     try self.emitConst(.{ .enum_type = self.enums.get(e.name).? }, e.span);
                     try self.defineGlobal(e.name, e.span);
                 },
+                .signal => |sg| {
+                    // A top-level signal is a single shared value; handlers
+                    // accumulate on it at runtime via `connect`.
+                    const s = try self.alloc.create(Signal);
+                    s.* = .{ .name = sg.name };
+                    try self.emitConst(.{ .signal = s }, sg.span);
+                    try self.defineGlobal(sg.name, sg.span);
+                },
                 else => {},
             }
         }
@@ -564,8 +586,7 @@ const Compiler = struct {
         }
         // Reject members the VM can't compile yet, with a clear message.
         for (members) |m| switch (m) {
-            .var_decl, .func => {},
-            .signal => |s| return self.fail(s.span, "the --vm backend does not support signals", .{}),
+            .var_decl, .func, .signal => {},
             else => return self.fail(declSpan(m), "the --vm backend does not support this class member", .{}),
         };
         const t = try self.alloc.create(TypeDef);
@@ -621,6 +642,11 @@ const Compiler = struct {
                 try t.fields.put(self.alloc, v.name, {});
                 try t.field_names.append(self.alloc, v.name);
                 try t.field_defaults.put(self.alloc, v.name, v.value);
+            },
+            .signal => |sg| {
+                if (methods_pass or t.signals.contains(sg.name)) continue;
+                try t.signals.put(self.alloc, sg.name, {});
+                try t.signal_names.append(self.alloc, sg.name);
             },
             .func => |f| {
                 if (!methods_pass or f.is_static) continue;
@@ -679,7 +705,7 @@ const Compiler = struct {
     /// ancestor chain (used to resolve inherited statics).
     fn buildRtType(self: *Compiler, t: *TypeDef) Error!void {
         const rt = t.rttype;
-        rt.* = .{ .name = t.name, .field_names = t.field_names.items };
+        rt.* = .{ .name = t.name, .field_names = t.field_names.items, .signal_names = t.signal_names.items };
         var it = t.methods.iterator();
         while (it.next()) |e| {
             const owner = e.value_ptr.owner;
@@ -1631,6 +1657,12 @@ const VM = struct {
                     const inst = try self.alloc.create(Instance);
                     inst.* = .{ .type = ty };
                     for (ty.field_names) |fname| try inst.fields.put(self.alloc, fname, .nil);
+                    // Each instance gets its own fresh signals, reached via `inst.name`.
+                    for (ty.signal_names) |sname| {
+                        const sig = try self.alloc.create(Signal);
+                        sig.* = .{ .name = sname };
+                        try inst.fields.put(self.alloc, sname, .{ .signal = sig });
+                    }
                     try self.push(.{ .instance = inst });
                 },
                 .get_member => {
@@ -2066,6 +2098,23 @@ const VM = struct {
                 }
                 return acc;
             },
+            .connect => {
+                if (args.len != 2 or args[0] != .signal) return self.fail("connect expects a signal and a handler", .{});
+                try args[0].signal.handlers.append(self.alloc, args[1]);
+                return .nil;
+            },
+            .emit => {
+                if (args.len < 1 or args[0] != .signal) return self.fail("emit expects a signal", .{});
+                const sig = args[0].signal;
+                // Copy the emit arguments out of the stack: firing a handler runs
+                // `callValueSync`, which may grow (and reallocate) the value stack.
+                const emit_args = try self.alloc.dupe(Value, args[1..]);
+                var i: usize = 0;
+                while (i < sig.handlers.items.len) : (i += 1) {
+                    _ = try self.callValueSync(sig.handlers.items[i], emit_args);
+                }
+                return .nil;
+            },
         }
     }
 
@@ -2161,6 +2210,11 @@ const VM = struct {
             },
             .closure, .builtin, .bound_method => try buf.appendSlice(self.alloc, "<function>"),
             .module => try buf.appendSlice(self.alloc, "<module>"),
+            .signal => |s| {
+                try buf.appendSlice(self.alloc, "<signal ");
+                try buf.appendSlice(self.alloc, s.name);
+                try buf.append(self.alloc, '>');
+            },
             .type => |t| try buf.appendSlice(self.alloc, t.name),
             .enum_type => |et| try buf.appendSlice(self.alloc, et.name),
             .enum_value => |ev| {
@@ -2700,9 +2754,97 @@ test "vm: accessing an unknown member is a runtime error" {
     try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "no member 'missing'") != null);
 }
 
+test "vm: a top-level signal invokes connected handlers in order" {
+    const src =
+        \\signal tick(n)
+        \\
+        \\var log: list<int> = []
+        \\
+        \\func on_tick(n):
+        \\    push(log, n)
+        \\
+        \\func main():
+        \\    connect(tick, on_tick)
+        \\    emit(tick, 1)
+        \\    emit(tick, 2)
+        \\    print(log)
+    ;
+    try expectVMOutput(src, "[1, 2]\n");
+}
+
+test "vm: an instance signal calls a bound-method handler" {
+    // `Button.press` emits its own signal by bare name (from inside a method).
+    const src =
+        \\class Button:
+        \\    signal pressed(label)
+        \\    func press(label):
+        \\        emit(pressed, label)
+        \\
+        \\class Logger:
+        \\    var count: int = 0
+        \\    func on_press(label):
+        \\        count = count + 1
+        \\
+        \\func main():
+        \\    var b = Button()
+        \\    var lg = Logger()
+        \\    connect(b.pressed, lg.on_press)
+        \\    b.press("ok")
+        \\    b.press("go")
+        \\    print(lg.count)
+        \\    print(b.pressed)
+    ;
+    try expectVMOutput(src, "2\n<signal pressed>\n");
+}
+
+test "vm: instance signals are independent per instance" {
+    const src =
+        \\class Button:
+        \\    signal pressed()
+        \\
+        \\var hits: int = 0
+        \\
+        \\func on_press():
+        \\    hits = hits + 1
+        \\
+        \\func main():
+        \\    var a = Button()
+        \\    var b = Button()
+        \\    connect(a.pressed, on_press)
+        \\    emit(a.pressed)
+        \\    emit(b.pressed)
+        \\    print(hits)
+    ;
+    try expectVMOutput(src, "1\n");
+}
+
+test "vm: a lambda works as a signal handler capturing a local" {
+    const src =
+        \\signal ping(msg)
+        \\
+        \\func main():
+        \\    var seen = []
+        \\    connect(ping, func(m): push(seen, m))
+        \\    emit(ping, "a")
+        \\    emit(ping, "b")
+        \\    print(seen)
+    ;
+    try expectVMOutput(src, "[a, b]\n");
+}
+
 test "vm: reports unsupported constructs" {
-    // A top-level signal is not compilable by the VM backend.
-    var result = try runSource(testing.allocator, "signal ping()\n\nfunc main():\n    pass");
+    // Cross-module inheritance (`extends mod.Base`) is not compilable by the VM.
+    const gpa = testing.allocator;
+    var dep = try parser.parse(gpa, "pub class Base:\n    var x: int = 0");
+    defer dep.deinit();
+    var entry = try parser.parse(gpa, "import base\n\nclass Sub extends base.Base:\n    var y: int = 0\n\nfunc main():\n    pass");
+    defer entry.deinit();
+    const imports = [_]ModuleImport{.{ .name = "base", .module_index = 0 }};
+    const modules = [_]ProgramModule{
+        .{ .module = dep.module, .imports = &.{}, .name = "base" },
+        .{ .module = entry.module, .imports = &imports, .name = "main" },
+    };
+    var result = try runProgram(gpa, &modules);
     defer result.deinit();
     try testing.expect(result.diagnostics.len > 0);
     try testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, "does not support") != null);

@@ -23,7 +23,7 @@ zig build run -- run --vm FILE.rg  # execute on the bytecode VM instead
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (291 as of writing)
+zig build test                  # run every test (295 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -245,10 +245,10 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   nested lambdas), string interpolation (`"a ${expr} b"`, each hole stringified and
   concatenated via an `interp` opcode), and the full stdlib of builtins (`print`/`len`/
   `str`/`range`/`push`/`keys`/…/`sort`/`split`/`join`/`find`/`replace`/`trim`/`abs`/
-  `min`/`max`/…) — including the higher-order `map`/`filter`/`reduce`, whose callbacks
-  run via a **re-entrant** `execFrames(stop_at)` (a builtin pushes the callback frame
-  and runs just that call to completion) — everything except the signal builtins
-  `connect`/`emit`. Optionals
+  `min`/`max`/…) — including the higher-order `map`/`filter`/`reduce` and the signal
+  builtins `connect`/`emit`, whose callbacks/handlers run via a **re-entrant**
+  `execFrames(stop_at)` (a builtin pushes the callback frame and runs just that call to
+  completion). Optionals
   (`?T`/`nil`) need no special runtime support and already work. `match` on
   literal/`_`/binding patterns compiles too (the subject lives in a slot found via a
   compile-time stack pointer, `FnState.stack_top`). Enums compile too: the enum name
@@ -266,11 +266,16 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   module even when called across the boundary (like the interpreter's home-module closures).
   `import mod` binds `mod` to a `module` value; `mod.name` reads it via `get_member`; each
   module's script runs in dependency order to populate its globals, and only the entry
-  runs `main`. Cross-module funcs/consts/types/enums all work.
+  runs `main`. Cross-module funcs/consts/types/enums/signals all work.
+- **Signals** compile too: a top-level `signal` is a single shared value bound in the
+  module globals; a class signal is created fresh per instance in `new_instance` (stored
+  alongside fields, inherited base-first via `RtType.signal_names`) and reachable by bare
+  name inside a method (`isMember` includes signals). `connect` appends a handler; `emit`
+  fires them in order through the re-entrant callback path.
 - **Not yet compiled** (reported as a clear "the --vm backend does not support …"
-  diagnostic, so the tree-walker stays the full-featured default): **signals**, and
-  **cross-module inheritance** (`extends`/`uses mod.Base` — the base's field layout /
-  method table isn't resolved across modules at compile time).
+  diagnostic, so the tree-walker stays the full-featured default): only **cross-module
+  inheritance** (`extends`/`uses mod.Base` — the base's field layout / method table isn't
+  resolved across modules at compile time).
 
 ### Known gaps / future work
 - A subclass's own **static method** now sees an inherited static by bare name (both
