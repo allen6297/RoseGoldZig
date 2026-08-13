@@ -647,6 +647,17 @@ const Interpreter = struct {
     }
 
     /// Look up a method on `ti` or any of its ancestors (most-derived wins).
+    /// The statics env that holds `name` — this type's, or an ancestor's — so a
+    /// subclass reaches (and shares) an inherited static through its own name.
+    fn staticsEnvFor(self: *Interpreter, ti: *const TypeInfo, name: []const u8) ?*Env {
+        _ = self;
+        if (ti.statics.vars.contains(name)) return ti.statics;
+        for (ti.ancestors) |a| {
+            if (a.statics.vars.contains(name)) return a.statics;
+        }
+        return null;
+    }
+
     fn findMethod(self: *Interpreter, ti: *const TypeInfo, name: []const u8) ?MethodRef {
         _ = self;
         if (ti.methods.get(name)) |m| return .{ .func = m, .owner = ti };
@@ -986,8 +997,8 @@ const Interpreter = struct {
                         }
                     },
                     .type_ref => |ti| {
-                        if (ti.statics.vars.getPtr(mem.name)) |slot| {
-                            slot.* = value;
+                        if (self.staticsEnvFor(ti, mem.name)) |env| {
+                            env.vars.getPtr(mem.name).?.* = value;
                         } else {
                             return self.fail(mem.span, "type '{s}' has no static field '{s}'", .{ ti.name, mem.name });
                         }
@@ -1513,7 +1524,7 @@ const Interpreter = struct {
                 return self.fail(m.span, "module has no member '{s}'", .{m.name});
             },
             .type_ref => |ti| {
-                if (ti.statics.vars.get(m.name)) |v| return v;
+                if (self.staticsEnvFor(ti, m.name)) |env| return env.vars.get(m.name).?;
                 return self.fail(m.span, "type '{s}' has no static member '{s}'", .{ ti.name, m.name });
             },
             else => return self.fail(m.span, "cannot access a member of {s}", .{@tagName(obj)}),
@@ -2521,6 +2532,26 @@ test "a REPL runtime error is reported and state survives" {
     const o2 = try repl.run(c2.items);
     try testing.expect(o2.runtime_error == null);
     try testing.expectEqualStrings("3\n", o2.output);
+}
+
+test "a subclass reaches and shares inherited statics" {
+    const src =
+        \\class Base:
+        \\    static var n: int = 0
+        \\    static func bump():
+        \\        n += 1
+        \\
+        \\class Sub extends Base:
+        \\    var x: int = 0
+        \\
+        \\func main():
+        \\    Base.bump()
+        \\    Sub.bump()
+        \\    print(Sub.n)
+        \\    Sub.n = 50
+        \\    print(Base.n)
+    ;
+    try expectOutput(src, "2\n50\n");
 }
 
 test "static fields are not instance fields" {

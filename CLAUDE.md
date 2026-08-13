@@ -22,7 +22,7 @@ zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (255 as of writing)
+zig build test                  # run every test (257 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -151,6 +151,8 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   runtime (inherited fields, method override, chained `init`). `static` members live on
   the type (`TypeInfo.statics`): static vars are one shared cell, static methods run with
   no receiver but see the type's statics by bare name; both are reached via `Type.member`.
+  Statics are inherited and shared — a subclass reaches a base's static through its own
+  name (`Sub.count`, the same cell as `Base.count`).
   Enum cases are distinct
   values printing as `Enum.CASE`. A **lambda** evaluates to a closure that captures
   the current environment, module, and receiver/statics, so it resolves outer names
@@ -213,8 +215,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   define callees first, or put mutually-recursive definitions in one entry.
 
 ### Known gaps / future work
-- **Static** members are not inherited (reached only through their declaring type's
-  name).
+- A subclass's own **static method** doesn't see an inherited static by bare name
+  (only via the type name); `static` argument checks against a static method's
+  parameters are the same as any call.
 - Collection **element types are analyzer-only** and not runtime-enforced (values
   stay dynamically typed). Element assignability is covariant (unsound under
   mutation, but matches the lenient design). The element-aware builtins are

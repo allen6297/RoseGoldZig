@@ -988,15 +988,27 @@ const Analyzer = struct {
     /// win), so inherited fields/methods resolve both by `.` and by bare name.
     fn flattenInheritedMembers(self: *Analyzer, class_name: []const u8) Error!void {
         const scope = self.user_types.get(class_name) orelse return;
+        const static_scope = self.static_types.get(class_name);
         const ancestors = self.supertypes.get(class_name) orelse return;
         var it = ancestors.keyIterator();
         while (it.next()) |anc| {
             if (std.mem.eql(u8, anc.*, class_name)) continue; // guard cyclic hierarchies
-            const anc_scope = self.user_types.get(anc.*) orelse continue;
-            var members = anc_scope.symbols.iterator();
-            while (members.next()) |entry| {
-                const gop = try scope.symbols.getOrPut(self.arena, entry.key_ptr.*);
-                if (!gop.found_existing) gop.value_ptr.* = entry.value_ptr.*;
+            if (self.user_types.get(anc.*)) |anc_scope| {
+                var members = anc_scope.symbols.iterator();
+                while (members.next()) |entry| {
+                    const gop = try scope.symbols.getOrPut(self.arena, entry.key_ptr.*);
+                    if (!gop.found_existing) gop.value_ptr.* = entry.value_ptr.*;
+                }
+            }
+            // Static members are inherited too (reachable via the subclass name).
+            if (static_scope) |ss| {
+                if (self.static_types.get(anc.*)) |anc_static| {
+                    var statics = anc_static.symbols.iterator();
+                    while (statics.next()) |entry| {
+                        const gop = try ss.symbols.getOrPut(self.arena, entry.key_ptr.*);
+                        if (!gop.found_existing) gop.value_ptr.* = entry.value_ptr.*;
+                    }
+                }
             }
         }
     }
@@ -3110,6 +3122,22 @@ test "a static method sees static members by bare name" {
     var analysis = try analyzeSource(testing.allocator, src);
     defer analysis.deinit();
     try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "an inherited static is reachable via the subclass and typed" {
+    const src =
+        \\class Base:
+        \\    static var n: int = 0
+        \\
+        \\class Sub extends Base:
+        \\    var x: int = 0
+        \\
+        \\func main():
+        \\    var s: str = Sub.n
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try expectMessageContains(a, "cannot assign int to str");
 }
 
 test "an instance method cannot reach statics by bare name" {
