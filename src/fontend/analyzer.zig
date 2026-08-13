@@ -1700,6 +1700,51 @@ fn expectMessageContains(analysis: Analysis, needle: []const u8) !void {
     try testing.expect(std.mem.indexOf(u8, analysis.diagnostics[0].message, needle) != null);
 }
 
+// A batch of adversarial/malformed inputs; the front end must produce
+// diagnostics rather than crash. (Complements the fuzz harness below, which
+// only smoke-runs unless invoked with `--fuzz`.)
+test "the front end survives adversarial inputs without crashing" {
+    const gpa = testing.allocator;
+    const inputs = [_][]const u8{
+        "",                    "\x00",             "func",              "func(",
+        "\"unterminated",      "${",               "match x {",         "class",
+        "for , in x:",         "0..",              "..",                "[[[",
+        "}}}",                 "1.2.3",            "func f(:",          "return return",
+        "\"a ${b",             "enum E {",         ">>>>",              "and or not",
+        "if:",                 "var x: mod.",      "func():\n\t x",     "\\\\\\",
+        "class A extends .B:", "x += += 1",        "\"${\"nested\"}\"", "for i, in xs:",
+    };
+    for (inputs) |src| {
+        var tree = parser.parse(gpa, src) catch continue;
+        defer tree.deinit();
+        if (tree.diagnostics.len == 0) {
+            var a = analyze(gpa, tree.module) catch continue;
+            a.deinit();
+        }
+    }
+    // Reaching here (no panic/segfault) is the assertion.
+}
+
+// Fuzz the whole front end (lexer + parser + analyzer): arbitrary bytes must
+// never crash it — only ever produce diagnostics. Run with `zig build test
+// --fuzz`; without it, this executes once as a smoke test.
+test "fuzz: the front end never crashes on arbitrary input" {
+    try std.testing.fuzz({}, fuzzFrontend, .{});
+}
+
+fn fuzzFrontend(_: void, smith: *std.testing.Smith) !void {
+    const gpa = std.testing.allocator;
+    var buf: [512]u8 = undefined;
+    const n: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    smith.bytes(buf[0..n]);
+    var tree = parser.parse(gpa, buf[0..n]) catch return;
+    defer tree.deinit();
+    if (tree.diagnostics.len == 0) {
+        var analysis = analyze(gpa, tree.module) catch return;
+        analysis.deinit();
+    }
+}
+
 // name resolution
 
 test "a well-formed program has no diagnostics" {

@@ -339,12 +339,32 @@ const Error = std.mem.Allocator.Error || error{ParseError};
 
 // --- parser ------------------------------------------------------------------
 
+/// Bound on how deeply expressions/blocks may nest, so pathological input
+/// (e.g. thousands of nested parens) is rejected instead of overflowing the
+/// recursive-descent stack.
+const max_nesting = 300;
+
 const Parser = struct {
     alloc: std.mem.Allocator,
     tokens: []const Token,
     src: []const u8,
     pos: usize = 0,
     diagnostics: *std.ArrayList(Diagnostic),
+    /// Current recursion depth (expressions + statement blocks).
+    depth: u32 = 0,
+
+    /// Enter a nesting level, failing if it is too deep. Pair with `leave`.
+    fn enter(self: *Parser) Error!void {
+        self.depth += 1;
+        if (self.depth > max_nesting) {
+            try self.err("nested too deeply");
+            return error.ParseError;
+        }
+    }
+
+    fn leave(self: *Parser) void {
+        self.depth -= 1;
+    }
 
     fn peek(self: *Parser) Token {
         return self.tokens[self.pos];
@@ -742,6 +762,8 @@ const Parser = struct {
 
     /// Parse an indented statement block, assuming the opening `:` is consumed.
     fn parseIndentedStmts(self: *Parser) Error![]const Stmt {
+        try self.enter();
+        defer self.leave();
         self.skipNewlines();
         _ = try self.expect(.indent, "expected an indented block");
         var stmts: std.ArrayList(Stmt) = .empty;
@@ -889,6 +911,8 @@ const Parser = struct {
     // --- expressions ---------------------------------------------------------
 
     fn parseExpr(self: *Parser) Error!*Expr {
+        try self.enter();
+        defer self.leave();
         const left = try self.parseOr();
         // A range `start..end` (lowest precedence, non-chaining).
         if (self.eat(.dot_dot)) {
@@ -1354,6 +1378,20 @@ test "parses generic collection type arguments" {
     try testing.expectEqualStrings("list", ty.args[1].name);
     try testing.expectEqual(@as(usize, 1), ty.args[1].args.len);
     try testing.expectEqualStrings("int", ty.args[1].args[0].name);
+}
+
+test "deeply nested expressions are rejected instead of overflowing" {
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "var x = ");
+    for (0..5000) |_| try buf.append(gpa, '(');
+    try buf.append(gpa, '1');
+    for (0..5000) |_| try buf.append(gpa, ')');
+    var tree = try parse(gpa, buf.items);
+    defer tree.deinit();
+    try testing.expect(tree.diagnostics.len > 0);
+    try testing.expect(std.mem.indexOf(u8, tree.diagnostics[0].message, "nested too deeply") != null);
 }
 
 test "parses an interpolated string into literal and expression parts" {

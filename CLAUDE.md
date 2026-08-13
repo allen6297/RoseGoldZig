@@ -22,7 +22,7 @@ zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (251 as of writing)
+zig build test                  # run every test (255 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -84,6 +84,13 @@ drives the loader, then the analyzer and interpreter over the loaded module set
 - **Panic-mode recovery.** The parser reports a diagnostic and `synchronize()`s to the
   next statement/decl boundary (with guaranteed forward progress) so one bad construct
   doesn't abort the parse.
+- **Recursion guards.** The recursive-descent parser bounds nesting (`max_nesting`,
+  in `parseExpr`/`parseIndentedStmts`) and the tree-walking interpreter bounds call
+  depth (`max_call_depth`), so pathological nesting or runaway recursion becomes a
+  diagnostic / runtime error instead of a native stack overflow. A fuzz harness and
+  an adversarial-input batch (both in `analyzer.zig`) guard the front end against
+  crashes on malformed input; `--fuzz` mode is currently blocked by a Zig 0.16
+  test-runner bug, so the harness runs as a smoke test.
 - **Tests** live at the bottom of each file (`test "..." { ... }`) and are aggregated by
   `tests.zig`. Interpreter tests assert on captured `output`; analyzer tests assert on
   diagnostic messages/counts. Add tests in the same file as the code.

@@ -43,6 +43,11 @@ const Error = std.mem.Allocator.Error || error{Runtime};
 
 const zero_span: Span = .{ .start = 0, .end = 0, .line = 0, .col = 0 };
 
+/// Maximum interpreter call-stack depth before a runtime error is raised. Each
+/// language call spans several deep native frames, so this is kept well below
+/// the native stack limit (calibrated so runaway recursion faults gracefully).
+const max_call_depth = 700;
+
 // --- values ------------------------------------------------------------------
 
 const List = std.ArrayList(Value);
@@ -393,6 +398,9 @@ const Interpreter = struct {
     current_statics: ?*Env = null,
     /// Every class/struct by name, so supertypes can be resolved.
     types: std.StringHashMapUnmanaged(*TypeInfo) = .{},
+    /// Current call-stack depth, so runaway recursion becomes a runtime error
+    /// instead of a native stack overflow.
+    call_depth: u32 = 0,
 
     fn fail(self: *Interpreter, span: Span, comptime fmt: []const u8, args: anytype) Error {
         self.runtime_error = .{
@@ -656,6 +664,9 @@ const Interpreter = struct {
     }
 
     fn construct(self: *Interpreter, ti: *const TypeInfo, args: []const Value, span: Span) Error!Value {
+        self.call_depth += 1;
+        defer self.call_depth -= 1;
+        if (self.call_depth > max_call_depth) return self.fail(span, "call stack overflow (too much recursion)", .{});
         const inst = try self.arena.create(Instance);
         inst.* = .{ .info = ti };
 
@@ -1019,6 +1030,9 @@ const Interpreter = struct {
     // --- calls ---------------------------------------------------------------
 
     fn callFunction(self: *Interpreter, fv: *const FuncValue, args: []const Value, span: Span) Error!Value {
+        self.call_depth += 1;
+        defer self.call_depth -= 1;
+        if (self.call_depth > max_call_depth) return self.fail(span, "call stack overflow (too much recursion)", .{});
         const func = fv.decl;
         if (args.len != func.params.len) {
             return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
@@ -1054,6 +1068,9 @@ const Interpreter = struct {
     /// scope (and the captured module/receiver/statics restored), so it still
     /// resolves the outer names it closed over.
     fn callClosure(self: *Interpreter, cl: *const Closure, args: []const Value, span: Span) Error!Value {
+        self.call_depth += 1;
+        defer self.call_depth -= 1;
+        if (self.call_depth > max_call_depth) return self.fail(span, "call stack overflow (too much recursion)", .{});
         const params = cl.lambda.params;
         if (args.len != params.len) {
             return self.fail(span, "lambda expects {d} argument(s), got {d}", .{ params.len, args.len });
@@ -1083,6 +1100,9 @@ const Interpreter = struct {
     }
 
     fn callMethod(self: *Interpreter, func: *const Decl.Func, owner: *const TypeInfo, receiver: *Instance, args: []const Value, span: Span) Error!Value {
+        self.call_depth += 1;
+        defer self.call_depth -= 1;
+        if (self.call_depth > max_call_depth) return self.fail(span, "call stack overflow (too much recursion)", .{});
         if (args.len != func.params.len) {
             return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
         }
@@ -1115,6 +1135,9 @@ const Interpreter = struct {
     /// Call a `static` method: no receiver, the type's statics in scope, running
     /// in the type's module.
     fn callStaticMethod(self: *Interpreter, sm: *const StaticMethod, args: []const Value, span: Span) Error!Value {
+        self.call_depth += 1;
+        defer self.call_depth -= 1;
+        if (self.call_depth > max_call_depth) return self.fail(span, "call stack overflow (too much recursion)", .{});
         const func = sm.func;
         if (args.len != func.params.len) {
             return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
@@ -2359,6 +2382,20 @@ test "string and collection stdlib builtins" {
         \\    print(abs(-5), min(3, 7), max(3, 7))
     ;
     try expectOutput(src, "HI bye\n[a, b, c]\nx-y-z\ntrue true\n[1, 2, 3] [3, 2, 1]\n5 3 7\n");
+}
+
+test "runaway recursion is a runtime error, not a crash" {
+    const src =
+        \\func f(n):
+        \\    return f(n) + 1
+        \\
+        \\func main():
+        \\    print(f(1))
+    ;
+    var result = try runSource(testing.allocator, src);
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "call stack overflow") != null);
 }
 
 test "range loops and index/value iteration" {
