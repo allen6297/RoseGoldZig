@@ -21,8 +21,8 @@ zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
-zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style) to stdout
-zig build test                  # run every test (250 as of writing)
+zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
+zig build test                  # run every test (251 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -34,8 +34,9 @@ The CLI (`run`/`check`/`repl`/`fmt`, default `run` with a file / `repl` without)
 prints program output to **stdout** and renders diagnostics (with a source line +
 caret) to **stderr**, exiting non-zero on any error. `repl` starts an interactive
 read-eval-print loop whose definitions and values persist across entries. `fmt`
-re-prints a file in canonical style to stdout (it walks the AST, so comments are
-not preserved — hence stdout, never in-place).
+re-prints a file in canonical style (to stdout, or in place with `-w`); it walks
+the AST but the lexer keeps `##` line comments, which the formatter re-emits by
+line (block comments and original blank lines are not preserved).
 
 ## Layout
 
@@ -49,7 +50,7 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/fontend/loader.zig` | Module loader: reads + parses the entry file and its transitive imports into a dependency-ordered `Graph`; path resolution, dedup, cycle detection. |
 | `src/fontend/analyzer.zig` | Combined name resolution + type checking over the AST. |
 | `src/fontend/interpreter.zig` | Tree-walking evaluator. |
-| `src/fontend/formatter.zig` | Canonical source printer (AST → formatted text) behind `fmt`; comments not preserved. |
+| `src/fontend/formatter.zig` | Canonical source printer (AST → formatted text) behind `fmt`; re-emits `##` line comments by line. |
 | `src/fontend/tests.zig` | Test aggregator; the `zig build test` frontend target roots here. |
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
 | `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. |

@@ -327,6 +327,8 @@ pub const Tree = struct {
     arena: std.heap.ArenaAllocator,
     module: Module,
     diagnostics: []const Diagnostic,
+    /// `##` line comments, in source order, for the formatter.
+    comments: []const lexer.Comment,
 
     pub fn deinit(self: *Tree) void {
         self.arena.deinit();
@@ -1206,8 +1208,9 @@ pub fn parse(gpa: std.mem.Allocator, src: []const u8) Error!Tree {
     };
     const module = try parser.parseModule();
     const diags = try diagnostics.toOwnedSlice(alloc);
+    const comments = try alloc.dupe(lexer.Comment, lex.comments.items);
 
-    return .{ .arena = arena, .module = module, .diagnostics = diags };
+    return .{ .arena = arena, .module = module, .diagnostics = diags, .comments = comments };
 }
 
 // --- REPL parsing ------------------------------------------------------------

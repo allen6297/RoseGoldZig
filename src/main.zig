@@ -21,7 +21,7 @@ const usage =
     \\  run     parse, analyze, and execute the program (the default)
     \\  check   parse and analyze only, then report any problems
     \\  repl    start an interactive session (also the default with no file)
-    \\  fmt     print the file re-formatted in canonical style (to stdout)
+    \\  fmt     re-format the file in canonical style (stdout; `-w` rewrites it)
     \\
 ;
 
@@ -62,13 +62,19 @@ fn handle(
         return repl(arena, io, out, err);
     }
 
-    // `fmt <file>`: re-print the file in canonical style.
+    // `fmt [-w] <file>`: re-print the file in canonical style (or rewrite it).
     if (std.mem.eql(u8, args[1], "fmt")) {
-        if (args.len < 3) {
+        var write = false;
+        var file_index: usize = 2;
+        if (args.len > 2 and (std.mem.eql(u8, args[2], "-w") or std.mem.eql(u8, args[2], "--write"))) {
+            write = true;
+            file_index = 3;
+        }
+        if (file_index >= args.len) {
             try err.writeAll(usage);
             return 1;
         }
-        return fmtCmd(arena, io, out, err, args[2]);
+        return fmtCmd(arena, io, out, err, args[file_index], write);
     }
 
     // Parse arguments: an optional subcommand followed by a file path.
@@ -147,9 +153,9 @@ fn handle(
 
 // --- fmt ---------------------------------------------------------------------
 
-/// Re-print one file in canonical style to stdout. Comments are not preserved
-/// (the AST does not retain them), so this never rewrites the file in place.
-fn fmtCmd(arena: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, path: []const u8) !u8 {
+/// Re-format one file in canonical style. With `write`, rewrite the file in
+/// place; otherwise print to stdout. Line comments are preserved.
+fn fmtCmd(arena: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, path: []const u8, write: bool) !u8 {
     const src = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 << 20)) catch |e| {
         try err.print("error: could not read '{s}': {s}\n", .{ path, @errorName(e) });
         return 1;
@@ -162,7 +168,15 @@ fn fmtCmd(arena: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, pa
         try err.print("{d} error(s)\n", .{tree.diagnostics.len});
         return 1;
     }
-    const formatted = try Formatter.format(arena, tree.module);
+    const formatted = try Formatter.format(arena, tree.module, tree.comments);
+    if (write) {
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = formatted }) catch |e| {
+            try err.print("error: could not write '{s}': {s}\n", .{ path, @errorName(e) });
+            return 1;
+        };
+        if (!std.mem.eql(u8, formatted, src)) try out.print("{s}: formatted\n", .{path});
+        return 0;
+    }
     try out.writeAll(formatted);
     return 0;
 }

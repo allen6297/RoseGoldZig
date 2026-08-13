@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const parser = @import("parser.zig");
+const lexer = @import("lexer.zig");
 
 const Decl = parser.Decl;
 const Stmt = parser.Stmt;
@@ -19,13 +20,43 @@ const BinaryOp = parser.BinaryOp;
 
 const Error = std.mem.Allocator.Error;
 
-/// Format `module` into canonical source. The caller owns the returned bytes.
-pub fn format(gpa: std.mem.Allocator, module: parser.Module) Error![]u8 {
+/// Format `module` into canonical source. `comments` (in source order, from the
+/// parse tree) are re-emitted, interleaved by their original line. The caller
+/// owns the returned bytes.
+pub fn format(gpa: std.mem.Allocator, module: parser.Module, comments: []const lexer.Comment) Error![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
-    var f = Formatter{ .gpa = gpa, .buf = &buf };
+    var f = Formatter{ .gpa = gpa, .buf = &buf, .comments = comments };
     try f.module(module);
+    try f.emitCommentsBefore(std.math.maxInt(u32)); // flush any trailing comments
     return buf.toOwnedSlice(gpa);
+}
+
+fn declLine(d: Decl) u32 {
+    return switch (d) {
+        .import => |x| x.span.line,
+        .var_decl => |x| x.span.line,
+        .func => |x| x.span.line,
+        .class => |x| x.span.line,
+        .struct_decl => |x| x.span.line,
+        .enum_decl => |x| x.span.line,
+        .signal => |x| x.span.line,
+    };
+}
+
+fn stmtLine(s: Stmt) u32 {
+    return switch (s) {
+        .var_decl => |x| x.span.line,
+        .return_stmt => |x| x.span.line,
+        .if_stmt => |x| x.span.line,
+        .while_stmt => |x| x.span.line,
+        .for_stmt => |x| x.span.line,
+        .assign => |x| x.span.line,
+        .expr_stmt => |e| parser.exprSpan(e.*).line,
+        .pass => |sp| sp.line,
+        .break_stmt => |sp| sp.line,
+        .continue_stmt => |sp| sp.line,
+    };
 }
 
 fn binPrec(op: BinaryOp) u8 {
@@ -68,6 +99,18 @@ const Formatter = struct {
     gpa: std.mem.Allocator,
     buf: *std.ArrayList(u8),
     indent: u32 = 0,
+    comments: []const lexer.Comment = &.{},
+    ci: usize = 0,
+
+    /// Emit any pending comments that appear before `line`, at the current
+    /// indent, advancing the cursor.
+    fn emitCommentsBefore(self: *Formatter, line: u32) Error!void {
+        while (self.ci < self.comments.len and self.comments[self.ci].line < line) : (self.ci += 1) {
+            try self.pad();
+            try self.w(self.comments[self.ci].text);
+            try self.nl();
+        }
+    }
 
     fn w(self: *Formatter, s: []const u8) Error!void {
         try self.buf.appendSlice(self.gpa, s);
@@ -92,6 +135,7 @@ const Formatter = struct {
     }
 
     fn decl(self: *Formatter, d: Decl) Error!void {
+        try self.emitCommentsBefore(declLine(d));
         switch (d) {
             .import => |im| {
                 try self.pad();
@@ -239,6 +283,7 @@ const Formatter = struct {
     }
 
     fn stmt(self: *Formatter, s: Stmt) Error!void {
+        try self.emitCommentsBefore(stmtLine(s));
         switch (s) {
             .var_decl => |v| try self.varDecl(v),
             .return_stmt => |r| {
@@ -496,7 +541,7 @@ const testing = std.testing;
 fn fmt(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
     var tree = try parser.parse(gpa, src);
     defer tree.deinit();
-    return format(gpa, tree.module);
+    return format(gpa, tree.module, tree.comments);
 }
 
 test "formats a function canonically" {
@@ -523,6 +568,24 @@ test "formats a class with fields grouped and methods spaced" {
         "    var y: int = 0\n\n" ++
         "    func sum() -> int:\n" ++
         "        return x + y\n";
+    try testing.expectEqualStrings(want, out);
+}
+
+test "line comments are preserved and re-indented" {
+    const gpa = testing.allocator;
+    const src =
+        \\## a header
+        \\func main():
+        \\    ## inside the body
+        \\    print(1)
+    ;
+    const out = try fmt(gpa, src);
+    defer gpa.free(out);
+    const want =
+        "## a header\n" ++
+        "func main():\n" ++
+        "    ## inside the body\n" ++
+        "    print(1)\n";
     try testing.expectEqualStrings(want, out);
 }
 

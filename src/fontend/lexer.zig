@@ -152,13 +152,18 @@ pub const Diagnostic = struct {
     col: u32,
 };
 
+/// A `##` line comment, kept (with its line) so the formatter can reproduce it.
+pub const Comment = struct { text: []const u8, line: u32 };
+
 pub const Result = struct {
     tokens: std.ArrayList(Token),
     diagnostics: std.ArrayList(Diagnostic),
+    comments: std.ArrayList(Comment),
 
     pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
         self.tokens.deinit(gpa);
         self.diagnostics.deinit(gpa);
+        self.comments.deinit(gpa);
     }
 };
 
@@ -189,6 +194,7 @@ pub const Lexer = struct {
 
     tokens: std.ArrayList(Token) = .empty,
     diagnostics: std.ArrayList(Diagnostic) = .empty,
+    comments: std.ArrayList(Comment) = .empty,
 
     fn col(self: *Lexer) u32 {
         return self.pos - self.line_start + 1;
@@ -350,8 +356,12 @@ pub const Lexer = struct {
         });
     }
 
-    fn skipLineComment(self: *Lexer) void {
+    /// Skip a line comment, recording it (with its line) for the formatter.
+    fn skipLineComment(self: *Lexer) !void {
+        const start = self.pos;
+        const line = self.line;
         while (!self.atEnd() and self.peek() != '\n') self.pos += 1;
+        try self.comments.append(self.gpa, .{ .text = self.src[start..self.pos], .line = line });
     }
 
     fn lexNumber(self: *Lexer) !void {
@@ -565,14 +575,14 @@ pub const Lexer = struct {
                         if (self.peekAt(2) == '/') {
                             try self.skipBlockComment();
                         } else {
-                            self.skipLineComment();
+                            try self.skipLineComment();
                         }
                     } else {
                         // A lone '#' is not a comment (comments start with '##').
                         // Flag it once and skip the rest of the line to recover,
                         // treating it as the malformed comment it most likely is.
                         try self.err("unexpected '#'; comments start with '##'");
-                        self.skipLineComment();
+                        try self.skipLineComment();
                     }
                 },
 
@@ -623,7 +633,7 @@ pub const Lexer = struct {
 
         self.indents.deinit(self.gpa);
         self.brackets.deinit(self.gpa);
-        return .{ .tokens = self.tokens, .diagnostics = self.diagnostics };
+        return .{ .tokens = self.tokens, .diagnostics = self.diagnostics, .comments = self.comments };
     }
 };
 
