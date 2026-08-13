@@ -21,7 +21,7 @@ zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
-zig build test                  # run every test (222 as of writing)
+zig build test                  # run every test (225 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -132,9 +132,13 @@ loader, then the analyzer and interpreter over the loaded module set.
   the type (`TypeInfo.statics`): static vars are one shared cell, static methods run with
   no receiver but see the type's statics by bare name; both are reached via `Type.member`.
   Enum cases are distinct
-  values printing as `Enum.CASE`. Builtins (`interpreter.builtin_names`, shared with
-  the analyzer): `print`, `echo`, `len`, `range`, `str`, `int`, `float`, `push`, `pop`,
-  `keys`, `values`, `has`.
+  values printing as `Enum.CASE`. **Signals** are real events: a `signal` is a value
+  holding a handler list — top-level signals are shared globals, a class signal is made
+  fresh per instance (inherited, reached via `inst.name`) — and `connect(sig, handler)`
+  / `emit(sig, args…)` register and fire handlers (any callable). Builtins
+  (`interpreter.builtin_names`, shared with the analyzer): `print`, `echo`, `len`,
+  `range`, `str`, `int`, `float`, `push`, `pop`, `keys`, `values`, `has`, `connect`,
+  `emit`.
 
 ### Modules
 - **A module is a `.rg` file.** `import a.b` loads `a/b.rg` **relative to the importing

@@ -50,12 +50,13 @@ const List = std.ArrayList(Value);
 const MapEntry = struct { key: Value, value: Value };
 const Map = struct { entries: std.ArrayList(MapEntry) = .empty };
 
-const Builtin = enum { print, echo, len, range, str, int, float, push, pop, keys, values, has };
+const Builtin = enum { print, echo, len, range, str, int, float, push, pop, keys, values, has, connect, emit };
 
 /// The names bound to each builtin. Shared with the analyzer (see analyzer.zig)
 /// so a program using them both analyzes and runs.
 pub const builtin_names = [_][]const u8{
-    "print", "echo", "len", "range", "str", "int", "float", "push", "pop", "keys", "values", "has",
+    "print",  "echo", "len", "range",  "str",    "int", "float",
+    "push",   "pop",  "keys", "values", "has",   "connect", "emit",
 };
 
 /// A field declared on a class/struct, with its default-value expression.
@@ -83,6 +84,11 @@ const TypeInfo = struct {
     /// Static `var` members, whose initializers are evaluated once (after the
     /// module's globals exist) into `statics`.
     static_fields: []const FieldDef = &.{},
+    /// Signal members declared directly on this type.
+    own_signals: []const []const u8 = &.{},
+    /// This type's signals plus inherited ones; a fresh signal per name is
+    /// created on each instance.
+    all_signals: []const []const u8 = &.{},
 };
 
 /// A live class/struct instance.
@@ -111,6 +117,14 @@ const EnumType = struct {
 /// A single enum case, e.g. `Status.OK`.
 const EnumValue = struct { type_name: []const u8, member: []const u8 };
 
+/// A live signal: an ordered list of handlers (any callable value) to invoke
+/// when the signal is emitted. Top-level signals are shared; a class signal is
+/// created fresh per instance.
+const Signal = struct {
+    name: []const u8,
+    handlers: std.ArrayList(Value) = .empty,
+};
+
 pub const Value = union(enum) {
     nil,
     int: i64,
@@ -127,6 +141,7 @@ pub const Value = union(enum) {
     type_ref: *const TypeInfo,
     enum_type: *const EnumType,
     enum_value: *const EnumValue,
+    signal: *Signal,
     /// An imported module, reached by its bound name; members are its globals.
     module: *Env,
 };
@@ -177,6 +192,7 @@ fn valuesEqual(a: Value, b: Value) bool {
         .enum_value => |x| b == .enum_value and
             std.mem.eql(u8, x.type_name, b.enum_value.type_name) and
             std.mem.eql(u8, x.member, b.enum_value.member),
+        .signal => |x| b == .signal and x == b.signal,
         .module => |x| b == .module and x == b.module,
     };
 }
@@ -424,6 +440,7 @@ const Interpreter = struct {
         var fields: std.ArrayList(FieldDef) = .empty;
         var methods: std.StringHashMapUnmanaged(*const Decl.Func) = .{};
         var static_fields: std.ArrayList(FieldDef) = .empty;
+        var signals: std.ArrayList([]const u8) = .empty;
         // Partition members: `static` ones belong to the type, the rest to
         // instances. Static methods need the finished `ti`, so they are bound
         // after it is created.
@@ -433,6 +450,7 @@ const Interpreter = struct {
                 try slot.append(self.arena, .{ .name = v.name, .value = v.value });
             },
             .func => |f| if (!f.is_static) try methods.put(self.arena, f.name, &members[j].func),
+            .signal => |sg| try signals.append(self.arena, sg.name),
             else => {},
         };
         var supers: std.ArrayList([]const u8) = .empty;
@@ -453,6 +471,7 @@ const Interpreter = struct {
             .all_fields = own_fields, // recomputed with inheritance in computeInheritance
             .statics = statics,
             .static_fields = try static_fields.toOwnedSlice(self.arena),
+            .own_signals = try signals.toOwnedSlice(self.arena),
         };
 
         // Bind static methods into the statics env, carrying `ti`.
@@ -517,6 +536,23 @@ const Interpreter = struct {
             try all.append(self.arena, f);
         }
         ti.all_fields = try all.toOwnedSlice(self.arena);
+
+        // Signals: same base-first, deduped shape as fields.
+        var all_sig: std.ArrayList([]const u8) = .empty;
+        var seen_s: std.StringHashMapUnmanaged(void) = .{};
+        var k = ti.ancestors.len;
+        while (k > 0) {
+            k -= 1;
+            for (ti.ancestors[k].own_signals) |s| {
+                if ((try seen_s.getOrPut(self.arena, s)).found_existing) continue;
+                try all_sig.append(self.arena, s);
+            }
+        }
+        for (ti.own_signals) |s| {
+            if ((try seen_s.getOrPut(self.arena, s)).found_existing) continue;
+            try all_sig.append(self.arena, s);
+        }
+        ti.all_signals = try all_sig.toOwnedSlice(self.arena);
     }
 
     fn collectAncestors(
@@ -573,6 +609,13 @@ const Interpreter = struct {
         self.current_receiver = saved_recv;
         self.current_statics = saved_statics;
         self.globals = saved_globals;
+
+        // Each instance gets its own signals, reached via `inst.name`.
+        for (ti.all_signals) |sname| {
+            const s = try self.arena.create(Signal);
+            s.* = .{ .name = sname };
+            try inst.fields.put(self.arena, sname, .{ .signal = s });
+        }
 
         // A method named `init` (inherited or own) acts as the constructor.
         if (self.findMethod(ti, "init")) |init_fn| {
@@ -645,6 +688,15 @@ const Interpreter = struct {
             },
             else => {},
         };
+        // Bind top-level signals as shared signal values.
+        for (module.decls) |decl| switch (decl) {
+            .signal => |sg| {
+                const s = try self.arena.create(Signal);
+                s.* = .{ .name = sg.name };
+                try self.define(self.globals, sg.name, .{ .signal = s });
+            },
+            else => {},
+        };
         // Evaluate top-level const/var.
         for (module.decls) |decl| switch (decl) {
             .var_decl => |x| {
@@ -693,7 +745,11 @@ const Interpreter = struct {
                 const val = if (v.value) |x| try self.eval(x.*) else Value.nil;
                 try self.define(self.globals, v.name, val);
             },
-            .signal => {},
+            .signal => |sg| {
+                const s = try self.arena.create(Signal);
+                s.* = .{ .name = sg.name };
+                try self.define(self.globals, sg.name, .{ .signal = s });
+            },
             .import => |im| return self.fail(im.span, "import is not supported in the REPL", .{}),
         }
     }
@@ -1044,6 +1100,20 @@ const Interpreter = struct {
                 }
                 return .{ .bool = false };
             },
+            .connect => {
+                if (args.len != 2 or args[0] != .signal) return self.fail(span, "connect expects a signal and a handler", .{});
+                try args[0].signal.handlers.append(self.arena, args[1]);
+                return .nil;
+            },
+            .emit => {
+                if (args.len < 1 or args[0] != .signal) return self.fail(span, "emit expects a signal", .{});
+                const sig = args[0].signal;
+                // Snapshot the arguments; call each handler in connection order.
+                for (sig.handlers.items) |handler| {
+                    _ = try self.callValue(handler, args[1..], span);
+                }
+                return .nil;
+            },
         }
     }
 
@@ -1162,13 +1232,19 @@ const Interpreter = struct {
         const callee = try self.eval(c.callee.*);
         const args = try self.arena.alloc(Value, c.args.len);
         for (c.args, 0..) |arg, i| args[i] = try self.eval(arg.*);
+        return self.callValue(callee, args, c.span);
+    }
+
+    /// Call any callable value with already-evaluated arguments. Shared by
+    /// `evalCall` and signal emission.
+    fn callValue(self: *Interpreter, callee: Value, args: []const Value, span: Span) Error!Value {
         return switch (callee) {
-            .func => |f| try self.callFunction(f, args, c.span),
-            .builtin => |b| try self.callBuiltin(b, args, c.span),
-            .bound_method => |bm| try self.callMethod(bm.func, bm.receiver, args, c.span),
-            .static_method => |sm| try self.callStaticMethod(sm, args, c.span),
-            .type_ref => |ti| try self.construct(ti, args, c.span),
-            else => self.fail(c.span, "{s} is not callable", .{@tagName(callee)}),
+            .func => |f| try self.callFunction(f, args, span),
+            .builtin => |b| try self.callBuiltin(b, args, span),
+            .bound_method => |bm| try self.callMethod(bm.func, bm.receiver, args, span),
+            .static_method => |sm| try self.callStaticMethod(sm, args, span),
+            .type_ref => |ti| try self.construct(ti, args, span),
+            else => self.fail(span, "{s} is not callable", .{@tagName(callee)}),
         };
     }
 
@@ -1334,6 +1410,11 @@ const Interpreter = struct {
             },
             .func, .builtin, .bound_method, .static_method => try buf.appendSlice(self.arena, "<function>"),
             .module => try buf.appendSlice(self.arena, "<module>"),
+            .signal => |s| {
+                try buf.appendSlice(self.arena, "<signal ");
+                try buf.appendSlice(self.arena, s.name);
+                try buf.append(self.arena, '>');
+            },
             .type_ref => |ti| {
                 try buf.appendSlice(self.arena, "<type ");
                 try buf.appendSlice(self.arena, ti.name);
@@ -1982,6 +2063,66 @@ test "compound assignment on a field via a method" {
         \\    print(c.v)
     ;
     try expectOutput(src, "14\n");
+}
+
+test "a top-level signal invokes connected handlers in order" {
+    const src =
+        \\signal tick(n)
+        \\
+        \\var log: list<int> = []
+        \\
+        \\func on_tick(n):
+        \\    push(log, n)
+        \\
+        \\func main():
+        \\    connect(tick, on_tick)
+        \\    emit(tick, 1)
+        \\    emit(tick, 2)
+        \\    print(log)
+    ;
+    try expectOutput(src, "[1, 2]\n");
+}
+
+test "an instance signal calls a bound-method handler" {
+    const src =
+        \\class Button:
+        \\    signal pressed(label)
+        \\
+        \\class Logger:
+        \\    var count: int = 0
+        \\    func on_press(label):
+        \\        count += 1
+        \\
+        \\func main():
+        \\    var b: Button = Button()
+        \\    var lg: Logger = Logger()
+        \\    connect(b.pressed, lg.on_press)
+        \\    emit(b.pressed, "ok")
+        \\    emit(b.pressed, "go")
+        \\    print(lg.count)
+    ;
+    try expectOutput(src, "2\n");
+}
+
+test "instance signals are independent per instance" {
+    const src =
+        \\class Button:
+        \\    signal pressed()
+        \\
+        \\var hits: int = 0
+        \\
+        \\func on_press():
+        \\    hits += 1
+        \\
+        \\func main():
+        \\    var a: Button = Button()
+        \\    var b: Button = Button()
+        \\    connect(a.pressed, on_press)
+        \\    emit(a.pressed)
+        \\    emit(b.pressed)
+        \\    print(hits)
+    ;
+    try expectOutput(src, "1\n");
 }
 
 test "the REPL keeps state across entries" {

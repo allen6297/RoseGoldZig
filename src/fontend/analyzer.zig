@@ -1335,10 +1335,10 @@ const Analyzer = struct {
         for (c.args, 0..) |arg, i| args[i] = try self.typeOf(arg.*);
 
         const eq = std.mem.eql;
-        // print/echo are variadic; everything else has a fixed arity.
-        if (eq(u8, name, "print") or eq(u8, name, "echo")) return .unknown;
+        // print/echo/emit are variadic; everything else has a fixed arity.
+        if (eq(u8, name, "print") or eq(u8, name, "echo") or eq(u8, name, "emit")) return .unknown;
 
-        const arity: usize = if (eq(u8, name, "push") or eq(u8, name, "has")) 2 else 1;
+        const arity: usize = if (eq(u8, name, "push") or eq(u8, name, "has") or eq(u8, name, "connect")) 2 else 1;
         if (c.args.len != arity) {
             try self.report(c.span, "{s} expects {d} argument(s), got {d}", .{ name, arity, c.args.len });
             // Still infer a plausible result type below (using whatever args exist).
