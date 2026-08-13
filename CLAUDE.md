@@ -21,7 +21,7 @@ zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
-zig build test                  # run every test (225 as of writing)
+zig build test                  # run every test (226 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -173,10 +173,14 @@ loader, then the analyzer and interpreter over the loaded module set.
   statements, so a bare expression like `1 + 1` is a statement whose value is
   printed. Definitions and values persist across entries; the CLI keeps every
   entry's source + parsed chunk alive because function values borrow that AST.
-- **It does not run the analyzer** — entries are parsed and interpreted directly,
-  so mistakes surface as runtime errors (the session survives them), not as
-  `check`-style diagnostics. Reading continues across an indented block (ended by
-  a blank line) or unclosed brackets. `import` is unavailable in the REPL.
+- **Each entry is type-checked before it runs** by a persistent analyzer
+  (`analyzer.ReplChecker` via `replCheckerInit`/`check`) whose scope survives across
+  entries and allows redefinition; on a static error the entry is reported and not
+  executed (a clean re-entry continues). Reading continues across an indented block
+  (ended by a blank line) or unclosed brackets. `import` is unavailable in the REPL.
+- The checker resolves names at **definition time** (unlike the interpreter's
+  call-time binding), so a forward reference to a not-yet-defined name is reported —
+  define callees first, or put mutually-recursive definitions in one entry.
 
 ### Known gaps / future work
 - **Static** members are not inherited (reached only through their declaring type's

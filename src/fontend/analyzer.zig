@@ -355,6 +355,81 @@ pub fn analyzeModule(gpa: std.mem.Allocator, module: Module, imports: []const Mo
     return .{ .arena = arena, .diagnostics = diags, .exports = exports };
 }
 
+// --- REPL checking -----------------------------------------------------------
+
+/// A persistent analyzer for the REPL: its scope, types, and inheritance graph
+/// survive across entries, so each entry is checked against everything defined
+/// before it. Redefinition is allowed. Heap-allocated so the analyzer's
+/// self-references stay valid.
+pub const ReplChecker = struct {
+    arena: std.heap.ArenaAllocator,
+    az: Analyzer,
+    diagnostics: std.ArrayList(Diagnostic),
+
+    pub fn deinit(self: *ReplChecker) void {
+        const gpa = self.arena.child_allocator;
+        self.arena.deinit();
+        gpa.destroy(self);
+    }
+
+    /// Type-check one REPL entry against the persistent scope, returning this
+    /// entry's diagnostics (owned by the checker; valid until the next call).
+    pub fn check(self: *ReplChecker, items: []const parser.ReplItem) Error![]const Diagnostic {
+        self.diagnostics.clearRetainingCapacity();
+        const az = &self.az;
+        az.current = az.module_scope;
+        az.current_ret = null;
+        az.current_class = null;
+        az.loop_depth = 0;
+
+        // Phase 1a: register the entry's declared names.
+        for (items) |item| if (item == .decl) try az.registerTopLevel(item.decl.*);
+        // Phase 1b: function signatures and class/struct/enum member scopes.
+        var class_decls: std.ArrayList(Decl) = .empty;
+        for (items) |item| if (item == .decl) switch (item.decl.*) {
+            .func => |f| {
+                if (az.module_scope.symbols.getPtr(f.name)) |sym| sym.ty = .{ .func = try az.funcSig(f) };
+            },
+            .class => |c| {
+                try az.buildUserType(c.name, c.members);
+                try class_decls.append(az.arena, item.decl.*);
+            },
+            .struct_decl => |s| try az.buildUserType(s.name, s.members),
+            .enum_decl => |en| try az.buildEnumType(en.name, en.members),
+            else => {},
+        };
+        // Inheritance + inherited-member flattening for this entry's classes.
+        try az.buildInheritance(class_decls.items);
+        for (class_decls.items) |d| try az.flattenInheritedMembers(d.class.name);
+        // Phase 2: analyze declaration bodies and statements in source order.
+        for (items) |item| switch (item) {
+            .decl => |d| try az.analyzeDecl(d.*),
+            .stmt => |s| try az.analyzeStmt(s.*),
+        };
+        return self.diagnostics.items;
+    }
+};
+
+pub fn replCheckerInit(gpa: std.mem.Allocator) Error!*ReplChecker {
+    const rc = try gpa.create(ReplChecker);
+    errdefer gpa.destroy(rc);
+    rc.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .az = undefined, .diagnostics = .empty };
+    const alloc = rc.arena.allocator();
+    const module_scope = try alloc.create(Scope);
+    module_scope.* = .{ .parent = null };
+    rc.az = .{
+        .arena = alloc,
+        .diagnostics = &rc.diagnostics,
+        .current = module_scope,
+        .module_scope = module_scope,
+        .allow_redefine = true,
+    };
+    for (interpreter.builtin_names) |name| {
+        try rc.az.declareIn(module_scope, name, .builtin, .any, .{ .start = 0, .end = 0, .line = 0, .col = 0 });
+    }
+    return rc;
+}
+
 // --- analyzer ----------------------------------------------------------------
 
 const Analyzer = struct {
@@ -384,6 +459,9 @@ const Analyzer = struct {
     /// all supertypes, so a subclass is assignable to any of its ancestors.
     direct_supers: std.StringHashMapUnmanaged([]const []const u8) = .{},
     supertypes: std.StringHashMapUnmanaged(*NameSet) = .{},
+    /// When set, re-declaring a name overwrites it instead of reporting a
+    /// duplicate — used by the REPL, where redefinition is normal.
+    allow_redefine: bool = false,
 
     fn report(self: *Analyzer, span: Span, comptime fmt: []const u8, args: anytype) Error!void {
         const msg = try std.fmt.allocPrint(self.arena, fmt, args);
@@ -402,7 +480,7 @@ const Analyzer = struct {
 
     fn declareIn(self: *Analyzer, scope: *Scope, name: []const u8, kind: SymbolKind, ty: Type, span: Span) Error!void {
         const gop = try scope.symbols.getOrPut(self.arena, name);
-        if (gop.found_existing) {
+        if (gop.found_existing and !self.allow_redefine) {
             try self.report(span, "'{s}' is already declared", .{name});
         } else {
             gop.value_ptr.* = .{ .kind = kind, .ty = ty, .span = span };
@@ -602,9 +680,9 @@ const Analyzer = struct {
 
     /// Validate every class's `extends`/`uses` targets and compute the transitive
     /// set of supertypes for each class.
-    fn buildInheritance(self: *Analyzer, module: Module) Error!void {
+    fn buildInheritance(self: *Analyzer, decls: []const Decl) Error!void {
         // Pass 1: validate and record the direct supertypes of each class.
-        for (module.decls) |decl| switch (decl) {
+        for (decls) |decl| switch (decl) {
             .class => |c| {
                 var supers: std.ArrayList([]const u8) = .empty;
                 if (c.extends) |base| {
@@ -626,7 +704,7 @@ const Analyzer = struct {
             else => {},
         };
         // Pass 2: transitive closure over the direct supertypes.
-        for (module.decls) |decl| switch (decl) {
+        for (decls) |decl| switch (decl) {
             .class => |c| {
                 const set = try self.arena.create(NameSet);
                 set.* = .{};
@@ -672,7 +750,7 @@ const Analyzer = struct {
             else => {},
         };
         // Validate extends/uses and compute the class hierarchy.
-        try self.buildInheritance(module);
+        try self.buildInheritance(module.decls);
         // Fold each class's inherited members into its own scope.
         for (module.decls) |decl| switch (decl) {
             .class => |c| try self.flattenInheritedMembers(c.name),
@@ -2610,6 +2688,31 @@ test "a correct construction is clean" {
     var analysis = try analyzeSource(testing.allocator, src);
     defer analysis.deinit();
     try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+// REPL checking
+
+test "the REPL checker checks across entries and allows redefinition" {
+    const gpa = testing.allocator;
+    var rc = try replCheckerInit(gpa);
+    defer rc.deinit();
+
+    // Entry 1: a typed global. Chunks must stay alive (AST is borrowed).
+    var e1 = try parser.parseRepl(gpa, "var x: int = 5");
+    defer e1.deinit();
+    try testing.expectEqual(@as(usize, 0), (try rc.check(e1.items)).len);
+
+    // Entry 2: a type error against the persisted `x`.
+    var e2 = try parser.parseRepl(gpa, "var s: str = x");
+    defer e2.deinit();
+    const d2 = try rc.check(e2.items);
+    try testing.expectEqual(@as(usize, 1), d2.len);
+    try testing.expect(std.mem.indexOf(u8, d2[0].message, "cannot assign int to str") != null);
+
+    // Entry 3: redefining `x` is allowed (no "already declared").
+    var e3 = try parser.parseRepl(gpa, "var x: str = \"hi\"");
+    defer e3.deinit();
+    try testing.expectEqual(@as(usize, 0), (try rc.check(e3.items)).len);
 }
 
 // typed collections

@@ -140,6 +140,7 @@ fn handle(
 /// entries. An entry spanning an indented block or unclosed brackets keeps
 /// reading (a blank line ends an indented block).
 fn repl(arena: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer) !u8 {
+    const checker = try Analyzer.replCheckerInit(arena);
     const session = try Interpreter.replInit(arena);
 
     try out.writeAll("RoseGold REPL. Enter a definition or expression; a blank line ends a block; Ctrl-D exits.\n");
@@ -185,17 +186,27 @@ fn repl(arena: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer) !u8 
         // outlives the reused scratch buffer (function values persist).
         const src = try arena.dupe(u8, entry.items);
         entry.clearRetainingCapacity();
-        try runReplEntry(arena, out, err, session, src);
+        try runReplEntry(arena, out, err, checker, session, src);
     }
     try out.writeAll("\n");
     return 0;
 }
 
-fn runReplEntry(arena: std.mem.Allocator, out: *Io.Writer, err: *Io.Writer, session: *Interpreter.Repl, src: []const u8) !void {
+fn runReplEntry(arena: std.mem.Allocator, out: *Io.Writer, err: *Io.Writer, checker: *Analyzer.ReplChecker, session: *Interpreter.Repl, src: []const u8) !void {
     // Never deinit the chunk: function values borrow its AST for the session.
     const chunk = try Parser.parseRepl(arena, src);
     if (chunk.diagnostics.len > 0) {
         for (chunk.diagnostics) |d| {
+            try render(err, "error", "<repl>", src, d.message, d.line, d.col);
+        }
+        try err.flush();
+        return;
+    }
+    // Type-check the entry; on a static error, report it and don't execute
+    // (like `check`). Redefine the entry cleanly to continue.
+    const diags = try checker.check(chunk.items);
+    if (diags.len > 0) {
+        for (diags) |d| {
             try render(err, "error", "<repl>", src, d.message, d.line, d.col);
         }
         try err.flush();
