@@ -1416,7 +1416,10 @@ const Analyzer = struct {
         // print/echo/emit are variadic; everything else has a fixed arity.
         if (eq(u8, name, "print") or eq(u8, name, "echo") or eq(u8, name, "emit")) return .unknown;
 
-        const arity: usize = if (eq(u8, name, "push") or eq(u8, name, "has") or eq(u8, name, "connect")) 2 else 1;
+        const two = eq(u8, name, "push") or eq(u8, name, "has") or eq(u8, name, "connect") or
+            eq(u8, name, "min") or eq(u8, name, "max") or eq(u8, name, "split") or
+            eq(u8, name, "join") or eq(u8, name, "contains");
+        const arity: usize = if (two) 2 else 1;
         if (c.args.len != arity) {
             try self.report(c.span, "{s} expects {d} argument(s), got {d}", .{ name, arity, c.args.len });
             // Still infer a plausible result type below (using whatever args exist).
@@ -1458,6 +1461,23 @@ const Analyzer = struct {
                 try self.report(parser.exprSpan(c.args[1].*), "cannot look up {s} in {s}", .{ typeName(args[1]), typeName(args[0]) });
             }
             return .bool;
+        }
+        if (eq(u8, name, "upper") or eq(u8, name, "lower")) return .str;
+        if (eq(u8, name, "join")) return .str;
+        if (eq(u8, name, "contains")) return .bool;
+        if (eq(u8, name, "split")) return self.makeList(.str);
+        if (eq(u8, name, "abs")) {
+            if (args.len == 1 and tagOf(args[0]) == .float) return .float;
+            if (args.len == 1 and tagOf(args[0]) == .int) return .int;
+            return .unknown;
+        }
+        if (eq(u8, name, "min") or eq(u8, name, "max")) {
+            if (args.len == 2 and isNumeric(args[0]) and isNumeric(args[1])) return numericResult(args[0], args[1]);
+            return .unknown;
+        }
+        if (eq(u8, name, "sort") or eq(u8, name, "reverse")) {
+            if (args.len == 1 and tagOf(args[0]) == .list) return args[0];
+            return .unknown;
         }
         return .unknown;
     }
@@ -2834,6 +2854,17 @@ test "range produces a list of int" {
     var analysis = try analyzeSource(testing.allocator, src);
     defer analysis.deinit();
     try expectMessageContains(analysis, "cannot assign int to str");
+}
+
+test "a stdlib builtin's result type is checked" {
+    var up = try analyzeSource(testing.allocator, "func main():\n    var n: int = upper(\"x\")");
+    defer up.deinit();
+    try expectMessageContains(up, "cannot assign str to int");
+
+    // split yields list<str>, so indexing it and misusing the element is caught.
+    var sp = try analyzeSource(testing.allocator, "func main():\n    var n: int = split(\"a,b\", \",\")[0]");
+    defer sp.deinit();
+    try expectMessageContains(sp, "cannot assign str to int");
 }
 
 test "a local shadowing a builtin is not treated as the builtin" {

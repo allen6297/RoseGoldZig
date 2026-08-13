@@ -50,13 +50,20 @@ const List = std.ArrayList(Value);
 const MapEntry = struct { key: Value, value: Value };
 const Map = struct { entries: std.ArrayList(MapEntry) = .empty };
 
-const Builtin = enum { print, echo, len, range, str, int, float, push, pop, keys, values, has, connect, emit };
+const Builtin = enum {
+    print,   echo,  len,     range, str,  int,   float,
+    push,    pop,   keys,    values, has, connect, emit,
+    abs,     min,   max,     upper, lower, split, join,
+    contains, sort, reverse,
+};
 
 /// The names bound to each builtin. Shared with the analyzer (see analyzer.zig)
 /// so a program using them both analyzes and runs.
 pub const builtin_names = [_][]const u8{
-    "print",  "echo", "len", "range",  "str",    "int", "float",
-    "push",   "pop",  "keys", "values", "has",   "connect", "emit",
+    "print",    "echo", "len",     "range",  "str",   "int",   "float",
+    "push",     "pop",  "keys",    "values", "has",   "connect", "emit",
+    "abs",      "min",  "max",     "upper",  "lower", "split", "join",
+    "contains", "sort", "reverse",
 };
 
 /// A field declared on a class/struct, with its default-value expression.
@@ -195,6 +202,16 @@ fn valuesEqual(a: Value, b: Value) bool {
         .signal => |x| b == .signal and x == b.signal,
         .module => |x| b == .module and x == b.module,
     };
+}
+
+/// Ordering used by `sort`: numbers ascending, strings lexicographically, other
+/// mixes left as-is (stable).
+fn valueLess(_: void, a: Value, b: Value) bool {
+    if (toFloat(a)) |fa| {
+        if (toFloat(b)) |fb| return fa < fb;
+    }
+    if (a == .str and b == .str) return std.mem.order(u8, a.str, b.str) == .lt;
+    return false;
 }
 
 // --- environment -------------------------------------------------------------
@@ -1113,6 +1130,75 @@ const Interpreter = struct {
                     _ = try self.callValue(handler, args[1..], span);
                 }
                 return .nil;
+            },
+            .abs => {
+                if (args.len != 1) return self.fail(span, "abs expects 1 argument", .{});
+                switch (args[0]) {
+                    .int => |n| return .{ .int = if (n < 0) -n else n },
+                    .float => |f| return .{ .float = @abs(f) },
+                    else => return self.fail(span, "abs expects a number", .{}),
+                }
+            },
+            .min, .max => {
+                if (args.len != 2) return self.fail(span, "{s} expects 2 arguments", .{@tagName(b)});
+                const a0 = toFloat(args[0]) orelse return self.fail(span, "{s} expects numbers", .{@tagName(b)});
+                const a1 = toFloat(args[1]) orelse return self.fail(span, "{s} expects numbers", .{@tagName(b)});
+                const first = if (b == .min) a0 <= a1 else a0 >= a1;
+                return if (first) args[0] else args[1];
+            },
+            .upper, .lower => {
+                if (args.len != 1 or args[0] != .str) return self.fail(span, "{s} expects a string", .{@tagName(b)});
+                const s = args[0].str;
+                const out = try self.arena.alloc(u8, s.len);
+                for (s, 0..) |c, i| out[i] = if (b == .upper) std.ascii.toUpper(c) else std.ascii.toLower(c);
+                return .{ .str = out };
+            },
+            .split => {
+                if (args.len != 2 or args[0] != .str or args[1] != .str) return self.fail(span, "split expects two strings", .{});
+                const s = args[0].str;
+                const sep = args[1].str;
+                const l = try self.arena.create(List);
+                l.* = .empty;
+                if (sep.len == 0) {
+                    var i: usize = 0;
+                    while (i < s.len) : (i += 1) try l.append(self.arena, .{ .str = s[i..][0..1] });
+                } else {
+                    var it = std.mem.splitSequence(u8, s, sep);
+                    while (it.next()) |part| try l.append(self.arena, .{ .str = part });
+                }
+                return .{ .list = l };
+            },
+            .join => {
+                if (args.len != 2 or args[0] != .list or args[1] != .str) return self.fail(span, "join expects a list and a string", .{});
+                const sep = args[1].str;
+                var buf: std.ArrayList(u8) = .empty;
+                for (args[0].list.items, 0..) |item, i| {
+                    if (i > 0) try buf.appendSlice(self.arena, sep);
+                    try self.appendValue(&buf, item);
+                }
+                return .{ .str = try buf.toOwnedSlice(self.arena) };
+            },
+            .contains => {
+                if (args.len != 2) return self.fail(span, "contains expects 2 arguments", .{});
+                switch (args[0]) {
+                    .str => |s| {
+                        if (args[1] != .str) return self.fail(span, "contains on a string expects a string", .{});
+                        return .{ .bool = std.mem.indexOf(u8, s, args[1].str) != null };
+                    },
+                    .list => |l| {
+                        for (l.items) |item| if (valuesEqual(item, args[1])) return .{ .bool = true };
+                        return .{ .bool = false };
+                    },
+                    else => return self.fail(span, "contains expects a string or list", .{}),
+                }
+            },
+            .sort, .reverse => {
+                if (args.len != 1 or args[0] != .list) return self.fail(span, "{s} expects a list", .{@tagName(b)});
+                const l = try self.arena.create(List);
+                l.* = .empty;
+                try l.appendSlice(self.arena, args[0].list.items);
+                if (b == .sort) std.mem.sort(Value, l.items, {}, valueLess) else std.mem.reverse(Value, l.items);
+                return .{ .list = l };
             },
         }
     }
@@ -2123,6 +2209,19 @@ test "instance signals are independent per instance" {
         \\    print(hits)
     ;
     try expectOutput(src, "1\n");
+}
+
+test "string and collection stdlib builtins" {
+    const src =
+        \\func main():
+        \\    print(upper("hi"), lower("BYE"))
+        \\    print(split("a,b,c", ","))
+        \\    print(join(["x", "y", "z"], "-"))
+        \\    print(contains("hello", "ell"), contains([1, 2, 3], 2))
+        \\    print(sort([3, 1, 2]), reverse([1, 2, 3]))
+        \\    print(abs(-5), min(3, 7), max(3, 7))
+    ;
+    try expectOutput(src, "HI bye\n[a, b, c]\nx-y-z\ntrue true\n[1, 2, 3] [3, 2, 1]\n5 3 7\n");
 }
 
 test "the REPL keeps state across entries" {

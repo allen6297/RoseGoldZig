@@ -21,7 +21,7 @@ zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
-zig build test                  # run every test (226 as of writing)
+zig build test                  # run every test (228 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -138,7 +138,8 @@ loader, then the analyzer and interpreter over the loaded module set.
   / `emit(sig, args…)` register and fire handlers (any callable). Builtins
   (`interpreter.builtin_names`, shared with the analyzer): `print`, `echo`, `len`,
   `range`, `str`, `int`, `float`, `push`, `pop`, `keys`, `values`, `has`, `connect`,
-  `emit`.
+  `emit`, and the stdlib `abs`, `min`, `max`, `upper`, `lower`, `split`, `join`,
+  `contains`, `sort`, `reverse`.
 
 ### Modules
 - **A module is a `.rg` file.** `import a.b` loads `a/b.rg` **relative to the importing
