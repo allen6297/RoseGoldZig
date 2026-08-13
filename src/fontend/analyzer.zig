@@ -578,6 +578,18 @@ const Analyzer = struct {
         return false;
     }
 
+    /// Whether a `extends`/`uses` target is valid: a local class, or a `mod.Base`
+    /// that names a type exported by an imported module.
+    fn validSuper(self: *Analyzer, t: TypeRef) bool {
+        if (t.module) |mod_name| {
+            const sym = self.module_scope.symbols.get(mod_name);
+            if (sym == null or sym.?.kind != .import) return false;
+            const exported = self.importExports(mod_name).symbols.get(t.name);
+            return exported != null and isUserType(exported.?.kind);
+        }
+        return self.isClass(t.name);
+    }
+
     /// Whether `sub` is `base` or transitively extends/uses it.
     fn isSubtype(self: *Analyzer, sub: []const u8, base: []const u8) bool {
         if (std.mem.eql(u8, sub, base)) return true;
@@ -686,14 +698,14 @@ const Analyzer = struct {
             .class => |c| {
                 var supers: std.ArrayList([]const u8) = .empty;
                 if (c.extends) |base| {
-                    if (self.isClass(base.name)) {
+                    if (self.validSuper(base)) {
                         try supers.append(self.arena, base.name);
                     } else {
                         try self.report(base.span, "unknown base class '{s}'", .{base.name});
                     }
                 }
                 for (c.uses) |trait| {
-                    if (self.isClass(trait.name)) {
+                    if (self.validSuper(trait)) {
                         try supers.append(self.arena, trait.name);
                     } else {
                         try self.report(trait.span, "unknown trait '{s}'", .{trait.name});
@@ -749,6 +761,9 @@ const Analyzer = struct {
             .enum_decl => |en| try self.buildEnumType(en.name, en.members),
             else => {},
         };
+        // Make imported types' member scopes resolvable before inheritance runs,
+        // so a class may extend an imported base (local types win a name clash).
+        try self.mergeImportedTypes();
         // Validate extends/uses and compute the class hierarchy.
         try self.buildInheritance(module.decls);
         // Fold each class's inherited members into its own scope.
@@ -756,9 +771,6 @@ const Analyzer = struct {
             .class => |c| try self.flattenInheritedMembers(c.name),
             else => {},
         };
-        // Make imported types' member scopes resolvable (so `mod.T` values can be
-        // checked); local types win on a name clash.
-        try self.mergeImportedTypes();
         // Phase 2: analyze bodies.
         for (module.decls) |decl| try self.analyzeDecl(decl);
     }
@@ -2648,6 +2660,38 @@ test "a qualified type on a non-module is reported" {
     var analysis = try analyzeSource(testing.allocator, "func main():\n    var p: foo.Bar");
     defer analysis.deinit();
     try expectMessageContains(analysis, "'foo' is not a module");
+}
+
+test "a subclass of an imported base checks inherited members" {
+    const gpa = testing.allocator;
+    var dep_tree = try parser.parse(gpa, "pub class Shape:\n    var name: str = \"?\"\n\n    func label() -> str:\n        return name");
+    defer dep_tree.deinit();
+    var dep = try analyze(gpa, dep_tree.module);
+    defer dep.deinit();
+    try testing.expectEqual(@as(usize, 0), dep.diagnostics.len);
+
+    const imports = [_]ModuleImport{.{ .name = "shapes", .exports = dep.exports }};
+    // Circle inherits `label()` (str); misusing its result is caught.
+    var imp_tree = try parser.parse(gpa, "import shapes\n\nclass Circle extends shapes.Shape:\n    var r: int = 0\n\nfunc main():\n    var c: Circle = Circle()\n    var n: int = c.label()");
+    defer imp_tree.deinit();
+    var imp = try analyzeModule(gpa, imp_tree.module, &imports);
+    defer imp.deinit();
+    try expectMessageContains(imp, "cannot assign str to int");
+}
+
+test "extending an unexported type is rejected" {
+    const gpa = testing.allocator;
+    var dep_tree = try parser.parse(gpa, "class Hidden:\n    var x: int = 0");
+    defer dep_tree.deinit();
+    var dep = try analyze(gpa, dep_tree.module);
+    defer dep.deinit();
+
+    const imports = [_]ModuleImport{.{ .name = "m", .exports = dep.exports }};
+    var imp_tree = try parser.parse(gpa, "import m\n\nclass Sub extends m.Hidden:\n    var y: int = 0");
+    defer imp_tree.deinit();
+    var imp = try analyzeModule(gpa, imp_tree.module, &imports);
+    defer imp.deinit();
+    try expectMessageContains(imp, "unknown base class 'Hidden'");
 }
 
 // constructor arguments

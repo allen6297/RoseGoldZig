@@ -565,16 +565,13 @@ const Parser = struct {
     fn parseClass(self: *Parser, visibility: Visibility) Error!Decl.Class {
         const kw = try self.expect(.kw_class, "expected 'class'");
         const name = try self.expect(.identifier, "expected a class name");
+        // `extends`/`uses` targets are types, so an imported base `mod.Base` works.
         var extends: ?TypeRef = null;
-        if (self.eat(.kw_extends)) {
-            const base = try self.expect(.identifier, "expected a base class name after 'extends'");
-            extends = .{ .name = base.text, .span = base.span };
-        }
+        if (self.eat(.kw_extends)) extends = try self.parseType();
         var uses: std.ArrayList(TypeRef) = .empty;
         if (self.eat(.kw_uses)) {
             while (true) {
-                const trait = try self.expect(.identifier, "expected a trait name after 'uses'");
-                try uses.append(self.alloc, .{ .name = trait.text, .span = trait.span });
+                try uses.append(self.alloc, try self.parseType());
                 if (!self.eat(.comma)) break;
             }
         }

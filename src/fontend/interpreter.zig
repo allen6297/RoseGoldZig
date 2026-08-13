@@ -80,6 +80,9 @@ const TypeInfo = struct {
     own_fields: []const FieldDef,
     methods: std.StringHashMapUnmanaged(*const Decl.Func) = .{},
     super_names: []const []const u8 = &.{},
+    /// Supertypes imported from another module, already resolved (their own
+    /// ancestors/fields are computed in their home module).
+    imported_supers: []const *const TypeInfo = &.{},
     /// Transitive supertypes, most-derived first (used for method resolution).
     ancestors: []const *const TypeInfo = &.{},
     /// This type's fields plus inherited ones, base classes first (used for
@@ -104,8 +107,12 @@ const Instance = struct {
     fields: std.StringHashMapUnmanaged(Value) = .{},
 };
 
-/// A method paired with the instance it was accessed on.
-const BoundMethod = struct { receiver: *Instance, func: *const Decl.Func };
+/// A method plus the type it is defined on (whose module it runs in).
+const MethodRef = struct { func: *const Decl.Func, owner: *const TypeInfo };
+
+/// A method paired with the instance it was accessed on and the type that
+/// defines it (so an inherited method runs in its base's module).
+const BoundMethod = struct { receiver: *Instance, func: *const Decl.Func, owner: *const TypeInfo };
 
 /// A function value: the declaration plus the globals of the module that
 /// defined it, so calling it resolves names in its home module.
@@ -404,9 +411,9 @@ const Interpreter = struct {
         }
         if (self.current_receiver) |recv| {
             if (recv.fields.get(name)) |v| return v;
-            if (self.findMethod(recv.info, name)) |func| {
+            if (self.findMethod(recv.info, name)) |mr| {
                 const bm = try self.arena.create(BoundMethod);
-                bm.* = .{ .receiver = recv, .func = func };
+                bm.* = .{ .receiver = recv, .func = mr.func, .owner = mr.owner };
                 return .{ .bound_method = bm };
             }
         }
@@ -470,9 +477,13 @@ const Interpreter = struct {
             .signal => |sg| try signals.append(self.arena, sg.name),
             else => {},
         };
+        // A `mod.Base` super is imported: resolve it to its TypeInfo now (its
+        // module is already loaded). A bare super resolves later, by name, in
+        // computeInheritance.
         var supers: std.ArrayList([]const u8) = .empty;
-        if (extends) |b| try supers.append(self.arena, b.name);
-        for (uses) |t| try supers.append(self.arena, t.name);
+        var imported: std.ArrayList(*const TypeInfo) = .empty;
+        if (extends) |b| try self.addSuper(b, &supers, &imported);
+        for (uses) |t| try self.addSuper(t, &supers, &imported);
 
         const statics = try self.arena.create(Env);
         statics.* = .{ .parent = self.globals };
@@ -485,6 +496,7 @@ const Interpreter = struct {
             .own_fields = own_fields,
             .methods = methods,
             .super_names = try supers.toOwnedSlice(self.arena),
+            .imported_supers = try imported.toOwnedSlice(self.arena),
             .all_fields = own_fields, // recomputed with inheritance in computeInheritance
             .statics = statics,
             .static_fields = try static_fields.toOwnedSlice(self.arena),
@@ -572,6 +584,26 @@ const Interpreter = struct {
         ti.all_signals = try all_sig.toOwnedSlice(self.arena);
     }
 
+    /// Record one supertype: a `mod.Base` is resolved to its TypeInfo through the
+    /// imported module's namespace; a bare `Base` is kept as a name for later.
+    fn addSuper(self: *Interpreter, t: parser.TypeRef, supers: *std.ArrayList([]const u8), imported: *std.ArrayList(*const TypeInfo)) Error!void {
+        if (t.module) |mod_name| {
+            if (self.globals.vars.get(mod_name)) |modv| {
+                if (modv == .module) {
+                    if (modv.module.vars.get(t.name)) |bv| {
+                        if (bv == .type_ref) {
+                            try imported.append(self.arena, bv.type_ref);
+                            return;
+                        }
+                    }
+                }
+            }
+            // Unresolved (the analyzer already reported it); ignore.
+        } else {
+            try supers.append(self.arena, t.name);
+        }
+    }
+
     fn collectAncestors(
         self: *Interpreter,
         ti: *const TypeInfo,
@@ -584,14 +616,22 @@ const Interpreter = struct {
             try out.append(self.arena, sup);
             try self.collectAncestors(sup, out, seen);
         }
+        // Imported supers already have their own ancestors computed; splice them
+        // in (self and each ancestor), deduped by name.
+        for (ti.imported_supers) |sup| {
+            if (!(try seen.getOrPut(self.arena, sup.name)).found_existing) try out.append(self.arena, sup);
+            for (sup.ancestors) |a| {
+                if (!(try seen.getOrPut(self.arena, a.name)).found_existing) try out.append(self.arena, a);
+            }
+        }
     }
 
     /// Look up a method on `ti` or any of its ancestors (most-derived wins).
-    fn findMethod(self: *Interpreter, ti: *const TypeInfo, name: []const u8) ?*const Decl.Func {
+    fn findMethod(self: *Interpreter, ti: *const TypeInfo, name: []const u8) ?MethodRef {
         _ = self;
-        if (ti.methods.get(name)) |m| return m;
+        if (ti.methods.get(name)) |m| return .{ .func = m, .owner = ti };
         for (ti.ancestors) |a| {
-            if (a.methods.get(name)) |m| return m;
+            if (a.methods.get(name)) |m| return .{ .func = m, .owner = a };
         }
         return null;
     }
@@ -635,8 +675,8 @@ const Interpreter = struct {
         }
 
         // A method named `init` (inherited or own) acts as the constructor.
-        if (self.findMethod(ti, "init")) |init_fn| {
-            _ = try self.callMethod(init_fn, inst, args, span);
+        if (self.findMethod(ti, "init")) |init_ref| {
+            _ = try self.callMethod(init_ref.func, init_ref.owner, inst, args, span);
         } else if (args.len != 0) {
             return self.fail(span, "{s} takes no constructor arguments", .{ti.name});
         }
@@ -973,14 +1013,14 @@ const Interpreter = struct {
         return if (flow == .returned) self.ret_value else Value.nil;
     }
 
-    fn callMethod(self: *Interpreter, func: *const Decl.Func, receiver: *Instance, args: []const Value, span: Span) Error!Value {
+    fn callMethod(self: *Interpreter, func: *const Decl.Func, owner: *const TypeInfo, receiver: *Instance, args: []const Value, span: Span) Error!Value {
         if (args.len != func.params.len) {
             return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
         }
-        // The method runs in its defining type's module, with the receiver in
-        // scope and no statics.
+        // The method runs in the module of the type that DEFINES it (which may be
+        // an imported base), with the receiver in scope and no statics.
         const saved_globals = self.globals;
-        self.globals = receiver.info.module;
+        self.globals = owner.module;
         const call_env = try self.newEnv(self.globals);
         for (func.params, args) |p, arg| try self.define(call_env, p.name, arg);
 
@@ -1327,7 +1367,7 @@ const Interpreter = struct {
         return switch (callee) {
             .func => |f| try self.callFunction(f, args, span),
             .builtin => |b| try self.callBuiltin(b, args, span),
-            .bound_method => |bm| try self.callMethod(bm.func, bm.receiver, args, span),
+            .bound_method => |bm| try self.callMethod(bm.func, bm.owner, bm.receiver, args, span),
             .static_method => |sm| try self.callStaticMethod(sm, args, span),
             .type_ref => |ti| try self.construct(ti, args, span),
             else => self.fail(span, "{s} is not callable", .{@tagName(callee)}),
@@ -1339,9 +1379,9 @@ const Interpreter = struct {
         switch (obj) {
             .instance => |inst| {
                 if (inst.fields.get(m.name)) |v| return v;
-                if (self.findMethod(inst.info, m.name)) |func| {
+                if (self.findMethod(inst.info, m.name)) |mr| {
                     const bm = try self.arena.create(BoundMethod);
-                    bm.* = .{ .receiver = inst, .func = func };
+                    bm.* = .{ .receiver = inst, .func = mr.func, .owner = mr.owner };
                     return .{ .bound_method = bm };
                 }
                 return self.fail(m.span, "type '{s}' has no member '{s}'", .{ inst.info.name, m.name });
@@ -2327,6 +2367,17 @@ test "an imported type constructs and its methods run in its module" {
         "pub struct Point:\n    var x: int = 0\n    var y: int = 0\n\n    func sum() -> int:\n        return x + y",
         "import shapes\n\nfunc main():\n    var p = shapes.Point()\n    p.x = 3\n    p.y = 4\n    print(p.sum())",
         "7\n",
+    );
+}
+
+test "a class inherits from an imported base" {
+    // The inherited `label()` runs in its base's module, so it resolves `KIND`
+    // there (not in the subclass's module), and reads the inherited `name` field.
+    try expectProgramOutput(
+        "shapes",
+        "pub const KIND: str = \"shape\"\n\npub class Shape:\n    var name: str = \"?\"\n\n    func label() -> str:\n        return name + \" (\" + KIND + \")\"",
+        "import shapes\n\nclass Circle extends shapes.Shape:\n    var radius: int = 0\n\nfunc main():\n    var c: Circle = Circle()\n    c.name = \"circle\"\n    print(c.label())",
+        "circle (shape)\n",
     );
 }
 

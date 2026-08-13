@@ -21,7 +21,7 @@ zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
-zig build test                  # run every test (228 as of writing)
+zig build test                  # run every test (231 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -164,8 +164,14 @@ loader, then the analyzer and interpreter over the loaded module set.
   `mod.T`'s statics) are checked across the boundary — as is a value returned by an
   imported function. (Names clash-resolve to the local type; construction is
   interpreter-only and already worked via `mod.T()`.)
+- **Cross-module inheritance.** A class may `extends`/`uses` a `mod.Base` exported by
+  an imported module. The interpreter resolves the imported base to its `TypeInfo`
+  (its own ancestors/fields already computed) and splices it into the subclass; an
+  inherited method runs in *its base's* module (methods carry their owning type, so
+  a base method still resolves its own module's names). The analyzer folds the base's
+  member scope in for checking. (One level deep; base *field defaults* referencing the
+  base's module-level names aren't resolved cross-module — keep them literal.)
 - **Limits (v1):** imports resolve relative to the importer's dir (no search path);
-  cross-module *inheritance* isn't supported (a class can't `extends` an imported type);
   a runtime error is attributed to the entry file.
 
 ### REPL
@@ -191,5 +197,5 @@ loader, then the analyzer and interpreter over the loaded module set.
   mutation, but matches the lenient design). The element-aware builtins are
   special-cased by name at their call sites rather than being first-class generic
   signatures, so calling one indirectly (`var f = push`) falls back to `any`.
-- Module resolution has no **search path / package roots**, and cross-module
-  *inheritance* isn't supported (see **Modules → Limits**).
+- Module resolution has no **search path / package roots** (see **Modules → Limits**);
+  cross-module inheritance is one level deep.
