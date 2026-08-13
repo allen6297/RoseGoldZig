@@ -13,13 +13,15 @@ const Parser = @import("fontend/parser.zig");
 const Loader = @import("fontend/loader.zig");
 const Analyzer = @import("fontend/analyzer.zig");
 const Interpreter = @import("fontend/interpreter.zig");
+const Formatter = @import("fontend/formatter.zig");
 
 const usage =
-    \\Usage: rosegold [run|check|repl] [<file.rg>]
+    \\Usage: rosegold [run|check|repl|fmt] [<file.rg>]
     \\
     \\  run     parse, analyze, and execute the program (the default)
     \\  check   parse and analyze only, then report any problems
     \\  repl    start an interactive session (also the default with no file)
+    \\  fmt     print the file re-formatted in canonical style (to stdout)
     \\
 ;
 
@@ -58,6 +60,15 @@ fn handle(
     // With no arguments, or an explicit `repl`, start an interactive session.
     if (args.len <= 1 or std.mem.eql(u8, args[1], "repl")) {
         return repl(arena, io, out, err);
+    }
+
+    // `fmt <file>`: re-print the file in canonical style.
+    if (std.mem.eql(u8, args[1], "fmt")) {
+        if (args.len < 3) {
+            try err.writeAll(usage);
+            return 1;
+        }
+        return fmtCmd(arena, io, out, err, args[2]);
     }
 
     // Parse arguments: an optional subcommand followed by a file path.
@@ -131,6 +142,28 @@ fn handle(
         try render(err, "runtime error", entry.path, entry.src, re.message, re.line, re.col);
         return 1;
     }
+    return 0;
+}
+
+// --- fmt ---------------------------------------------------------------------
+
+/// Re-print one file in canonical style to stdout. Comments are not preserved
+/// (the AST does not retain them), so this never rewrites the file in place.
+fn fmtCmd(arena: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, path: []const u8) !u8 {
+    const src = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 << 20)) catch |e| {
+        try err.print("error: could not read '{s}': {s}\n", .{ path, @errorName(e) });
+        return 1;
+    };
+    const tree = try Parser.parse(arena, src);
+    if (tree.diagnostics.len > 0) {
+        for (tree.diagnostics) |d| {
+            try render(err, "error", path, src, d.message, d.line, d.col);
+        }
+        try err.print("{d} error(s)\n", .{tree.diagnostics.len});
+        return 1;
+    }
+    const formatted = try Formatter.format(arena, tree.module);
+    try out.writeAll(formatted);
     return 0;
 }
 

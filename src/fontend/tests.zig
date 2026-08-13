@@ -7,4 +7,5 @@ test {
     _ = @import("analyzer.zig");
     _ = @import("interpreter.zig");
     _ = @import("loader.zig");
+    _ = @import("formatter.zig");
 }
