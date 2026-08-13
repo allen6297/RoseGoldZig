@@ -1256,6 +1256,13 @@ const Analyzer = struct {
             .int_literal => .int,
             .float_literal => .float,
             .string_literal => .str,
+            .interpolation => |x| blk: {
+                for (x.parts) |p| switch (p) {
+                    .expr => |pe| _ = try self.typeOf(pe.*),
+                    .literal => {},
+                };
+                break :blk .str;
+            },
             .bool_literal => .bool,
             .nil_literal => .nil,
             .identifier => |id| blk: {
@@ -2944,6 +2951,12 @@ test "a stdlib builtin's result type is checked" {
     var sp = try analyzeSource(testing.allocator, "func main():\n    var n: int = split(\"a,b\", \",\")[0]");
     defer sp.deinit();
     try expectMessageContains(sp, "cannot assign str to int");
+}
+
+test "an interpolation hole is type-checked" {
+    var analysis = try analyzeSource(testing.allocator, "func main():\n    print(\"v = ${missing}\")");
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "undefined name 'missing'");
 }
 
 test "a lambda body is type-checked with its parameters" {

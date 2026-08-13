@@ -22,7 +22,7 @@ zig build run -- run FILE.rg    # parse, analyze, and execute FILE
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style) to stdout
-zig build test                  # run every test (241 as of writing)
+zig build test                  # run every test (246 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -105,7 +105,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   the parser desugars to `x = x <op> e`), expression statements. All statement
   blocks are colon-blocks (indentation); braces `{ }` are only for `enum`/`match`
   bodies.
-- **Expressions:** literals (incl. `nil`), identifiers, `and`/`or`/`not`,
+- **Expressions:** literals (incl. `nil`), string interpolation `"a ${expr} b"`
+  (the parser splits the literal and sub-parses each hole; `\$` escapes; no string
+  literals inside a hole), identifiers, `and`/`or`/`not`,
   arithmetic/comparison with precedence, calls, indexing `a[i]`, member access `x.f`,
   array `[...]` and map `{k: v}` literals, anonymous functions `func(params): expr`
   (single expression, implicitly returned; or `func(params):` + an indented block)

@@ -87,6 +87,7 @@ pub const Expr = union(enum) {
     map: Map,
     match: Match,
     lambda: *const Lambda,
+    interpolation: *const Interpolation,
 
     pub const Literal = struct { text: []const u8, span: Span };
     pub const Bool = struct { value: bool, span: Span };
@@ -102,6 +103,13 @@ pub const Expr = union(enum) {
     /// An anonymous function `func(params): expr` (single expression, implicitly
     /// returned) or `func(params):` + an indented block.
     pub const Lambda = struct { params: []const Param, body: []const Stmt, span: Span };
+    /// A string with `${expr}` holes: alternating literal (raw, still escaped)
+    /// and expression parts, in order.
+    pub const Interpolation = struct {
+        parts: []const Part,
+        span: Span,
+        pub const Part = union(enum) { literal: []const u8, expr: *Expr };
+    };
 };
 
 pub const MatchArm = struct {
@@ -252,6 +260,7 @@ pub fn exprSpan(e: Expr) Span {
         .map => |m| m.span,
         .match => |m| m.span,
         .lambda => |l| l.span,
+        .interpolation => |x| x.span,
     };
 }
 
@@ -631,6 +640,71 @@ const Parser = struct {
         };
     }
 
+    /// If the string literal `text` (including its quotes) contains a `${...}`
+    /// hole, split it into an interpolation expression; otherwise return null.
+    /// Each hole's expression is lexed and parsed on its own. A `$` may be
+    /// escaped as `\$`. String literals inside a hole are not supported (the
+    /// lexer ends the outer string at the first quote).
+    fn maybeInterpolation(self: *Parser, text: []const u8, span: Span) Error!?*Expr {
+        if (text.len < 2) return null;
+        const inner = text[1 .. text.len - 1];
+        if (std.mem.indexOf(u8, inner, "${") == null) return null;
+
+        var parts: std.ArrayList(Expr.Interpolation.Part) = .empty;
+        var i: usize = 0;
+        var lit_start: usize = 0;
+        while (i < inner.len) {
+            if (inner[i] == '\\') {
+                i += 2; // keep the escape in the literal run; the interpreter unescapes
+                continue;
+            }
+            if (inner[i] == '$' and i + 1 < inner.len and inner[i + 1] == '{') {
+                if (i > lit_start) try parts.append(self.alloc, .{ .literal = inner[lit_start..i] });
+                // Find the matching `}`, honoring nested braces (e.g. a map hole).
+                var depth: usize = 1;
+                var j = i + 2;
+                while (j < inner.len) : (j += 1) {
+                    if (inner[j] == '{') depth += 1;
+                    if (inner[j] == '}') {
+                        depth -= 1;
+                        if (depth == 0) break;
+                    }
+                }
+                if (depth != 0) {
+                    try self.reportAt(span, "unterminated '${' in string");
+                    return self.mkExpr(.{ .string_literal = .{ .text = text, .span = span } });
+                }
+                const e = try self.subParseExpr(inner[i + 2 .. j], span);
+                try parts.append(self.alloc, .{ .expr = e });
+                i = j + 1;
+                lit_start = i;
+            } else i += 1;
+        }
+        if (inner.len > lit_start) try parts.append(self.alloc, .{ .literal = inner[lit_start..] });
+
+        const interp = try self.alloc.create(Expr.Interpolation);
+        interp.* = .{ .parts = try parts.toOwnedSlice(self.alloc), .span = span };
+        return self.mkExpr(.{ .interpolation = interp });
+    }
+
+    /// Lex and parse `text` as a single expression, threading any diagnostics
+    /// into this parser. On failure, yields a `nil` placeholder.
+    fn subParseExpr(self: *Parser, text: []const u8, span: Span) Error!*Expr {
+        const lex = try lexer.tokenize(self.alloc, text);
+        for (lex.diagnostics.items) |d| try self.diagnostics.append(self.alloc, d);
+        var sub = Parser{
+            .alloc = self.alloc,
+            .tokens = lex.tokens.items,
+            .src = text,
+            .diagnostics = self.diagnostics,
+        };
+        return sub.parseExpr() catch self.mkExpr(.{ .nil_literal = span });
+    }
+
+    fn reportAt(self: *Parser, span: Span, comptime msg: []const u8) Error!void {
+        try self.diagnostics.append(self.alloc, .{ .message = msg, .line = span.line, .col = span.col });
+    }
+
     /// Parse an anonymous function expression: `func(params): expr` (single
     /// expression, implicitly returned) or `func(params):` + an indented block.
     fn parseLambda(self: *Parser) Error!*Expr {
@@ -942,6 +1016,7 @@ const Parser = struct {
             },
             .string_literal => {
                 _ = self.advance();
+                if (try self.maybeInterpolation(t.text, t.span)) |e| return e;
                 return self.mkExpr(.{ .string_literal = .{ .text = t.text, .span = t.span } });
             },
             .kw_true => {
@@ -1254,6 +1329,26 @@ test "parses generic collection type arguments" {
     try testing.expectEqualStrings("list", ty.args[1].name);
     try testing.expectEqual(@as(usize, 1), ty.args[1].args.len);
     try testing.expectEqualStrings("int", ty.args[1].args[0].name);
+}
+
+test "parses an interpolated string into literal and expression parts" {
+    var tree = try parse(testing.allocator, "var s = \"a ${x} b\"");
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const val = tree.module.decls[0].var_decl.value.?;
+    try testing.expect(val.* == .interpolation);
+    const parts = val.interpolation.parts;
+    try testing.expectEqual(@as(usize, 3), parts.len);
+    try testing.expect(parts[0] == .literal);
+    try testing.expect(parts[1] == .expr);
+    try testing.expect(parts[1].expr.* == .identifier);
+    try testing.expect(parts[2] == .literal);
+}
+
+test "a string without a hole is a plain literal" {
+    var tree = try parse(testing.allocator, "var s = \"no holes here\"");
+    defer tree.deinit();
+    try testing.expect(tree.module.decls[0].var_decl.value.?.* == .string_literal);
 }
 
 test "parses a single-expression lambda" {

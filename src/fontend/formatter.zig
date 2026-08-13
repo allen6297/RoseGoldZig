@@ -396,6 +396,18 @@ const Formatter = struct {
             },
             .match => |m| try self.matchExpr(m),
             .lambda => |lam| try self.lambda(lam),
+            .interpolation => |x| {
+                try self.w("\"");
+                for (x.parts) |p| switch (p) {
+                    .literal => |lit| try self.w(lit), // raw (still escaped)
+                    .expr => |sub| {
+                        try self.w("${");
+                        try self.expr(sub.*);
+                        try self.w("}");
+                    },
+                };
+                try self.w("\"");
+            },
             .binary => try self.exprPrec(e, 0), // reached only via a wrapped call
         }
     }
@@ -503,6 +515,13 @@ test "formats a class with fields grouped and methods spaced" {
         "    func sum() -> int:\n" ++
         "        return x + y\n";
     try testing.expectEqualStrings(want, out);
+}
+
+test "formats an interpolated string, spacing holes" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "func main():\n    print(\"hi ${name}, ${a+b} left\")");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("func main():\n    print(\"hi ${name}, ${a + b} left\")\n", out);
 }
 
 test "formatting is idempotent" {

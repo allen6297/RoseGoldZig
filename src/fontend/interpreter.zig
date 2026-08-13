@@ -1305,6 +1305,14 @@ const Interpreter = struct {
             .map => |m| try self.evalMap(m),
             .match => |m| try self.evalMatch(m),
             .member => |m| try self.evalMember(m),
+            .interpolation => |x| blk: {
+                var buf: std.ArrayList(u8) = .empty;
+                for (x.parts) |p| switch (p) {
+                    .literal => |lit| try self.appendUnescaped(&buf, lit),
+                    .expr => |pe| try self.appendValue(&buf, try self.eval(pe.*)),
+                };
+                break :blk .{ .str = try buf.toOwnedSlice(self.arena) };
+            },
             .lambda => |lam| blk: {
                 // Capture the current environment and context.
                 const cl = try self.arena.create(Closure);
@@ -1548,6 +1556,13 @@ const Interpreter = struct {
     fn unquote(self: *Interpreter, text: []const u8) Error![]const u8 {
         const inner = if (text.len >= 2) text[1 .. text.len - 1] else text;
         var buf: std.ArrayList(u8) = .empty;
+        try self.appendUnescaped(&buf, inner);
+        return buf.toOwnedSlice(self.arena);
+    }
+
+    /// Append `inner` (a string body without quotes) to `buf`, resolving escape
+    /// sequences.
+    fn appendUnescaped(self: *Interpreter, buf: *std.ArrayList(u8), inner: []const u8) Error!void {
         var i: usize = 0;
         while (i < inner.len) : (i += 1) {
             if (inner[i] == '\\' and i + 1 < inner.len) {
@@ -1563,7 +1578,6 @@ const Interpreter = struct {
                 try buf.append(self.arena, inner[i]);
             }
         }
-        return buf.toOwnedSlice(self.arena);
     }
 
     fn appendValue(self: *Interpreter, buf: *std.ArrayList(u8), v: Value) Error!void {
@@ -2319,6 +2333,17 @@ test "string and collection stdlib builtins" {
         \\    print(abs(-5), min(3, 7), max(3, 7))
     ;
     try expectOutput(src, "HI bye\n[a, b, c]\nx-y-z\ntrue true\n[1, 2, 3] [3, 2, 1]\n5 3 7\n");
+}
+
+test "string interpolation evaluates and concatenates its holes" {
+    const src =
+        \\func main():
+        \\    var name = "Ada"
+        \\    var n = 3
+        \\    print("hi ${name}, ${n + 1} left")
+        \\    print("nested ${upper(name)}!")
+    ;
+    try expectOutput(src, "hi Ada, 4 left\nnested ADA!\n");
 }
 
 test "a lambda captures a local by reference" {
