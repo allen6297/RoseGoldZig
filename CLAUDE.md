@@ -23,7 +23,7 @@ zig build run -- run --vm FILE.rg  # execute on the bytecode VM instead
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (278 as of writing)
+zig build test                  # run every test (281 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -248,10 +248,16 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   literal/`_`/binding patterns compiles too (the subject lives in a slot found via a
   compile-time stack pointer, `FnState.stack_top`). Enums compile too: the enum name
   binds to an `enum_type` value, `Enum.CASE` reads a case via `get_member`, cases compare
-  by identity and print `Enum.CASE`, and enum-case `match` arms work.
+  by identity and print `Enum.CASE`, and enum-case `match` arms work. `static` members
+  compile too: the type name binds to a `type` value (callable to construct, and the
+  target for `Type.member`); static vars live in a per-`RtType` `statics` map (initialized
+  once after globals exist, shared with subclasses by walking `ancestors`), static methods
+  are closures stored there, and inside a static method a bare own-static name resolves via
+  a pushed type value + `get_member`. (As in the interpreter, an *instance* method reaches
+  statics only through the type name, not by bare name.)
 - **Not yet compiled** (reported as a clear "the --vm backend does not support …"
-  diagnostic, so the tree-walker stays the full-featured default): `static` members,
-  modules (so no cross-module inheritance or imported bases/traits), and signals.
+  diagnostic, so the tree-walker stays the full-featured default): modules (so no
+  cross-module inheritance or imported bases/traits) and signals.
 
 ### Known gaps / future work
 - A subclass's own **static method** doesn't see an inherited static by bare name

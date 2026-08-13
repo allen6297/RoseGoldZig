@@ -69,6 +69,20 @@ const RtType = struct {
     name: []const u8,
     field_names: []const []const u8,
     methods: std.StringHashMapUnmanaged(*const Function) = .{},
+    /// The synthetic constructor invoked when the type value is called.
+    constructor: *const Function = undefined,
+    /// This type's own static storage: static var cells and static-method
+    /// closures, reached via `Type.member` (inherited statics resolve by walking
+    /// `ancestors`, so a subclass shares a base's cell).
+    statics: std.StringHashMapUnmanaged(Value) = .{},
+    ancestors: []const *const RtType = &.{},
+
+    /// The static cell named `name` on this type or an ancestor, or null.
+    fn staticSlot(self: *const RtType, name: []const u8) ?*Value {
+        if (self.statics.getPtr(name)) |p| return p;
+        for (self.ancestors) |a| if (@constCast(a).statics.getPtr(name)) |p| return p;
+        return null;
+    }
 };
 
 /// A live class/struct instance: its type plus its own field storage.
@@ -99,6 +113,7 @@ const Value = union(enum) {
     builtin: Builtin,
     instance: *Instance,
     bound_method: *BoundMethod,
+    type: *RtType,
     enum_type: *const RtEnum,
     enum_value: *const EnumValue,
 };
@@ -143,6 +158,7 @@ fn valuesEqual(a: Value, b: Value) bool {
         .builtin => |x| b == .builtin and x == b.builtin,
         .instance => |x| b == .instance and x == b.instance,
         .bound_method => |x| b == .bound_method and x == b.bound_method,
+        .type => |x| b == .type and x == b.type,
         .enum_type => |x| b == .enum_type and x == b.enum_type,
         .enum_value => |x| b == .enum_value and
             std.mem.eql(u8, x.enum_name, b.enum_value.enum_name) and
@@ -310,6 +326,14 @@ const TypeDef = struct {
     methods: std.StringHashMapUnmanaged(MethodEntry) = .{},
     /// This type's own methods, compiled once (keyed by name).
     own_compiled: std.StringHashMapUnmanaged(*Function) = .{},
+    /// This type's own `static` members: var names (ordered) + their defaults,
+    /// and static-method decls. Statics live on the defining type only.
+    static_var_names: std.ArrayList([]const u8) = .empty,
+    static_defaults: std.StringHashMapUnmanaged(?*const Expr) = .{},
+    static_methods: std.StringHashMapUnmanaged(*const Decl.Func) = .{},
+    /// Own static member names (vars + methods), for bare-name resolution inside
+    /// this type's static methods.
+    own_statics: std.StringHashMapUnmanaged(void) = .{},
     rttype: *RtType = undefined,
     constructor: *Function = undefined,
     init_arity: usize = 0,
@@ -323,6 +347,9 @@ const TypeDef = struct {
     fn isMember(self: *const TypeDef, name: []const u8) bool {
         return self.fields.contains(name) or self.methods.contains(name);
     }
+    fn isOwnStatic(self: *const TypeDef, name: []const u8) bool {
+        return self.own_statics.contains(name);
+    }
 };
 
 const Compiler = struct {
@@ -334,6 +361,9 @@ const Compiler = struct {
     /// The type whose method/constructor/field-default is being compiled, so a
     /// bare name can resolve to a field or method of the receiver.
     current_type: ?*TypeDef = null,
+    /// The type whose `static` method / static initializer is being compiled, so
+    /// a bare name can resolve to one of its own static members.
+    current_static_type: ?*TypeDef = null,
 
     fn chunk(self: *Compiler) *Chunk {
         return &self.cur.func.chunk;
@@ -384,6 +414,8 @@ const Compiler = struct {
         type_it = self.types.valueIterator();
         while (type_it.next()) |t| try self.buildRtType(t.*);
         type_it = self.types.valueIterator();
+        while (type_it.next()) |t| try self.compileStaticMembers(t.*);
+        type_it = self.types.valueIterator();
         while (type_it.next()) |t| try self.compileConstructor(t.*);
 
         // Compile each top-level function (they capture nothing — no enclosing).
@@ -407,10 +439,11 @@ const Compiler = struct {
                     try self.defineGlobal(v.name, v.span);
                 },
                 .class, .struct_decl => {
-                    // The type name binds to its constructor closure.
+                    // The type name binds to its type value (callable to construct,
+                    // and the target for `Type.staticMember`).
                     const name = if (decl == .class) decl.class.name else decl.struct_decl.name;
                     const t = self.types.get(name).?;
-                    try self.emitClosure(t.constructor, t.span);
+                    try self.emitConst(.{ .type = t.rttype }, t.span);
                     try self.defineGlobal(name, t.span);
                 },
                 .enum_decl => |e| {
@@ -422,6 +455,23 @@ const Compiler = struct {
                 else => {},
             }
         }
+
+        // Initialize static vars once, now that all globals exist: evaluate each
+        // initializer with its type in static scope and store it on the type.
+        type_it = self.types.valueIterator();
+        while (type_it.next()) |tp| {
+            const t = tp.*;
+            for (t.static_var_names.items) |name| {
+                self.cur.stack_top = 0;
+                try self.emitTypeConst(t, t.span);
+                const saved_static = self.current_static_type;
+                self.current_static_type = t;
+                if (t.static_defaults.get(name).?) |d| try self.expr(d.*) else try self.emit(.nil, t.span);
+                self.current_static_type = saved_static;
+                try self.emitGlobal(.set_field, name, t.span);
+            }
+        }
+
         if (funcs.get("main")) |_| {
             try self.emitGlobal(.get_global, "main", zeroSpan);
             try self.emit(.call, zeroSpan);
@@ -455,13 +505,25 @@ const Compiler = struct {
         }
         // Reject members the VM can't compile yet, with a clear message.
         for (members) |m| switch (m) {
-            .var_decl => |v| if (v.is_static) return self.fail(v.span, "the --vm backend does not support static members yet", .{}),
-            .func => |f| if (f.is_static) return self.fail(f.span, "the --vm backend does not support static methods yet", .{}),
+            .var_decl, .func => {},
             .signal => |s| return self.fail(s.span, "the --vm backend does not support signals", .{}),
             else => return self.fail(declSpan(m), "the --vm backend does not support this class member", .{}),
         };
         const t = try self.alloc.create(TypeDef);
         t.* = .{ .name = name, .span = span, .members = members, .super_names = try supers.toOwnedSlice(self.alloc) };
+        // Collect this type's own static members.
+        for (members, 0..) |m, i| switch (m) {
+            .var_decl => |v| if (v.is_static) {
+                try t.static_var_names.append(self.alloc, v.name);
+                try t.static_defaults.put(self.alloc, v.name, v.value);
+                try t.own_statics.put(self.alloc, v.name, {});
+            },
+            .func => |f| if (f.is_static) {
+                try t.static_methods.put(self.alloc, f.name, &members[i].func);
+                try t.own_statics.put(self.alloc, f.name, {});
+            },
+            else => {},
+        };
         try self.types.put(self.alloc, name, t);
     }
 
@@ -495,14 +557,14 @@ const Compiler = struct {
     fn addFieldsAndMethods(self: *Compiler, t: *TypeDef, src: *TypeDef, methods_pass: bool) Error!void {
         for (src.members, 0..) |m, i| switch (m) {
             .var_decl => |v| {
-                if (methods_pass) continue;
+                if (methods_pass or v.is_static) continue;
                 if (t.fields.contains(v.name)) continue;
                 try t.fields.put(self.alloc, v.name, {});
                 try t.field_names.append(self.alloc, v.name);
                 try t.field_defaults.put(self.alloc, v.name, v.value);
             },
             .func => |f| {
-                if (!methods_pass) continue;
+                if (!methods_pass or f.is_static) continue;
                 // Point at the member in the owner's stable slice, not the loop copy.
                 try t.methods.put(self.alloc, f.name, .{ .decl = &src.members[i].func, .owner = src });
             },
@@ -529,7 +591,7 @@ const Compiler = struct {
         const saved_type = self.current_type;
         self.current_type = t;
         defer self.current_type = saved_type;
-        for (t.members) |m| if (m == .func) {
+        for (t.members) |m| if (m == .func and !m.func.is_static) {
             const f = try self.compileMethod(t, m.func);
             try t.own_compiled.put(self.alloc, m.func.name, f);
         };
@@ -553,8 +615,9 @@ const Compiler = struct {
         return func;
     }
 
-    /// Build a type's runtime shape: the printable name, ordered field names, and
-    /// method table (each name pointing at its owning type's compiled body).
+    /// Build a type's runtime shape: printable name, ordered field names, method
+    /// table (each name pointing at its owning type's compiled body), and the
+    /// ancestor chain (used to resolve inherited statics).
     fn buildRtType(self: *Compiler, t: *TypeDef) Error!void {
         const rt = t.rttype;
         rt.* = .{ .name = t.name, .field_names = t.field_names.items };
@@ -564,6 +627,42 @@ const Compiler = struct {
             const compiled = owner.own_compiled.get(e.key_ptr.*).?;
             try rt.methods.put(self.alloc, e.key_ptr.*, compiled);
         }
+        const anc = try self.alloc.alloc(*const RtType, t.ancestors.len);
+        for (t.ancestors, 0..) |a, i| anc[i] = a.rttype;
+        rt.ancestors = anc;
+    }
+
+    /// Populate a type's static storage: a cell (initially nil) per static var
+    /// and a closure per static method, compiled with the type in static scope.
+    fn compileStaticMembers(self: *Compiler, t: *TypeDef) Error!void {
+        const rt = t.rttype;
+        for (t.static_var_names.items) |name| try rt.statics.put(self.alloc, name, .nil);
+        var it = t.static_methods.iterator();
+        while (it.next()) |e| {
+            const f = try self.compileStaticMethod(t, e.value_ptr.*.*);
+            const cl = try self.alloc.create(Closure);
+            cl.* = .{ .func = f, .upvalues = &.{} };
+            try rt.statics.put(self.alloc, e.key_ptr.*, .{ .closure = cl });
+        }
+    }
+
+    fn compileStaticMethod(self: *Compiler, t: *TypeDef, f: Decl.Func) Error!*Function {
+        const func = try self.alloc.create(Function);
+        func.* = .{ .name = f.name, .arity = f.params.len };
+        var fs = FnState{ .func = func, .enclosing = null };
+        const saved = self.cur;
+        self.cur = &fs;
+        defer self.cur = saved;
+        const saved_static = self.current_static_type;
+        self.current_static_type = t;
+        defer self.current_static_type = saved_static;
+        // No receiver: parameters occupy slots 0..n-1.
+        for (f.params) |p| try fs.locals.append(self.alloc, .{ .name = p.name, .depth = 0 });
+        try self.block(f.body);
+        try self.emit(.nil, f.span);
+        try self.emit(.ret, f.span);
+        func.upvalues = try fs.upvalues.toOwnedSlice(self.alloc);
+        return func;
     }
 
     /// Compile the synthetic constructor `<T>`: create the instance, evaluate
@@ -608,6 +707,7 @@ const Compiler = struct {
         try self.emit(.ret, t.span);
         func.upvalues = &.{};
         t.constructor = func;
+        t.rttype.constructor = func;
     }
 
     fn emitNewInstance(self: *Compiler, t: *TypeDef, span: Span) Error!void {
@@ -615,6 +715,12 @@ const Compiler = struct {
         try self.chunk().rttypes.append(self.alloc, t.rttype);
         try self.emit(.new_instance, span);
         try self.emitU16(@intCast(idx), span);
+        self.cur.stack_top += 1;
+    }
+
+    /// Push a type value (for `Type.staticMember` access on the receiver type).
+    fn emitTypeConst(self: *Compiler, t: *TypeDef, span: Span) Error!void {
+        try self.emitConst(.{ .type = t.rttype }, span);
         self.cur.stack_top += 1;
     }
 
@@ -834,6 +940,11 @@ const Compiler = struct {
                     try self.loadSelf(a.span);
                     try self.expr(a.value.*);
                     try self.emitGlobal(.set_field, id.name, a.span);
+                } else if (self.current_static_type != null and self.current_static_type.?.isOwnStatic(id.name)) {
+                    // A bare static write inside a static method: [type, value] set_field.
+                    try self.emitTypeConst(self.current_static_type.?, a.span);
+                    try self.expr(a.value.*);
+                    try self.emitGlobal(.set_field, id.name, a.span);
                 } else {
                     try self.expr(a.value.*);
                     try self.emitGlobal(.set_global, id.name, a.span);
@@ -996,6 +1107,11 @@ const Compiler = struct {
                     // A bare field/method name inside a method resolves against
                     // the receiver.
                     try self.loadSelf(id.span);
+                    try self.emitGlobal(.get_member, id.name, id.span);
+                } else if (self.current_static_type != null and self.current_static_type.?.isOwnStatic(id.name)) {
+                    // A bare static name inside a static method resolves against
+                    // the type.
+                    try self.emitTypeConst(self.current_static_type.?, id.span);
                     try self.emitGlobal(.get_member, id.name, id.span);
                 } else {
                     try self.emitGlobal(.get_global, id.name, id.span);
@@ -1458,6 +1574,11 @@ const VM = struct {
                                 try self.push(.{ .bound_method = bm });
                             } else return self.fail("type '{s}' has no member '{s}'", .{ inst.type.name, name });
                         },
+                        .type => |rt| {
+                            if (rt.staticSlot(name)) |slot| {
+                                try self.push(slot.*);
+                            } else return self.fail("type '{s}' has no static member '{s}'", .{ rt.name, name });
+                        },
                         .enum_type => |et| {
                             if (!et.members.contains(name)) return self.fail("enum '{s}' has no member '{s}'", .{ et.name, name });
                             const ev = try self.alloc.create(EnumValue);
@@ -1471,10 +1592,19 @@ const VM = struct {
                     const name = chunk.constants.items[self.readU16(frame)].str;
                     const value = self.pop();
                     const obj = self.pop();
-                    if (obj != .instance) return self.fail("cannot assign member '{s}' of {s}", .{ name, @tagName(obj) });
-                    if (obj.instance.fields.getPtr(name)) |slot| {
-                        slot.* = value;
-                    } else return self.fail("type '{s}' has no field '{s}'", .{ obj.instance.type.name, name });
+                    switch (obj) {
+                        .instance => |inst| {
+                            if (inst.fields.getPtr(name)) |slot| {
+                                slot.* = value;
+                            } else return self.fail("type '{s}' has no field '{s}'", .{ inst.type.name, name });
+                        },
+                        .type => |rt| {
+                            if (rt.staticSlot(name)) |slot| {
+                                slot.* = value;
+                            } else return self.fail("type '{s}' has no static field '{s}'", .{ rt.name, name });
+                        },
+                        else => return self.fail("cannot assign member '{s}' of {s}", .{ name, @tagName(obj) }),
+                    }
                 },
                 .make_range => {
                     const end = self.pop();
@@ -1632,6 +1762,13 @@ const VM = struct {
                 // arguments, so slot 0 is the receiver and slots 1.. are the args.
                 const base = self.stack.items.len - argc;
                 try self.stack.insert(self.alloc, base, .{ .instance = bm.recv });
+                try self.frames.append(self.alloc, .{ .func = f, .upvalues = &.{}, .ip = 0, .base = base });
+            },
+            .type => |rt| {
+                // Calling a type constructs an instance: run its constructor.
+                const f = rt.constructor;
+                if (argc != f.arity) return self.fail("{s} expects {d} argument(s), got {d}", .{ rt.name, f.arity, argc });
+                const base = self.stack.items.len - argc;
                 try self.frames.append(self.alloc, .{ .func = f, .upvalues = &.{}, .ip = 0, .base = base });
             },
             .builtin => |bi| {
@@ -1896,6 +2033,7 @@ const VM = struct {
                 try buf.append(self.alloc, '}');
             },
             .closure, .builtin, .bound_method => try buf.appendSlice(self.alloc, "<function>"),
+            .type => |t| try buf.appendSlice(self.alloc, t.name),
             .enum_type => |et| try buf.appendSlice(self.alloc, et.name),
             .enum_value => |ev| {
                 try buf.appendSlice(self.alloc, ev.enum_name);
@@ -2250,6 +2388,61 @@ test "vm: a lambda in a method captures the receiver" {
         \\    print(f(5))
     ;
     try expectVMOutput(src, "15\n");
+}
+
+test "vm: static var and method shared on the type" {
+    const src =
+        \\class Counter:
+        \\    static var count: int = 0
+        \\    static func bump():
+        \\        count = count + 1
+        \\
+        \\func main():
+        \\    Counter.bump()
+        \\    Counter.bump()
+        \\    print(Counter.count)
+    ;
+    try expectVMOutput(src, "2\n");
+}
+
+test "vm: a static factory sees statics and constructs instances" {
+    const src =
+        \\class Widget:
+        \\    var id: int = 0
+        \\    static var next: int = 100
+        \\    static func make() -> Widget:
+        \\        var w = Widget()
+        \\        w.id = next
+        \\        next = next + 1
+        \\        return w
+        \\
+        \\func main():
+        \\    var a = Widget.make()
+        \\    var b = Widget.make()
+        \\    print(a.id, b.id, Widget.next)
+        \\    print(Widget())
+    ;
+    try expectVMOutput(src, "100 101 102\nWidget { id: 0 }\n");
+}
+
+test "vm: a subclass reaches and shares inherited statics" {
+    const src =
+        \\class Base:
+        \\    static var n: int = 0
+        \\    static func bump():
+        \\        n += 1
+        \\
+        \\class Sub extends Base:
+        \\    var x: int = 0
+        \\
+        \\func main():
+        \\    Base.bump()
+        \\    Sub.bump()
+        \\    print(Sub.n)
+        \\    Sub.n = 50
+        \\    print(Base.n)
+    ;
+    try expectVMOutput(src, "2\n50\n");
 }
 
 test "vm: accessing an unknown member is a runtime error" {
