@@ -223,8 +223,8 @@ drives the loader, then the analyzer and interpreter over the loaded module set
 - An alternative execution backend (`vm.zig`): a compiler lowers each function to a
   `Chunk` of stack-machine opcodes + constants, and a `VM` runs it over a value stack
   with a call-frame stack. It has its **own** small `Value` type (no coupling to the
-  interpreter) and produces byte-identical output to the tree-walker on the programs it
-  supports.
+  interpreter) and produces byte-identical output to the tree-walker. It now covers the
+  **entire language except cross-module inheritance** — a genuine drop-in backend.
 - **Classes/structs** compile too: construction (`Name(...)` binds the type name to a
   synthetic constructor closure that creates the instance via a `new_instance` opcode,
   runs field defaults with the instance as receiver, then calls `init`), field get/set
