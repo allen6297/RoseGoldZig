@@ -1,10 +1,11 @@
 //! A bytecode compiler + stack VM: an alternative execution backend to the
 //! tree-walking interpreter, reached via `run --vm`. It covers the core of the
 //! language — expressions, control flow, functions (with recursion), locals and
-//! globals, lists, and the common builtins — enough to run programs like `fib`
-//! and list/loop processing. Constructs it does not compile (classes, closures,
-//! modules, signals, `match`, member access, …) are reported as unsupported, so
-//! the tree-walker remains the full-featured default.
+//! globals, lists/maps/ranges, lambdas with by-reference closures (upvalues),
+//! and the common builtins — enough to run programs like `fib` and list/loop
+//! processing. Constructs it does not compile (classes, modules, signals,
+//! `match`, member access, …) are reported as unsupported, so the tree-walker
+//! remains the full-featured default.
 //!
 //! Design: each function compiles to a `Chunk` of opcodes + constants; the VM
 //! runs a `Chunk` over a value stack with a frame stack for calls.
@@ -40,11 +41,25 @@ const builtin_names = [_][]const u8{
     "trim",  "starts_with", "ends_with", "find", "replace",
 };
 
+/// A compile-time upvalue descriptor: `is_local` captures local slot `index` of
+/// the immediately-enclosing function; otherwise it captures upvalue `index` of
+/// the enclosing function (chaining a capture up multiple levels).
+const Upvalue = struct { is_local: bool, index: u8 };
+
 const Function = struct {
     name: []const u8,
     arity: usize,
-    chunk: Chunk,
+    chunk: Chunk = .{},
+    upvalues: []const Upvalue = &.{},
 };
+
+/// A runtime upvalue: while `stack_index` is set it aliases that stack slot
+/// (shared by reference); once the slot goes out of scope it is "closed" into
+/// `value`.
+const UpvalueObj = struct { stack_index: ?usize, value: Value = .nil };
+
+/// A function paired with the upvalues it captured where it was created.
+const Closure = struct { func: *const Function, upvalues: []*UpvalueObj };
 
 const Value = union(enum) {
     nil,
@@ -54,7 +69,7 @@ const Value = union(enum) {
     str: []const u8,
     list: *List,
     map: *Map,
-    func: *const Function,
+    closure: *Closure,
     builtin: Builtin,
 };
 
@@ -94,7 +109,7 @@ fn valuesEqual(a: Value, b: Value) bool {
         .str => |x| b == .str and std.mem.eql(u8, x, b.str),
         .list => |x| b == .list and x == b.list,
         .map => |x| b == .map and x == b.map,
-        .func => |x| b == .func and x == b.func,
+        .closure => |x| b == .closure and x == b.closure,
         .builtin => |x| b == .builtin and x == b.builtin,
     };
 }
@@ -133,6 +148,10 @@ const Op = enum(u8) {
     get_global, // u16 name-const index
     set_global, // u16
     define_global, // u16
+    get_upvalue, // u8 index
+    set_upvalue, // u8 index (stores top, keeps it on the stack)
+    closure, // u16 func-const index -> capture upvalues, push a Closure
+    close_upvalue, // close the open upvalue for the top slot, then pop it
     jump, // u16 (absolute target)
     jump_if_false, // u16
     call, // u8 argc
@@ -153,6 +172,8 @@ const Chunk = struct {
     code: std.ArrayList(u8) = .empty,
     lines: std.ArrayList(u32) = .empty,
     constants: std.ArrayList(Value) = .empty,
+    /// Nested function prototypes referenced by the `closure` opcode.
+    functions: std.ArrayList(*const Function) = .empty,
 };
 
 // --- result ------------------------------------------------------------------
@@ -203,7 +224,7 @@ const Program = struct { script: *Function };
 
 // --- compiler ----------------------------------------------------------------
 
-const Local = struct { name: []const u8, depth: u32 };
+const Local = struct { name: []const u8, depth: u32, captured: bool = false };
 
 const Loop = struct {
     /// Local count at loop entry, so `break`/`continue` can pop body locals.
@@ -213,13 +234,25 @@ const Loop = struct {
     continues: std.ArrayList(usize) = .empty,
 };
 
+/// Per-function compile state. The `enclosing` chain lets a lambda resolve
+/// captures against the functions it is nested in.
+const FnState = struct {
+    func: *Function,
+    locals: std.ArrayList(Local) = .empty,
+    scope_depth: u32 = 0,
+    upvalues: std.ArrayList(Upvalue) = .empty,
+    loops: std.ArrayList(*Loop) = .empty,
+    enclosing: ?*FnState = null,
+};
+
 const Compiler = struct {
     alloc: std.mem.Allocator,
     diagnostics: *std.ArrayList(lexer.Diagnostic),
-    chunk: *Chunk = undefined,
-    locals: std.ArrayList(Local) = .empty,
-    scope_depth: u32 = 0,
-    loops: std.ArrayList(*Loop) = .empty,
+    cur: *FnState = undefined,
+
+    fn chunk(self: *Compiler) *Chunk {
+        return &self.cur.func.chunk;
+    }
 
     fn fail(self: *Compiler, span: Span, comptime fmt: []const u8, args: anytype) Error {
         const msg = try std.fmt.allocPrint(self.alloc, fmt, args);
@@ -234,23 +267,23 @@ const Compiler = struct {
             else => return self.fail(declSpan(decl), "the --vm backend does not support this construct yet; use the default interpreter", .{}),
         };
 
-        // Compile each function to a Function object.
+        // The script runs as a function with no enclosing scope.
+        const script = try self.alloc.create(Function);
+        script.* = .{ .name = "<script>", .arity = 0 };
+        var script_fs = FnState{ .func = script, .enclosing = null };
+        self.cur = &script_fs;
+
+        // Compile each top-level function (they capture nothing — no enclosing).
         var funcs: std.StringHashMapUnmanaged(*Function) = .{};
         for (module.decls) |decl| if (decl == .func) {
-            const f = try self.compileFunction(decl.func);
+            const f = try self.compileFunction(decl.func, null);
             try funcs.put(self.alloc, decl.func.name, f);
         };
 
-        // The script chunk: bind functions/globals, then call main().
-        const script = try self.alloc.create(Function);
-        script.* = .{ .name = "<script>", .arity = 0, .chunk = .{} };
-        self.chunk = &script.chunk;
-        self.locals = .empty;
-        self.scope_depth = 0;
-
+        // The script body: bind functions/globals, then call main().
         for (module.decls) |decl| switch (decl) {
             .func => |fd| {
-                try self.emitConst(.{ .func = funcs.get(fd.name).? }, fd.span);
+                try self.emitClosure(funcs.get(fd.name).?, fd.span);
                 try self.defineGlobal(fd.name, fd.span);
             },
             .var_decl => |v| {
@@ -271,44 +304,77 @@ const Compiler = struct {
         return .{ .script = script };
     }
 
-    fn compileFunction(self: *Compiler, f: Decl.Func) Error!*Function {
+    fn compileFunction(self: *Compiler, f: Decl.Func, enclosing: ?*FnState) Error!*Function {
         const func = try self.alloc.create(Function);
-        func.* = .{ .name = f.name, .arity = f.params.len, .chunk = .{} };
+        func.* = .{ .name = f.name, .arity = f.params.len };
 
-        const saved_chunk = self.chunk;
-        const saved_locals = self.locals;
-        const saved_depth = self.scope_depth;
-        self.chunk = &func.chunk;
-        self.locals = .empty;
-        self.scope_depth = 0;
-        defer {
-            self.chunk = saved_chunk;
-            self.locals = saved_locals;
-            self.scope_depth = saved_depth;
-        }
+        var fs = FnState{ .func = func, .enclosing = enclosing };
+        const saved = self.cur;
+        self.cur = &fs;
+        defer self.cur = saved;
 
-        // Parameters occupy the first local slots.
-        for (f.params) |p| try self.locals.append(self.alloc, .{ .name = p.name, .depth = 0 });
+        for (f.params) |p| try self.cur.locals.append(self.alloc, .{ .name = p.name, .depth = 0 });
         try self.block(f.body);
-        // Implicit `return nil` if the body falls off the end.
-        try self.emit(.nil, f.span);
+        try self.emit(.nil, f.span); // implicit `return nil`
         try self.emit(.ret, f.span);
+        func.upvalues = try fs.upvalues.toOwnedSlice(self.alloc);
         return func;
+    }
+
+    /// Compile a lambda expression: compile its body to a Function, then emit a
+    /// `closure` op that captures its upvalues from the current frame.
+    fn compileLambda(self: *Compiler, lam: *const Expr.Lambda) Error!void {
+        const func = try self.alloc.create(Function);
+        func.* = .{ .name = "<lambda>", .arity = lam.params.len };
+        var fs = FnState{ .func = func, .enclosing = self.cur };
+        const saved = self.cur;
+        self.cur = &fs;
+        for (lam.params) |p| try self.cur.locals.append(self.alloc, .{ .name = p.name, .depth = 0 });
+        try self.block(lam.body);
+        try self.emit(.nil, lam.span);
+        try self.emit(.ret, lam.span);
+        func.upvalues = try fs.upvalues.toOwnedSlice(self.alloc);
+        self.cur = saved;
+        try self.emitClosure(func, lam.span);
+    }
+
+    /// Resolve `name` as an upvalue of `fs`: a local of the enclosing function
+    /// (captured directly), or an upvalue of it (captured transitively). Returns
+    /// the upvalue index in `fs`, or null if `name` is not an enclosing local.
+    fn resolveUpvalue(self: *Compiler, fs: *FnState, name: []const u8) Error!?u8 {
+        const enclosing = fs.enclosing orelse return null;
+        if (localSlot(enclosing, name)) |slot| {
+            enclosing.locals.items[slot].captured = true;
+            return try self.addUpvalue(fs, true, @intCast(slot));
+        }
+        if (try self.resolveUpvalue(enclosing, name)) |up| {
+            return try self.addUpvalue(fs, false, up);
+        }
+        return null;
+    }
+
+    fn addUpvalue(self: *Compiler, fs: *FnState, is_local: bool, index: u8) Error!u8 {
+        for (fs.upvalues.items, 0..) |uv, i| {
+            if (uv.is_local == is_local and uv.index == index) return @intCast(i);
+        }
+        try fs.upvalues.append(self.alloc, .{ .is_local = is_local, .index = index });
+        return @intCast(fs.upvalues.items.len - 1);
     }
 
     // --- statements ----------------------------------------------------------
 
     fn block(self: *Compiler, stmts: []const Stmt) Error!void {
-        self.scope_depth += 1;
+        self.cur.scope_depth += 1;
         for (stmts) |s| try self.stmt(s);
         try self.endScope();
     }
 
     fn endScope(self: *Compiler) Error!void {
-        self.scope_depth -= 1;
-        while (self.locals.items.len > 0 and self.locals.items[self.locals.items.len - 1].depth > self.scope_depth) {
-            _ = self.locals.pop();
-            try self.emit(.pop, zeroSpan);
+        self.cur.scope_depth -= 1;
+        while (self.cur.locals.items.len > 0 and self.cur.locals.items[self.cur.locals.items.len - 1].depth > self.cur.scope_depth) {
+            const local = self.cur.locals.pop().?;
+            // A captured local is closed (its upvalue takes ownership) then popped.
+            try self.emit(if (local.captured) .close_upvalue else .pop, zeroSpan);
         }
     }
 
@@ -317,7 +383,7 @@ const Compiler = struct {
             .pass => {},
             .var_decl => |v| {
                 if (v.value) |val| try self.expr(val.*) else try self.emit(.nil, v.span);
-                try self.locals.append(self.alloc, .{ .name = v.name, .depth = self.scope_depth });
+                try self.cur.locals.append(self.alloc, .{ .name = v.name, .depth = self.cur.scope_depth });
             },
             .expr_stmt => |e| {
                 try self.expr(e.*);
@@ -353,6 +419,9 @@ const Compiler = struct {
                 if (self.resolveLocal(id.name)) |slot| {
                     try self.emit(.set_local, a.span);
                     try self.emitByte(@intCast(slot), a.span);
+                } else if (try self.resolveUpvalue(self.cur, id.name)) |up| {
+                    try self.emit(.set_upvalue, a.span);
+                    try self.emitByte(up, a.span);
                 } else {
                     try self.emitGlobal(.set_global, id.name, a.span);
                 }
@@ -398,9 +467,9 @@ const Compiler = struct {
 
     fn whileStmt(self: *Compiler, x: Stmt.While) Error!void {
         const start = self.here();
-        var loop = Loop{ .local_count = self.locals.items.len };
-        try self.loops.append(self.alloc, &loop);
-        defer _ = self.loops.pop();
+        var loop = Loop{ .local_count = self.cur.locals.items.len };
+        try self.cur.loops.append(self.alloc, &loop);
+        defer _ = self.cur.loops.pop();
 
         try self.expr(x.cond.*);
         const exit = try self.emitJump(.jump_if_false, parser.exprSpan(x.cond.*));
@@ -414,26 +483,26 @@ const Compiler = struct {
     fn forStmt(self: *Compiler, x: Stmt.For) Error!void {
         // Index iteration over any iterable via the iter_* opcodes: hidden locals
         // hold the iterable and the index; the binding(s) are set each round.
-        self.scope_depth += 1;
+        self.cur.scope_depth += 1;
         try self.expr(x.iter.*);
-        const it_slot = self.locals.items.len;
-        try self.locals.append(self.alloc, .{ .name = "$it", .depth = self.scope_depth });
+        const it_slot = self.cur.locals.items.len;
+        try self.cur.locals.append(self.alloc, .{ .name = "$it", .depth = self.cur.scope_depth });
         try self.emitConst(.{ .int = 0 }, x.span);
-        const idx_slot = self.locals.items.len;
-        try self.locals.append(self.alloc, .{ .name = "$idx", .depth = self.scope_depth });
-        const first_slot = self.locals.items.len;
-        try self.locals.append(self.alloc, .{ .name = x.binding, .depth = self.scope_depth });
+        const idx_slot = self.cur.locals.items.len;
+        try self.cur.locals.append(self.alloc, .{ .name = "$idx", .depth = self.cur.scope_depth });
+        const first_slot = self.cur.locals.items.len;
+        try self.cur.locals.append(self.alloc, .{ .name = x.binding, .depth = self.cur.scope_depth });
         try self.emit(.nil, x.span);
         var second_slot: usize = 0;
         if (x.value_binding) |vb| {
-            second_slot = self.locals.items.len;
-            try self.locals.append(self.alloc, .{ .name = vb, .depth = self.scope_depth });
+            second_slot = self.cur.locals.items.len;
+            try self.cur.locals.append(self.alloc, .{ .name = vb, .depth = self.cur.scope_depth });
             try self.emit(.nil, x.span);
         }
 
-        var loop = Loop{ .local_count = self.locals.items.len };
-        try self.loops.append(self.alloc, &loop);
-        defer _ = self.loops.pop();
+        var loop = Loop{ .local_count = self.cur.locals.items.len };
+        try self.cur.loops.append(self.alloc, &loop);
+        defer _ = self.cur.loops.pop();
 
         const start = self.here();
         // idx < iter_len(it)
@@ -492,6 +561,9 @@ const Compiler = struct {
             .identifier => |id| {
                 if (self.resolveLocal(id.name)) |slot| {
                     try self.emitLocal(.get_local, slot, id.span);
+                } else if (try self.resolveUpvalue(self.cur, id.name)) |up| {
+                    try self.emit(.get_upvalue, id.span);
+                    try self.emitByte(up, id.span);
                 } else {
                     try self.emitGlobal(.get_global, id.name, id.span);
                 }
@@ -533,6 +605,7 @@ const Compiler = struct {
                 try self.expr(r.end.*);
                 try self.emit(.make_range, r.span);
             },
+            .lambda => |lam| try self.compileLambda(lam),
             else => return self.fail(parser.exprSpan(e), "the --vm backend does not support this expression yet", .{}),
         }
     }
@@ -607,23 +680,18 @@ const Compiler = struct {
     // --- locals / loops ------------------------------------------------------
 
     fn resolveLocal(self: *Compiler, name: []const u8) ?usize {
-        var i = self.locals.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (std.mem.eql(u8, self.locals.items[i].name, name)) return i;
-        }
-        return null;
+        return localSlot(self.cur, name);
     }
 
     fn currentLoop(self: *Compiler) ?*Loop {
-        if (self.loops.items.len == 0) return null;
-        return self.loops.items[self.loops.items.len - 1];
+        if (self.cur.loops.items.len == 0) return null;
+        return self.cur.loops.items[self.cur.loops.items.len - 1];
     }
 
     // --- emit ----------------------------------------------------------------
 
     fn here(self: *Compiler) usize {
-        return self.chunk.code.items.len;
+        return self.chunk().code.items.len;
     }
 
     fn emit(self: *Compiler, op: Op, span: Span) Error!void {
@@ -631,8 +699,8 @@ const Compiler = struct {
     }
 
     fn emitByte(self: *Compiler, byte: u8, span: Span) Error!void {
-        try self.chunk.code.append(self.alloc, byte);
-        try self.chunk.lines.append(self.alloc, span.line);
+        try self.chunk().code.append(self.alloc, byte);
+        try self.chunk().lines.append(self.alloc, span.line);
     }
 
     fn emitU16(self: *Compiler, v: u16, span: Span) Error!void {
@@ -640,9 +708,18 @@ const Compiler = struct {
         try self.emitByte(@intCast(v & 0xff), span);
     }
 
+    /// Emit a `closure` op referencing `func` via the current chunk's function
+    /// table (the VM captures its upvalues at runtime).
+    fn emitClosure(self: *Compiler, func: *const Function, span: Span) Error!void {
+        const idx = self.chunk().functions.items.len;
+        try self.chunk().functions.append(self.alloc, func);
+        try self.emit(.closure, span);
+        try self.emitU16(@intCast(idx), span);
+    }
+
     fn emitConst(self: *Compiler, v: Value, span: Span) Error!void {
-        const idx = self.chunk.constants.items.len;
-        try self.chunk.constants.append(self.alloc, v);
+        const idx = self.chunk().constants.items.len;
+        try self.chunk().constants.append(self.alloc, v);
         try self.emit(.constant, span);
         try self.emitU16(@intCast(idx), span);
     }
@@ -653,8 +730,8 @@ const Compiler = struct {
     }
 
     fn emitGlobal(self: *Compiler, op: Op, name: []const u8, span: Span) Error!void {
-        const idx = self.chunk.constants.items.len;
-        try self.chunk.constants.append(self.alloc, .{ .str = name });
+        const idx = self.chunk().constants.items.len;
+        try self.chunk().constants.append(self.alloc, .{ .str = name });
         try self.emit(op, span);
         try self.emitU16(@intCast(idx), span);
     }
@@ -677,14 +754,17 @@ const Compiler = struct {
 
     fn patchJumpTo(self: *Compiler, at: usize, target: usize) void {
         const t: u16 = @intCast(target);
-        self.chunk.code.items[at] = @intCast(t >> 8);
-        self.chunk.code.items[at + 1] = @intCast(t & 0xff);
+        self.chunk().code.items[at] = @intCast(t >> 8);
+        self.chunk().code.items[at + 1] = @intCast(t & 0xff);
     }
 
-    /// Emit a POP for each local declared past `count` (for break/continue).
+    /// Pop each local declared past `count` (for break/continue), closing any
+    /// that were captured.
     fn popLocalsTo(self: *Compiler, count: usize, sp: Span) Error!void {
-        var n = self.locals.items.len;
-        while (n > count) : (n -= 1) try self.emit(.pop, sp);
+        var n = self.cur.locals.items.len;
+        while (n > count) : (n -= 1) {
+            try self.emit(if (self.cur.locals.items[n - 1].captured) .close_upvalue else .pop, sp);
+        }
     }
 
     /// Emit an unconditional jump back to `target`.
@@ -695,6 +775,16 @@ const Compiler = struct {
 };
 
 const zeroSpan: Span = .{ .start = 0, .end = 0, .line = 0, .col = 0 };
+
+/// The slot of the innermost local named `name` in `fs`, or null.
+fn localSlot(fs: *FnState, name: []const u8) ?usize {
+    var i = fs.locals.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, fs.locals.items[i].name, name)) return i;
+    }
+    return null;
+}
 
 fn declSpan(d: Decl) Span {
     return switch (d) {
@@ -712,7 +802,7 @@ fn declSpan(d: Decl) Span {
 
 const VMError = std.mem.Allocator.Error || error{Runtime};
 
-const Frame = struct { func: *const Function, ip: usize, base: usize };
+const Frame = struct { closure: *Closure, ip: usize, base: usize };
 
 const VM = struct {
     alloc: std.mem.Allocator,
@@ -720,6 +810,7 @@ const VM = struct {
     stack: std.ArrayList(Value) = .empty,
     frames: std.ArrayList(Frame) = .empty,
     globals: std.StringHashMapUnmanaged(Value) = .{},
+    open_upvalues: std.ArrayList(*UpvalueObj) = .empty,
     runtime_error: ?RuntimeError = null,
 
     fn fail(self: *VM, comptime fmt: []const u8, args: anytype) VMError {
@@ -736,7 +827,8 @@ const VM = struct {
         if (self.frames.items.len == 0) return 0;
         const fr = self.frames.items[self.frames.items.len - 1];
         const ip = if (fr.ip > 0) fr.ip - 1 else 0;
-        if (ip < fr.func.chunk.lines.items.len) return fr.func.chunk.lines.items[ip];
+        const lines = fr.closure.func.chunk.lines.items;
+        if (ip < lines.len) return lines[ip];
         return 0;
     }
 
@@ -745,7 +837,9 @@ const VM = struct {
         inline for (builtin_names, 0..) |name, i| {
             try self.globals.put(self.alloc, name, .{ .builtin = @enumFromInt(i) });
         }
-        try self.frames.append(self.alloc, .{ .func = program.script, .ip = 0, .base = 0 });
+        const script_cl = try self.alloc.create(Closure);
+        script_cl.* = .{ .func = program.script, .upvalues = &.{} };
+        try self.frames.append(self.alloc, .{ .closure = script_cl, .ip = 0, .base = 0 });
         try self.exec();
     }
 
@@ -764,7 +858,7 @@ const VM = struct {
     fn exec(self: *VM) VMError!void {
         var frame = &self.frames.items[self.frames.items.len - 1];
         while (true) {
-            const chunk = &frame.func.chunk;
+            const chunk = &frame.closure.func.chunk;
             const op: Op = @enumFromInt(chunk.code.items[frame.ip]);
             frame.ip += 1;
             switch (op) {
@@ -814,6 +908,33 @@ const VM = struct {
                     const name = chunk.constants.items[self.readU16(frame)].str;
                     try self.globals.put(self.alloc, name, self.pop());
                 },
+                .get_upvalue => {
+                    const idx = self.readByte(frame);
+                    const up = frame.closure.upvalues[idx];
+                    try self.push(if (up.stack_index) |si| self.stack.items[si] else up.value);
+                },
+                .set_upvalue => {
+                    const idx = self.readByte(frame);
+                    const up = frame.closure.upvalues[idx];
+                    if (up.stack_index) |si| self.stack.items[si] = self.peek(0) else up.value = self.peek(0);
+                },
+                .closure => {
+                    const f = chunk.functions.items[self.readU16(frame)];
+                    const cl = try self.alloc.create(Closure);
+                    const ups = try self.alloc.alloc(*UpvalueObj, f.upvalues.len);
+                    for (f.upvalues, 0..) |uv, i| {
+                        ups[i] = if (uv.is_local)
+                            try self.captureUpvalue(frame.base + uv.index)
+                        else
+                            frame.closure.upvalues[uv.index];
+                    }
+                    cl.* = .{ .func = f, .upvalues = ups };
+                    try self.push(.{ .closure = cl });
+                },
+                .close_upvalue => {
+                    self.closeUpvalues(self.stack.items.len - 1);
+                    _ = self.pop();
+                },
                 .jump => frame.ip = self.readU16(frame),
                 .jump_if_false => {
                     const target = self.readU16(frame);
@@ -827,6 +948,9 @@ const VM = struct {
                 .ret => {
                     const result = self.pop();
                     const finished = self.frames.pop().?;
+                    // Close any upvalues that captured this frame's locals before
+                    // they're popped, so escaping closures keep their own copy.
+                    self.closeUpvalues(finished.base);
                     if (self.frames.items.len == 0) return; // script returned
                     // Drop the frame's locals AND the callee that sat just below.
                     self.stack.shrinkRetainingCapacity(finished.base - 1);
@@ -889,7 +1013,7 @@ const VM = struct {
 
     fn readByte(self: *VM, frame: *Frame) u8 {
         _ = self;
-        const b = frame.func.chunk.code.items[frame.ip];
+        const b = frame.closure.func.chunk.code.items[frame.ip];
         frame.ip += 1;
         return b;
     }
@@ -961,14 +1085,45 @@ const VM = struct {
         return self.fail("cannot order {s} and {s}", .{ @tagName(a), @tagName(b) });
     }
 
+    /// Return the open upvalue aliasing `stack_index`, creating (and recording)
+    /// one if none exists yet, so all closures over the same slot share it.
+    fn captureUpvalue(self: *VM, stack_index: usize) VMError!*UpvalueObj {
+        for (self.open_upvalues.items) |up| {
+            if (up.stack_index == stack_index) return up;
+        }
+        const up = try self.alloc.create(UpvalueObj);
+        up.* = .{ .stack_index = stack_index };
+        try self.open_upvalues.append(self.alloc, up);
+        return up;
+    }
+
+    /// Close every open upvalue whose slot is at or above `from`: copy the live
+    /// stack value into the upvalue and detach it from the stack.
+    fn closeUpvalues(self: *VM, from: usize) void {
+        var i: usize = 0;
+        while (i < self.open_upvalues.items.len) {
+            const up = self.open_upvalues.items[i];
+            if (up.stack_index) |si| {
+                if (si >= from) {
+                    up.value = self.stack.items[si];
+                    up.stack_index = null;
+                    _ = self.open_upvalues.swapRemove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+
     fn call(self: *VM, argc: usize) VMError!void {
         const callee = self.peek(argc);
         switch (callee) {
-            .func => |f| {
+            .closure => |cl| {
+                const f = cl.func;
                 if (argc != f.arity) return self.fail("{s} expects {d} argument(s), got {d}", .{ f.name, f.arity, argc });
                 // The callee sits just below the arguments; use it as slot 0 base.
                 const base = self.stack.items.len - argc;
-                try self.frames.append(self.alloc, .{ .func = f, .ip = 0, .base = base });
+                try self.frames.append(self.alloc, .{ .closure = cl, .ip = 0, .base = base });
             },
             .builtin => |bi| {
                 const base = self.stack.items.len - argc;
@@ -1231,7 +1386,7 @@ const VM = struct {
                 }
                 try buf.append(self.alloc, '}');
             },
-            .func, .builtin => try buf.appendSlice(self.alloc, "<function>"),
+            .closure, .builtin => try buf.appendSlice(self.alloc, "<function>"),
         }
     }
 };
@@ -1323,6 +1478,62 @@ test "vm: stdlib builtins" {
 
 test "vm: short-circuit logical operators" {
     try expectVMOutput("func main():\n    print(true and false, false or true, not false)", "false true true\n");
+}
+
+test "vm: a lambda captures a local by reference" {
+    const src =
+        \\func main():
+        \\    var n = 10
+        \\    var add = func(x): x + n
+        \\    print(add(5))
+        \\    n = 100
+        \\    print(add(5))
+    ;
+    try expectVMOutput(src, "15\n105\n");
+}
+
+test "vm: a lambda is a first-class higher-order argument" {
+    const src =
+        \\func apply(f, x):
+        \\    return f(x)
+        \\
+        \\func main():
+        \\    print(apply(func(n): n * n, 7))
+    ;
+    try expectVMOutput(src, "49\n");
+}
+
+test "vm: a returned closure keeps its own captured cell" {
+    // Each `make_counter()` closes over its own `n`; the upvalue outlives the
+    // frame and the two counters stay independent.
+    const src =
+        \\func make_counter():
+        \\    var n = 0
+        \\    var step = func():
+        \\        n = n + 1
+        \\        return n
+        \\    return step
+        \\
+        \\func main():
+        \\    var c = make_counter()
+        \\    print(c(), c(), c())
+        \\    var d = make_counter()
+        \\    print(d(), c())
+    ;
+    try expectVMOutput(src, "1 2 3\n1 4\n");
+}
+
+test "vm: nested closures capture transitively" {
+    const src =
+        \\func adder(x):
+        \\    return func(y): func(z): x + y + z
+        \\
+        \\func main():
+        \\    var f = adder(1)
+        \\    var g = f(20)
+        \\    print(g(300))
+    ;
+    try expectVMOutput(src, "321\n");
 }
 
 test "vm: reports unsupported constructs" {
