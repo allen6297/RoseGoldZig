@@ -9,8 +9,9 @@ Editor support for RoseGold (`.rg`) files in Visual Studio Code:
 - **Language server** — a client for `RoseGold_Zig lsp`, giving **live
   diagnostics** (matching the compiler's `check`), **hover** (standard-library
   docs), **go-to-definition**, a **symbol outline**, **completion** (keywords,
-  types, builtins, your declarations, and a module's exports after `mod.`), and
-  **signature help** (parameter hints while typing a call's arguments).
+  types, builtins, your declarations, and a module's exports after `mod.`),
+  **signature help** (parameter hints while typing a call's arguments), and
+  **find all references** across the workspace.
 - **Run command** — *RoseGold: Run Current File* (command palette) runs the file
   on the tree-walker, or the bytecode VM when `rosegold.useVm` is set.
 

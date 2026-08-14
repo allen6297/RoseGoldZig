@@ -647,6 +647,8 @@ const Server = struct {
                 try self.onCompletion(id.?, params);
             } else if (std.mem.eql(u8, method, "textDocument/signatureHelp")) {
                 try self.onSignatureHelp(id.?, params);
+            } else if (std.mem.eql(u8, method, "textDocument/references")) {
+                try self.onReferences(id.?, params);
             } else if (id) |rid| {
                 // Any other request: reply with null so the client isn't left waiting.
                 try self.respond(rid, @as(?u8, null));
@@ -692,6 +694,7 @@ const Server = struct {
             hoverProvider: bool,
             definitionProvider: bool,
             documentSymbolProvider: bool,
+            referencesProvider: bool,
             completionProvider: struct { triggerCharacters: []const []const u8 },
             signatureHelpProvider: struct { triggerCharacters: []const []const u8 },
         },
@@ -703,6 +706,7 @@ const Server = struct {
                 .hoverProvider = true,
                 .definitionProvider = true,
                 .documentSymbolProvider = true,
+                .referencesProvider = true,
                 .completionProvider = .{ .triggerCharacters = &.{"."} },
                 .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
             },
@@ -1038,6 +1042,95 @@ const Server = struct {
         try self.respond(id, result);
     }
 
+    /// Find every reference to the identifier under the cursor across the
+    /// workspace — all open buffers plus the `.rg` files under the document's
+    /// directory and the search roots. Name-based (whole-word, skipping comments
+    /// and string text but not `${…}` holes); not scope-aware.
+    fn onReferences(self: *Server, id: std.json.Value, params: ?std.json.Value) !void {
+        const empty = &[_]Location{};
+        const p = params orelse return self.respond(id, empty);
+        const uri = self.uriOf(params) orelse return self.respond(id, empty);
+        const text = self.docs.get(uri) orelse return self.respond(id, empty);
+        const pos = objGet(p, "position") orelse return self.respond(id, empty);
+        const line = intField(pos, "line") orelse return self.respond(id, empty);
+        const character = intField(pos, "character") orelse return self.respond(id, empty);
+        const off = offsetAt(text, @intCast(line), @intCast(character)) orelse return self.respond(id, empty);
+        const target = identAt(text, off) orelse return self.respond(id, empty);
+
+        var include_decl = true;
+        if (objGet(p, "context")) |ctx| {
+            if (objGet(ctx, "includeDeclaration")) |v| {
+                if (v == .bool) include_decl = v.bool;
+            }
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+
+        // Candidate files: path → source. Open buffers win over disk.
+        var files: std.StringHashMapUnmanaged([]const u8) = .{};
+        var it = self.docs.iterator();
+        while (it.next()) |e| {
+            const path = uriToPath(a, e.key_ptr.*) orelse continue;
+            files.put(a, path, e.value_ptr.*) catch {};
+        }
+        var budget: usize = 4000; // cap files walked, guarding pathological trees
+        if (uriToPath(a, uri)) |dp| {
+            if (std.fs.path.dirname(dp)) |dir| self.walkRgFiles(a, dir, &files, &budget);
+        }
+        for (self.roots.items) |r| self.walkRgFiles(a, r, &files, &budget);
+
+        var locs: std.ArrayList(Location) = .empty;
+        var fit = files.iterator();
+        while (fit.next()) |e| {
+            const path = e.key_ptr.*;
+            const src = e.value_ptr.*;
+            const file_uri = pathToUri(a, path) orelse continue;
+            var offs: std.ArrayList(usize) = .empty;
+            collectRefs(a, src, target, &offs) catch continue;
+            const decl_offs: ?[]usize = if (include_decl) null else (declNameOffsets(a, src) catch null);
+            for (offs.items) |o| {
+                if (decl_offs) |ds| {
+                    if (std.mem.indexOfScalar(usize, ds, o) != null) continue;
+                }
+                const ps = offsetToPos(src, o);
+                locs.append(a, .{
+                    .uri = file_uri,
+                    .range = .{
+                        .start = ps,
+                        .end = .{ .line = ps.line, .character = ps.character + @as(u32, @intCast(target.len)) },
+                    },
+                }) catch {};
+            }
+        }
+        try self.respond(id, locs.items);
+    }
+
+    /// Add every `.rg` file under `dir_abs` (recursively) to `files`, reading from
+    /// disk unless the path is already present (an open buffer). Best-effort: any
+    /// error skips the directory. `budget` bounds the number of files added.
+    fn walkRgFiles(self: *Server, a: std.mem.Allocator, dir_abs: []const u8, files: *std.StringHashMapUnmanaged([]const u8), budget: *usize) void {
+        var dir = Io.Dir.openDirAbsolute(self.io, dir_abs, .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
+        var walker = dir.walk(a) catch return;
+        defer walker.deinit();
+        while (walker.next(self.io) catch null) |entry| {
+            if (budget.* == 0) return;
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.basename, ".rg")) continue;
+            // Skip generated/vendored trees.
+            if (std.mem.indexOf(u8, entry.path, ".zig-cache") != null) continue;
+            if (std.mem.indexOf(u8, entry.path, "zig-out") != null) continue;
+            if (std.mem.indexOf(u8, entry.path, "node_modules") != null) continue;
+            const abs = std.fs.path.join(a, &.{ dir_abs, entry.path }) catch continue;
+            if (files.contains(abs)) continue;
+            const src = Io.Dir.cwd().readFileAlloc(self.io, abs, a, .limited(16 << 20)) catch continue;
+            files.put(a, abs, src) catch continue;
+            budget.* -= 1;
+        }
+    }
+
     // --- request helpers ---
 
     fn uriOf(self: *Server, params: ?std.json.Value) ?[]const u8 {
@@ -1103,6 +1196,105 @@ fn hexVal(c: u8) ?u8 {
         'A'...'F' => c - 'A' + 10,
         else => null,
     };
+}
+
+fn isUnreservedUriChar(c: u8) bool {
+    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or
+        c == '-' or c == '.' or c == '_' or c == '~';
+}
+
+/// Convert a filesystem path to a `file://` URI, percent-encoding as needed.
+fn pathToUri(a: std.mem.Allocator, path: []const u8) ?[]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    buf.appendSlice(a, "file://") catch return null;
+    const hex = "0123456789ABCDEF";
+    for (path) |c| {
+        if (isUnreservedUriChar(c) or c == '/') {
+            buf.append(a, c) catch return null;
+        } else {
+            buf.append(a, '%') catch return null;
+            buf.append(a, hex[c >> 4]) catch return null;
+            buf.append(a, hex[c & 0xF]) catch return null;
+        }
+    }
+    return buf.toOwnedSlice(a) catch null;
+}
+
+/// The 0-based (line, byte-column) position of `offset` in `text`.
+fn offsetToPos(text: []const u8, offset: usize) Pos {
+    var line: u32 = 0;
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while (i < offset and i < text.len) : (i += 1) {
+        if (text[i] == '\n') {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    return .{ .line = line, .character = @intCast(offset - line_start) };
+}
+
+/// Collect the byte offset of every whole-word occurrence of `target` in `text`,
+/// skipping `##` comments and string literals but *including* identifiers inside
+/// `${…}` interpolation holes (which are real references).
+fn collectRefs(a: std.mem.Allocator, text: []const u8, target: []const u8, out: *std.ArrayList(usize)) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (c == '#' and i + 1 < text.len and text[i + 1] == '#') {
+            while (i < text.len and text[i] != '\n') i += 1;
+            continue;
+        }
+        if (c == '"') {
+            i += 1;
+            while (i < text.len and text[i] != '"') {
+                if (text[i] == '\\') {
+                    i += 2;
+                    continue;
+                }
+                if (text[i] == '$' and i + 1 < text.len and text[i + 1] == '{') {
+                    i += 2;
+                    var depth: usize = 1;
+                    while (i < text.len and depth > 0) {
+                        const h = text[i];
+                        if (h == '{') {
+                            depth += 1;
+                            i += 1;
+                        } else if (h == '}') {
+                            depth -= 1;
+                            i += 1;
+                        } else if (isIdentStart(h)) {
+                            const s = i;
+                            while (i < text.len and isIdentChar(text[i])) i += 1;
+                            if (std.mem.eql(u8, text[s..i], target)) try out.append(a, s);
+                        } else i += 1;
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            if (i < text.len) i += 1; // past the closing quote
+            continue;
+        }
+        if (isIdentStart(c) and (i == 0 or !isIdentChar(text[i - 1]))) {
+            const s = i;
+            while (i < text.len and isIdentChar(text[i])) i += 1;
+            if (std.mem.eql(u8, text[s..i], target)) try out.append(a, s);
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Byte offsets of the *names* of every declaration in `text` (to optionally
+/// exclude declarations from references).
+fn declNameOffsets(a: std.mem.Allocator, text: []const u8) ![]usize {
+    const decls = try scanDecls(a, text);
+    var offs: std.ArrayList(usize) = .empty;
+    for (decls) |d| {
+        if (offsetAt(text, d.line, d.character)) |o| try offs.append(a, o);
+    }
+    return offs.toOwnedSlice(a);
 }
 
 /// Convert a `file://` URI to a filesystem path (percent-decoded), or null for a
@@ -1223,6 +1415,31 @@ test "uriToPath strips file:// and percent-decodes" {
     try testing.expectEqualStrings("/a/My Code/app.rg", p2);
 
     try testing.expect(uriToPath(gpa, "untitled:Untitled-1") == null);
+}
+
+test "collectRefs finds whole-word refs, skipping comments and string text" {
+    const a = testing.allocator;
+    const text = "foo\nfoobar\n## foo comment\nx = \"foo\"\ny = \"${foo}\"\n";
+    var offs: std.ArrayList(usize) = .empty;
+    defer offs.deinit(a);
+    try collectRefs(a, text, "foo", &offs);
+    // A bare `foo` and the one inside a `${…}` hole; not `foobar`, the comment, or string text.
+    try testing.expectEqual(@as(usize, 2), offs.items.len);
+    try testing.expectEqual(@as(usize, 0), offs.items[0]);
+}
+
+test "offsetToPos maps a byte offset to line/character" {
+    const text = "ab\ncde\nf";
+    const p = offsetToPos(text, 4); // 'd' on line 1
+    try testing.expectEqual(@as(u32, 1), p.line);
+    try testing.expectEqual(@as(u32, 1), p.character);
+}
+
+test "pathToUri percent-encodes and prefixes file://" {
+    const a = testing.allocator;
+    const u = pathToUri(a, "/a/My Code/x.rg").?;
+    defer a.free(u);
+    try testing.expectEqualStrings("file:///a/My%20Code/x.rg", u);
 }
 
 test "callContext finds the enclosing call and active argument" {

@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (336 as of writing)
+zig build test                  # run every test (339 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -307,8 +307,12 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   marked. `callContext` scans back through balanced brackets to find the callee + comma
   index; the signature comes from a builtin table, or the function's `(…)` header read
   straight from source (`signatureFromSource`, so types/defaults show as written) for a
-  document func/method or an imported `mod.func`. Unknown requests get a null result so the
-  client never hangs.
+  document func/method or an imported `mod.func`, and `references`: every whole-word
+  occurrence of the identifier under the cursor across the workspace — all open buffers plus
+  the `.rg` files walked (`Io.Dir.walk`) under the document's directory and the search roots
+  (`collectRefs` skips `##` comments and string text but includes identifiers inside `${…}`
+  holes; honors `includeDeclaration`; name-based, not scope-aware). Unknown requests get a
+  null result so the client never hangs.
 - **Workspace search roots.** `initialize` captures the workspace folders (and legacy
   `rootUri`), plus an optional `initializationOptions.importPaths` (paths or `file://`
   URIs), as module search roots (`onInitialize` → `addRoot`/`addRootUri`, deduped). They're
