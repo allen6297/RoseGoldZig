@@ -340,7 +340,7 @@ fn findLambdasInExpr(a: std.mem.Allocator, e: *const parser.Expr, scopes: *std.A
         },
         .call => |c| {
             try findLambdasInExpr(a, c.callee, scopes);
-            for (c.args) |arg| try findLambdasInExpr(a, arg, scopes);
+            for (c.args) |arg| try findLambdasInExpr(a, arg.value, scopes);
         },
         .index => |ix| {
             try findLambdasInExpr(a, ix.object, scopes);

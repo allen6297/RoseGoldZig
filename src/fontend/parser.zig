@@ -111,7 +111,9 @@ pub const Expr = union(enum) {
     pub const Ident = struct { name: []const u8, span: Span };
     pub const Unary = struct { op: UnaryOp, operand: *Expr, span: Span };
     pub const Binary = struct { op: BinaryOp, lhs: *Expr, rhs: *Expr, span: Span };
-    pub const Call = struct { callee: *Expr, args: []const *Expr, span: Span };
+    /// A call argument: positional (`name == null`) or named (`name: value`).
+    pub const Arg = struct { name: ?[]const u8 = null, value: *Expr };
+    pub const Call = struct { callee: *Expr, args: []const Arg, span: Span };
     pub const Index = struct { object: *Expr, index: *Expr, span: Span };
     /// `object[start:end]` — a sub-range of a list or string; `start`/`end` are
     /// optional (default 0 / length).
@@ -1162,10 +1164,21 @@ const Parser = struct {
                 },
                 .l_paren => {
                     _ = self.advance();
-                    var args: std.ArrayList(*Expr) = .empty;
+                    var args: std.ArrayList(Expr.Arg) = .empty;
+                    var seen_named = false;
                     if (!self.at(.r_paren)) {
                         while (true) {
-                            try args.append(self.alloc, try self.parseExpr());
+                            // A named argument is `name: value` — an identifier
+                            // immediately followed by a colon.
+                            var name: ?[]const u8 = null;
+                            if (self.at(.identifier) and self.tokens[self.pos + 1].kind == .colon) {
+                                name = self.advance().text;
+                                _ = self.advance(); // ':'
+                                seen_named = true;
+                            } else if (seen_named) {
+                                try self.err("a positional argument cannot follow a named one");
+                            }
+                            try args.append(self.alloc, .{ .name = name, .value = try self.parseExpr() });
                             if (!self.eat(.comma)) break;
                         }
                     }

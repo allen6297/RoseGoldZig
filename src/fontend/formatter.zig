@@ -461,7 +461,11 @@ const Formatter = struct {
                 try self.w("(");
                 for (c.args, 0..) |arg, i| {
                     if (i > 0) try self.w(", ");
-                    try self.expr(arg.*);
+                    if (arg.name) |n| {
+                        try self.w(n);
+                        try self.w(": ");
+                    }
+                    try self.expr(arg.value.*);
                 }
                 try self.w(")");
             },
@@ -627,6 +631,13 @@ test "formats default parameter values" {
     const out = try fmt(gpa, "func f(a,b=1+1,c=\"x\"):\n    return a");
     defer gpa.free(out);
     try testing.expectEqualStrings("func f(a, b = 1 + 1, c = \"x\"):\n    return a\n", out);
+}
+
+test "formats named call arguments" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "func main():\n    print(f(1, y : 2, z:3))");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("func main():\n    print(f(1, y: 2, z: 3))\n", out);
 }
 
 test "formats slices in all four forms" {

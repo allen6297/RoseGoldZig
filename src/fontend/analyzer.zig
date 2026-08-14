@@ -58,6 +58,8 @@ const FuncSig = struct {
     /// Minimum arguments (parameters without a default); defaults are trailing,
     /// so `required <= params.len`. Equal to `params.len` when none default.
     required: usize = 0,
+    /// Parameter names, parallel to `params` (for named-argument calls).
+    param_names: []const []const u8 = &.{},
 };
 
 /// An optional type `?T`, carrying the wrapped type and a pre-formatted name
@@ -620,10 +622,14 @@ const Analyzer = struct {
 
     fn funcSig(self: *Analyzer, f: Decl.Func) Error!*const FuncSig {
         const params = try self.arena.alloc(Type, f.params.len);
-        for (f.params, 0..) |p, i| params[i] = if (p.type) |ann| try self.annotationType(ann) else .any;
+        const names = try self.arena.alloc([]const u8, f.params.len);
+        for (f.params, 0..) |p, i| {
+            params[i] = if (p.type) |ann| try self.annotationType(ann) else .any;
+            names[i] = p.name;
+        }
         const ret: Type = if (f.return_type) |rt| try self.annotationType(rt) else .any;
         const sig = try self.arena.create(FuncSig);
-        sig.* = .{ .params = params, .ret = ret, .required = requiredParamCount(f.params) };
+        sig.* = .{ .params = params, .ret = ret, .required = requiredParamCount(f.params), .param_names = names };
         return sig;
     }
 
@@ -1478,7 +1484,9 @@ const Analyzer = struct {
             try self.analyzeStmts(lam.body);
         }
         const sig = try self.arena.create(FuncSig);
-        sig.* = .{ .params = param_types, .ret = ret, .required = requiredParamCount(lam.params) };
+        const lam_names = try self.arena.alloc([]const u8, lam.params.len);
+        for (lam.params, 0..) |p, i| lam_names[i] = p.name;
+        sig.* = .{ .params = param_types, .ret = ret, .required = requiredParamCount(lam.params), .param_names = lam_names };
         return .{ .func = sig };
     }
 
@@ -1561,18 +1569,87 @@ const Analyzer = struct {
 
     /// Check a call's argument count and types against a parameter list. With
     /// default parameters the count is a range `required..params.len`.
-    fn checkArgs(self: *Analyzer, c: Expr.Call, params: []const Type, required: usize) Error!void {
-        if (c.args.len < required or c.args.len > params.len) {
-            if (required == params.len) {
-                try self.report(c.span, "expected {d} argument(s), got {d}", .{ params.len, c.args.len });
-            } else {
-                try self.report(c.span, "expected {d} to {d} argument(s), got {d}", .{ required, params.len, c.args.len });
+    /// Report any named arguments as unsupported (builtins take positional args).
+    fn rejectNamedArgs(self: *Analyzer, c: Expr.Call) Error!void {
+        for (c.args) |arg| {
+            if (arg.name) |n| {
+                try self.report(parser.exprSpan(arg.value.*), "named argument '{s}' is not allowed here", .{n});
             }
         }
-        for (c.args, 0..) |arg, i| {
-            const at = try self.typeOf(arg.*);
-            if (i < params.len and !self.assignable(at, params[i])) {
-                try self.report(parser.exprSpan(arg.*), "argument {d}: cannot pass {s} where {s} is expected", .{ i + 1, typeName(at), typeName(params[i]) });
+    }
+
+    fn checkArgs(self: *Analyzer, c: Expr.Call, params: []const Type, param_names: []const []const u8, required: usize) Error!void {
+        var has_named = false;
+        for (c.args) |arg| {
+            if (arg.name != null) has_named = true;
+        }
+        if (!has_named) {
+            // Positional-only fast path (unchanged behavior/messages).
+            if (c.args.len < required or c.args.len > params.len) {
+                if (required == params.len) {
+                    try self.report(c.span, "expected {d} argument(s), got {d}", .{ params.len, c.args.len });
+                } else {
+                    try self.report(c.span, "expected {d} to {d} argument(s), got {d}", .{ required, params.len, c.args.len });
+                }
+            }
+            for (c.args, 0..) |arg, i| {
+                const at = try self.typeOf(arg.value.*);
+                if (i < params.len and !self.assignable(at, params[i])) {
+                    try self.report(parser.exprSpan(arg.value.*), "argument {d}: cannot pass {s} where {s} is expected", .{ i + 1, typeName(at), typeName(params[i]) });
+                }
+            }
+            return;
+        }
+        try self.checkNamedArgs(c, params, param_names, required);
+    }
+
+    /// Validate a call that mixes positional and named arguments: names must match
+    /// a parameter, no parameter twice, and every required parameter filled.
+    fn checkNamedArgs(self: *Analyzer, c: Expr.Call, params: []const Type, param_names: []const []const u8, required: usize) Error!void {
+        const filled = try self.arena.alloc(bool, params.len);
+        for (filled) |*f| f.* = false;
+
+        var pos: usize = 0;
+        while (pos < c.args.len and c.args[pos].name == null) pos += 1;
+
+        for (c.args[0..pos], 0..) |arg, i| {
+            const at = try self.typeOf(arg.value.*);
+            if (i < params.len) {
+                filled[i] = true;
+                if (!self.assignable(at, params[i])) {
+                    try self.report(parser.exprSpan(arg.value.*), "argument {d}: cannot pass {s} where {s} is expected", .{ i + 1, typeName(at), typeName(params[i]) });
+                }
+            } else {
+                try self.report(parser.exprSpan(arg.value.*), "too many arguments (expected at most {d})", .{params.len});
+            }
+        }
+        for (c.args[pos..]) |arg| {
+            const name = arg.name.?;
+            const at = try self.typeOf(arg.value.*);
+            var idx: ?usize = null;
+            for (param_names, 0..) |pn, j| {
+                if (std.mem.eql(u8, pn, name)) {
+                    idx = j;
+                    break;
+                }
+            }
+            if (idx == null) {
+                try self.report(parser.exprSpan(arg.value.*), "no parameter named '{s}'", .{name});
+                continue;
+            }
+            const j = idx.?;
+            if (filled[j]) {
+                try self.report(parser.exprSpan(arg.value.*), "argument '{s}' was already provided", .{name});
+                continue;
+            }
+            filled[j] = true;
+            if (!self.assignable(at, params[j])) {
+                try self.report(parser.exprSpan(arg.value.*), "argument '{s}': cannot pass {s} where {s} is expected", .{ name, typeName(at), typeName(params[j]) });
+            }
+        }
+        for (0..required) |j| {
+            if (!filled[j]) {
+                try self.report(c.span, "missing required argument '{s}'", .{param_names[j]});
             }
         }
     }
@@ -1583,17 +1660,20 @@ const Analyzer = struct {
         // resolves to the builtin and isn't shadowed by a local/param.
         if (c.callee.* == .identifier) {
             if (self.resolve(c.callee.identifier.name)) |sym| {
-                if (sym.kind == .builtin) return self.typeBuiltinCall(c.callee.identifier.name, c);
+                if (sym.kind == .builtin) {
+                    try self.rejectNamedArgs(c);
+                    return self.typeBuiltinCall(c.callee.identifier.name, c);
+                }
             }
         }
         const ct = try self.typeOf(c.callee.*);
         switch (ct) {
             .func => |sig| {
-                try self.checkArgs(c, sig.params, sig.required);
+                try self.checkArgs(c, sig.params, sig.param_names, sig.required);
                 return sig.ret;
             },
             .any, .unknown => {
-                for (c.args) |arg| _ = try self.typeOf(arg.*);
+                for (c.args) |arg| _ = try self.typeOf(arg.value.*);
                 return .unknown;
             },
             // Calling a class/struct name constructs an instance; its arguments
@@ -1603,12 +1683,12 @@ const Analyzer = struct {
                 const init_sym: ?Symbol = if (scope) |s| s.symbols.get("init") else null;
                 if (init_sym) |sym| {
                     if (tagOf(sym.ty) == .func) {
-                        try self.checkArgs(c, sym.ty.func.params, sym.ty.func.required);
+                        try self.checkArgs(c, sym.ty.func.params, sym.ty.func.param_names, sym.ty.func.required);
                     } else {
-                        for (c.args) |arg| _ = try self.typeOf(arg.*);
+                        for (c.args) |arg| _ = try self.typeOf(arg.value.*);
                     }
                 } else {
-                    for (c.args) |arg| _ = try self.typeOf(arg.*);
+                    for (c.args) |arg| _ = try self.typeOf(arg.value.*);
                     if (c.args.len != 0) {
                         try self.report(c.span, "{s} takes no constructor arguments", .{type_name});
                     }
@@ -1616,7 +1696,7 @@ const Analyzer = struct {
                 return .{ .named = type_name };
             },
             else => {
-                for (c.args) |arg| _ = try self.typeOf(arg.*);
+                for (c.args) |arg| _ = try self.typeOf(arg.value.*);
                 try self.report(c.span, "{s} is not callable", .{typeName(ct)});
                 return .unknown;
             },
@@ -1628,7 +1708,7 @@ const Analyzer = struct {
     /// the specific builtin. Unknown/`any` arguments degrade to a lenient result.
     fn typeBuiltinCall(self: *Analyzer, name: []const u8, c: Expr.Call) Error!Type {
         const args = try self.arena.alloc(Type, c.args.len);
-        for (c.args, 0..) |arg, i| args[i] = try self.typeOf(arg.*);
+        for (c.args, 0..) |arg, i| args[i] = try self.typeOf(arg.value.*);
 
         const eq = std.mem.eql;
         // print/echo/emit are variadic; everything else has a fixed arity.
@@ -1652,7 +1732,7 @@ const Analyzer = struct {
         if (eq(u8, name, "float")) return .float;
         if (eq(u8, name, "range")) {
             if (args.len >= 1 and !isAnyish(args[0]) and tagOf(args[0]) != .int) {
-                try self.report(parser.exprSpan(c.args[0].*), "range expects an int, got {s}", .{typeName(args[0])});
+                try self.report(parser.exprSpan(c.args[0].value.*), "range expects an int, got {s}", .{typeName(args[0])});
             }
             return self.makeList(.int);
         }
@@ -1660,7 +1740,7 @@ const Analyzer = struct {
             if (args.len == 2 and tagOf(args[0]) == .list) {
                 const elem = args[0].list.elem;
                 if (!self.assignable(args[1], elem)) {
-                    try self.report(parser.exprSpan(c.args[1].*), "cannot push {s} into {s}", .{ typeName(args[1]), typeName(args[0]) });
+                    try self.report(parser.exprSpan(c.args[1].value.*), "cannot push {s} into {s}", .{ typeName(args[1]), typeName(args[0]) });
                 }
             }
             return .void;
@@ -1679,7 +1759,7 @@ const Analyzer = struct {
         }
         if (eq(u8, name, "has")) {
             if (args.len == 2 and tagOf(args[0]) == .map and !self.assignable(args[1], args[0].map.key)) {
-                try self.report(parser.exprSpan(c.args[1].*), "cannot look up {s} in {s}", .{ typeName(args[1]), typeName(args[0]) });
+                try self.report(parser.exprSpan(c.args[1].value.*), "cannot look up {s} in {s}", .{ typeName(args[1]), typeName(args[0]) });
             }
             return .bool;
         }
@@ -1707,7 +1787,7 @@ const Analyzer = struct {
         // reduce -> the accumulator (initial-value) type.
         if (eq(u8, name, "map")) {
             if (args.len >= 1 and !isAnyish(args[0]) and tagOf(args[0]) != .list) {
-                try self.report(parser.exprSpan(c.args[0].*), "map expects a list, got {s}", .{typeName(args[0])});
+                try self.report(parser.exprSpan(c.args[0].value.*), "map expects a list, got {s}", .{typeName(args[0])});
             }
             return self.makeList(.any);
         }
@@ -1715,7 +1795,7 @@ const Analyzer = struct {
             if (args.len >= 1) {
                 if (tagOf(args[0]) == .list) return args[0];
                 if (!isAnyish(args[0])) {
-                    try self.report(parser.exprSpan(c.args[0].*), "filter expects a list, got {s}", .{typeName(args[0])});
+                    try self.report(parser.exprSpan(c.args[0].value.*), "filter expects a list, got {s}", .{typeName(args[0])});
                 }
             }
             return .unknown;
@@ -1729,14 +1809,14 @@ const Analyzer = struct {
         if (eq(u8, name, "sqrt") or eq(u8, name, "pow")) {
             for (args, 0..) |a, i| {
                 if (!isAnyish(a) and !isNumeric(a)) {
-                    try self.report(parser.exprSpan(c.args[i].*), "{s} expects a number, got {s}", .{ name, typeName(a) });
+                    try self.report(parser.exprSpan(c.args[i].value.*), "{s} expects a number, got {s}", .{ name, typeName(a) });
                 }
             }
             return .float;
         }
         if (eq(u8, name, "floor") or eq(u8, name, "ceil") or eq(u8, name, "round")) {
             if (args.len == 1 and !isAnyish(args[0]) and !isNumeric(args[0])) {
-                try self.report(parser.exprSpan(c.args[0].*), "{s} expects a number, got {s}", .{ name, typeName(args[0]) });
+                try self.report(parser.exprSpan(c.args[0].value.*), "{s} expects a number, got {s}", .{ name, typeName(args[0]) });
             }
             return .int;
         }
@@ -2576,6 +2656,28 @@ test "arithmetic on non-numbers is reported" {
     var analysis = try analyzeSource(testing.allocator, "const x: int = true + 1");
     defer analysis.deinit();
     try expectMessageContains(analysis, "'+'");
+}
+
+test "named arguments: valid reorder is clean; bad names/dupes/builtins are rejected" {
+    var ok = try analyzeSource(testing.allocator, "func f(a: int, b: int = 0) -> int:\n    return a + b\nfunc main():\n    print(f(b: 2, a: 1))");
+    defer ok.deinit();
+    try testing.expectEqual(@as(usize, 0), ok.diagnostics.len);
+
+    var unknown = try analyzeSource(testing.allocator, "func f(a: int):\n    return a\nfunc main():\n    print(f(a: 1, b: 2))");
+    defer unknown.deinit();
+    try expectMessageContains(unknown, "no parameter named 'b'");
+
+    var dupe = try analyzeSource(testing.allocator, "func f(a: int, b: int = 0):\n    return a\nfunc main():\n    print(f(1, a: 2))");
+    defer dupe.deinit();
+    try expectMessageContains(dupe, "already provided");
+
+    var missing = try analyzeSource(testing.allocator, "func f(a: int, b: int):\n    return a\nfunc main():\n    print(f(b: 2))");
+    defer missing.deinit();
+    try expectMessageContains(missing, "missing required argument 'a'");
+
+    var builtin = try analyzeSource(testing.allocator, "func main():\n    print(len(x: [1]))");
+    defer builtin.deinit();
+    try expectMessageContains(builtin, "not allowed here");
 }
 
 test "slicing keeps the element type; non-lists and non-int bounds are rejected" {

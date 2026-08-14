@@ -71,6 +71,8 @@ const Function = struct {
     /// or `null` for a required parameter. Empty when the function has no
     /// defaults. Each thunk evaluates its default in the home module's scope.
     defaults: []const ?Value = &.{},
+    /// Parameter names (for named-argument calls); empty if unused.
+    param_names: []const []const u8 = &.{},
 };
 
 /// A module's runtime namespace: its own top-level bindings (functions, types,
@@ -285,6 +287,7 @@ const Op = enum(u8) {
     pop_handler, // remove the innermost try handler (body finished normally)
     raise, // pop a value and throw it, unwinding to the nearest handler
     call, // u8 argc
+    call_kw, // u8 argc, u16 index into chunk.kw_argnames
     ret,
     build_list, // u16 count
     build_map, // u16 entry count (2*count values popped)
@@ -313,6 +316,8 @@ const Chunk = struct {
     functions: std.ArrayList(*const Function) = .empty,
     /// Class/struct shapes referenced by the `new_instance` opcode.
     rttypes: std.ArrayList(*const RtType) = .empty,
+    /// Per-argument names for `call_kw` sites (null = positional), by index.
+    kw_argnames: std.ArrayList([]const ?[]const u8) = .empty,
 };
 
 // --- result ------------------------------------------------------------------
@@ -527,6 +532,9 @@ const Compiler = struct {
     /// (before switching into the function's own `FnState`): each thunk compiles
     /// in isolation, in the current module's scope.
     fn attachDefaults(self: *Compiler, func: *Function, params: []const parser.Param) Error!void {
+        const names = try self.alloc.alloc([]const u8, params.len);
+        for (params, 0..) |p, i| names[i] = p.name;
+        func.param_names = names;
         func.required = requiredParamCount(params);
         if (func.required == params.len) return; // no defaults
         const defs = try self.alloc.alloc(?Value, params.len);
@@ -1397,9 +1405,23 @@ const Compiler = struct {
             .binary => |b| try self.binary(b),
             .call => |c| {
                 try self.expr(c.callee.*);
-                for (c.args) |arg| try self.expr(arg.*);
-                try self.emit(.call, c.span);
-                try self.emitByte(@intCast(c.args.len), c.span);
+                for (c.args) |arg| try self.expr(arg.value.*);
+                var has_named = false;
+                for (c.args) |arg| {
+                    if (arg.name != null) has_named = true;
+                }
+                if (has_named) {
+                    const names = try self.alloc.alloc(?[]const u8, c.args.len);
+                    for (c.args, 0..) |arg, i| names[i] = arg.name;
+                    const idx = self.chunk().kw_argnames.items.len;
+                    try self.chunk().kw_argnames.append(self.alloc, names);
+                    try self.emit(.call_kw, c.span);
+                    try self.emitByte(@intCast(c.args.len), c.span);
+                    try self.emitU16(@intCast(idx), c.span);
+                } else {
+                    try self.emit(.call, c.span);
+                    try self.emitByte(@intCast(c.args.len), c.span);
+                }
             },
             .index => |idx| {
                 try self.expr(idx.object.*);
@@ -1906,6 +1928,12 @@ const VM = struct {
                     try self.call(argc);
                     frame = &self.frames.items[self.frames.items.len - 1];
                 },
+                .call_kw => {
+                    const argc = self.readByte(frame);
+                    const names = chunk.kw_argnames.items[self.readU16(frame)];
+                    try self.callKw(argc, names);
+                    frame = &self.frames.items[self.frames.items.len - 1];
+                },
                 .ret => {
                     const result = self.pop();
                     const finished = self.frames.pop().?;
@@ -2214,6 +2242,58 @@ const VM = struct {
             try self.push(v);
         }
         return f.arity;
+    }
+
+    /// A call with named arguments: reorder the provided values into parameter
+    /// order (positional first, then by name), fill unprovided parameters from
+    /// their defaults, then dispatch as a normal positional call.
+    fn callKw(self: *VM, argc: usize, names: []const ?[]const u8) VMError!void {
+        const callee = self.peek(argc);
+        const f: *const Function = switch (callee) {
+            .closure => |cl| cl.func,
+            .bound_method => |bm| bm.func,
+            .type => |rt| rt.constructor,
+            else => return self.fail("named arguments are not allowed here", .{}),
+        };
+        // Copy the provided args off the stack, leaving the callee below.
+        const base = self.stack.items.len - argc;
+        const provided_vals = try self.alloc.dupe(Value, self.stack.items[base..]);
+        self.stack.shrinkRetainingCapacity(base);
+
+        const ordered = try self.alloc.alloc(Value, f.arity);
+        const filled = try self.alloc.alloc(bool, f.arity);
+        @memset(filled, false);
+
+        var pos: usize = 0;
+        while (pos < argc and names[pos] == null) pos += 1;
+        if (pos > f.arity) return self.fail("too many arguments (expected at most {d})", .{f.arity});
+        for (0..pos) |i| {
+            ordered[i] = provided_vals[i];
+            filled[i] = true;
+        }
+        var i: usize = pos;
+        while (i < argc) : (i += 1) {
+            const name = names[i].?;
+            var idx: ?usize = null;
+            for (f.param_names, 0..) |pn, j| {
+                if (std.mem.eql(u8, pn, name)) {
+                    idx = j;
+                    break;
+                }
+            }
+            const j = idx orelse return self.fail("no parameter named '{s}'", .{name});
+            if (filled[j]) return self.fail("argument '{s}' was already provided", .{name});
+            ordered[j] = provided_vals[i];
+            filled[j] = true;
+        }
+        for (0..f.arity) |j| {
+            if (filled[j]) continue;
+            const has_def = f.defaults.len == f.arity and f.defaults[j] != null;
+            if (!has_def) return self.fail("missing required argument '{s}'", .{f.param_names[j]});
+            ordered[j] = try self.callValueSync(f.defaults[j].?, &.{});
+        }
+        for (ordered) |v| try self.push(v);
+        try self.call(f.arity);
     }
 
     fn call(self: *VM, argc: usize) VMError!void {
@@ -2725,6 +2805,10 @@ fn disasmInstr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), ch: *const Chu
             try out.print(alloc, " {d}", .{code[offset + 1]});
             break :blk offset + 2;
         },
+        .call_kw => blk: {
+            try out.print(alloc, " {d} kw:{d}", .{ code[offset + 1], readU16At(code, offset + 2) });
+            break :blk offset + 4;
+        },
         .define_global, .get_member, .set_field => blk: {
             try out.print(alloc, " {s}", .{ch.constants.items[readU16At(code, offset + 1)].str});
             break :blk offset + 3;
@@ -2891,6 +2975,21 @@ test "vm: reaching an undefined module member is a runtime error" {
 
 test "vm: arithmetic and precedence" {
     try expectVMOutput("func main():\n    print(1 + 2 * 3 - 4)", "3\n");
+}
+
+test "vm: named arguments reorder, skip defaults, and work on lambdas" {
+    const src =
+        \\func box(w: int, h: int = 1, label: str = "?") -> str:
+        \\    return label + ":" + str(w) + "x" + str(h)
+        \\
+        \\func main():
+        \\    print(box(3))
+        \\    print(box(3, label: "R"))
+        \\    print(box(label: "Z", w: 4))
+        \\    var scale = func(n: int, k: int = 2): n * k
+        \\    print(scale(k: 3, n: 4))
+    ;
+    try expectVMOutput(src, "?:3x1\nR:3x1\nZ:4x1\n12\n");
 }
 
 test "vm: list and string slicing with clamping" {

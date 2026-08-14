@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (352 as of writing)
+zig build test                  # run every test (356 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -129,7 +129,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   arithmetic/comparison with precedence, **bitwise** `& | ^ ~ << >>` (int-only, tier
   between comparison and additive — `|`<`^`<`&`<shift<`+`; `<<`/`>>` lex as two adjacent
   `<`/`>` so nested generics keep single `>`), a range `a..b` (the ints `a` … `b-1`, as a
-  `list<int>`), calls, indexing `a[i]`, **slicing** `a[start:end]` (list/string; either
+  `list<int>`), calls (positional or **named** — `f(x, k: v)`; named args come after
+  positional, match a parameter by name, no duplicates, and unfilled params use their
+  defaults — see **Named arguments**), indexing `a[i]`, **slicing** `a[start:end]` (list/string; either
   bound optional → 0 / length; clamped, `end<start` ⇒ empty; negatives clamp to 0),
   member access `x.f`,
   array `[...]` and map `{k: v}` literals, tuple literals `(a, b, ...)` (two or more
@@ -265,6 +267,23 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `fillDefaults` runs the missing ones through `callValueSync` in `call`, padding the
   frame to full arity. The default's type is checked against the parameter's annotation.
   See `examples/defaults.rg` (runs on both backends).
+
+### Named arguments
+- A call may pass arguments by name: `f(x, k: v)`. Named args must **follow** all
+  positional args (a parser error otherwise); each name must match a parameter, no
+  parameter twice, and any parameter left unfilled uses its default (else "missing required
+  argument"). Works on functions, methods, static methods, constructors (`init`), and
+  lambdas; **builtins take positional args only** (named → analyzer error). `Expr.Arg` now
+  carries an optional `name`; `FuncSig.param_names` / VM `Function.param_names` drive the
+  mapping.
+- **Both backends reorder to a full positional array before binding.** The interpreter's
+  `reorderArgs` builds one value per parameter (positional by index, named by name, gaps via
+  `evalDefaultIn` in the callee's module) then runs the normal call path. The VM emits a
+  `call_kw` opcode (argc + an index into `Chunk.kw_argnames`); at runtime `callKw` copies the
+  provided values off the stack, reorders them by the callee `Function`'s `param_names`,
+  fills gaps by running the default thunks, re-pushes in parameter order, and dispatches like
+  a positional `call`. Byte-identical output; the analyzer's `checkNamedArgs` validates
+  names/dupes/arity at compile time (positional-only calls keep the exact old fast path).
 
 ### REPL
 - `repl` (or no file) starts a persistent interpreter session (`interpreter.Repl`

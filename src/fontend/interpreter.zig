@@ -184,6 +184,31 @@ pub const Value = union(enum) {
     module: *Env,
 };
 
+/// The parameter list of a callable value (for named-argument reordering), or
+/// null for a builtin / non-callable (which take positional args only).
+fn calleeParams(callee: Value) ?[]const parser.Param {
+    return switch (callee) {
+        .func => |f| f.decl.params,
+        .closure => |cl| cl.lambda.params,
+        .bound_method => |bm| bm.func.params,
+        .static_method => |sm| sm.func.params,
+        .type_ref => |ti| if (ti.methods.get("init")) |init| init.params else &.{},
+        else => null,
+    };
+}
+
+/// The home module of a callable value (where its default values are evaluated).
+fn calleeModule(callee: Value) ?*Env {
+    return switch (callee) {
+        .func => |f| f.module,
+        .closure => |cl| cl.module,
+        .bound_method => |bm| bm.owner.module,
+        .static_method => |sm| sm.ti.module,
+        .type_ref => |ti| ti.module,
+        else => null,
+    };
+}
+
 /// The count of leading parameters with no default value (defaults are
 /// trailing), i.e. the minimum number of arguments a call must supply.
 fn requiredParamCount(params: []const parser.Param) usize {
@@ -1713,9 +1738,83 @@ const Interpreter = struct {
 
     fn evalCall(self: *Interpreter, c: Expr.Call) Error!Value {
         const callee = try self.eval(c.callee.*);
+
+        var has_named = false;
+        for (c.args) |a| {
+            if (a.name != null) has_named = true;
+        }
+        if (has_named) {
+            const params = calleeParams(callee) orelse return self.fail(c.span, "named arguments are not allowed here", .{});
+            const module = calleeModule(callee) orelse return self.fail(c.span, "named arguments are not allowed here", .{});
+            const ordered = try self.reorderArgs(c, params, module, c.span);
+            return self.callValue(callee, ordered, c.span);
+        }
+
         const args = try self.arena.alloc(Value, c.args.len);
-        for (c.args, 0..) |arg, i| args[i] = try self.eval(arg.*);
+        for (c.args, 0..) |arg, i| args[i] = try self.eval(arg.value.*);
         return self.callValue(callee, args, c.span);
+    }
+
+    /// Evaluate a call's positional + named arguments into a full positional array
+    /// (one value per parameter): positional fill left-to-right, named fill by
+    /// name, and any unprovided parameter uses its default (evaluated in the
+    /// callee's module scope). Reports name/arity errors.
+    fn reorderArgs(self: *Interpreter, c: Expr.Call, params: []const parser.Param, module: *Env, span: Span) Error![]Value {
+        const ordered = try self.arena.alloc(Value, params.len);
+        const provided = try self.arena.alloc(bool, params.len);
+        for (provided) |*b| b.* = false;
+
+        var pos: usize = 0;
+        while (pos < c.args.len and c.args[pos].name == null) pos += 1;
+        if (pos > params.len) return self.fail(span, "too many arguments (expected at most {d})", .{params.len});
+        for (c.args[0..pos], 0..) |arg, i| {
+            ordered[i] = try self.eval(arg.value.*);
+            provided[i] = true;
+        }
+        for (c.args[pos..]) |arg| {
+            const name = arg.name.?;
+            var idx: ?usize = null;
+            for (params, 0..) |p, j| {
+                if (std.mem.eql(u8, p.name, name)) {
+                    idx = j;
+                    break;
+                }
+            }
+            const j = idx orelse return self.fail(span, "no parameter named '{s}'", .{name});
+            if (provided[j]) return self.fail(span, "argument '{s}' was already provided", .{name});
+            ordered[j] = try self.eval(arg.value.*);
+            provided[j] = true;
+        }
+        for (params, 0..) |p, j| {
+            if (!provided[j]) {
+                const d = p.default orelse return self.fail(span, "missing required argument '{s}'", .{p.name});
+                ordered[j] = try self.evalDefaultIn(module, d.*);
+            }
+        }
+        return ordered;
+    }
+
+    /// Evaluate a default-value expression in `module`'s scope (no receiver or
+    /// statics), matching how `bindArgs` fills omitted trailing arguments.
+    fn evalDefaultIn(self: *Interpreter, module: *Env, expr: Expr) Error!Value {
+        const saved_env = self.env;
+        const saved_globals = self.globals;
+        const saved_recv = self.current_receiver;
+        const saved_statics = self.current_statics;
+        const saved_static_ti = self.current_static_ti;
+        self.globals = module;
+        self.env = try self.newEnv(module);
+        self.current_receiver = null;
+        self.current_statics = null;
+        self.current_static_ti = null;
+        defer {
+            self.env = saved_env;
+            self.globals = saved_globals;
+            self.current_receiver = saved_recv;
+            self.current_statics = saved_statics;
+            self.current_static_ti = saved_static_ti;
+        }
+        return self.eval(expr);
     }
 
     /// Call any callable value with already-evaluated arguments. Shared by
@@ -2033,6 +2132,21 @@ test "recursion" {
         \\    print(fact(5))
     ;
     try expectOutput(src, "120\n");
+}
+
+test "named arguments reorder, skip defaults, and work on lambdas" {
+    const src =
+        \\func box(w: int, h: int = 1, label: str = "?") -> str:
+        \\    return label + ":" + str(w) + "x" + str(h)
+        \\
+        \\func main():
+        \\    print(box(3))
+        \\    print(box(3, label: "R"))
+        \\    print(box(label: "Z", w: 4))
+        \\    var scale = func(n: int, k: int = 2): n * k
+        \\    print(scale(k: 3, n: 4))
+    ;
+    try expectOutput(src, "?:3x1\nR:3x1\nZ:4x1\n12\n");
 }
 
 test "list and string slicing with clamping" {
