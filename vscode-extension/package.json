@@ -1,0 +1,65 @@
+{
+  "name": "rosegold",
+  "displayName": "RoseGold",
+  "description": "Language support for RoseGold (.rg): syntax highlighting and a language-server client (diagnostics, hover, go-to-definition, symbols).",
+  "version": "0.1.0",
+  "publisher": "rosegold",
+  "license": "MIT",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Programming Languages"],
+  "main": "./extension.js",
+  "activationEvents": ["onLanguage:rosegold"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "rosegold",
+        "aliases": ["RoseGold", "rosegold"],
+        "extensions": [".rg"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "rosegold",
+        "scopeName": "source.rosegold",
+        "path": "./syntaxes/rosegold.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "rosegold.run",
+        "title": "RoseGold: Run Current File"
+      },
+      {
+        "command": "rosegold.restartServer",
+        "title": "RoseGold: Restart Language Server"
+      }
+    ],
+    "configuration": {
+      "title": "RoseGold",
+      "properties": {
+        "rosegold.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the RoseGold_Zig executable. If empty, 'RoseGold_Zig' on your PATH is used."
+        },
+        "rosegold.useVm": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run files on the bytecode VM (run --vm) instead of the tree-walker."
+        },
+        "rosegold.enableLanguageServer": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the RoseGold language server for live diagnostics, hover, and navigation."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.75.0"
+  }
+}
