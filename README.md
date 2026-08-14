@@ -311,11 +311,18 @@ See [`CLAUDE.md`](CLAUDE.md) for a deeper implementation reference, and
 
 ## Editor support
 
-[`intellij-plugin/`](intellij-plugin/) is a JetBrains IDE plugin (Java + Gradle):
-syntax highlighting, `##` comment toggling, brace matching, keyword/builtin
-completion, live error highlighting via the `check` command, and run
-configurations that execute a file on either backend. See its
-[README](intellij-plugin/README.md) to build it.
+The compiler ships a **Language Server** — `RoseGold_Zig lsp` speaks LSP over
+stdio, reusing the parser + analyzer for live diagnostics (matching `check`),
+plus hover, go-to-definition, and a document-symbol outline. Any LSP-capable
+editor can drive it.
+
+- [`vscode-extension/`](vscode-extension/) — a VS Code client for the language
+  server, with a TextMate grammar for highlighting and a "run" command.
+- [`intellij-plugin/`](intellij-plugin/) — a JetBrains IDE plugin (Java + Gradle):
+  syntax highlighting, `##` comment toggling, brace matching, keyword/builtin
+  completion + quick-doc, live error highlighting via `check`, structure view,
+  folding, reformat via `fmt`, go-to-declaration, and run configurations for both
+  backends. See its [README](intellij-plugin/README.md) to build it.
 
 ## Status
 

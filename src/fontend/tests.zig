@@ -9,4 +9,5 @@ test {
     _ = @import("loader.zig");
     _ = @import("formatter.zig");
     _ = @import("vm.zig");
+    _ = @import("lsp.zig");
 }

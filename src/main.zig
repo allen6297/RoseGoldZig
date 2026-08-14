@@ -15,6 +15,7 @@ const Analyzer = @import("fontend/analyzer.zig");
 const Interpreter = @import("fontend/interpreter.zig");
 const Formatter = @import("fontend/formatter.zig");
 const Vm = @import("fontend/vm.zig");
+const Lsp = @import("fontend/lsp.zig");
 
 const usage =
     \\Usage: rosegold [run|check|repl|fmt] [<file.rg>]
@@ -25,6 +26,7 @@ const usage =
     \\  check   parse and analyze only, then report any problems
     \\  repl    start an interactive session (also the default with no file)
     \\  fmt     re-format the file in canonical style (stdout; `-w` rewrites it)
+    \\  lsp     run a Language Server over stdio (diagnostics, hover, go-to-def)
     \\
     \\  --path DIR (or -I DIR)   add a module search root for imports not found
     \\                           relative to the importing file (repeatable)
@@ -66,6 +68,12 @@ fn handle(
     // With no arguments, or an explicit `repl`, start an interactive session.
     if (args.len <= 1 or std.mem.eql(u8, args[1], "repl")) {
         return repl(arena, io, out, err);
+    }
+
+    // `lsp`: speak the Language Server Protocol over stdio. It's long-running and
+    // frees per message, so it uses a general (freeing) allocator, not the arena.
+    if (std.mem.eql(u8, args[1], "lsp")) {
+        return Lsp.run(std.heap.smp_allocator, io, out);
     }
 
     // `fmt [-w] <file>`: re-print the file in canonical style (or rewrite it).

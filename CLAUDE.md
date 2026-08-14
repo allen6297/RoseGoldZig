@@ -24,7 +24,8 @@ zig build run -- run --disasm FILE.rg  # print the compiled VM bytecode (don't r
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (323 as of writing)
+zig build run -- lsp            # run the Language Server over stdio (for editors)
+zig build test                  # run every test (326 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -32,7 +33,7 @@ zig test src/fontend/parser.zig
 zig test src/fontend/interpreter.zig   # covers parser + lexer too
 ```
 
-The CLI (`run`/`check`/`repl`/`fmt`, default `run` with a file / `repl` without)
+The CLI (`run`/`check`/`repl`/`fmt`/`lsp`, default `run` with a file / `repl` without)
 prints program output to **stdout** and renders diagnostics (with a source line +
 caret) to **stderr**, exiting non-zero on any error. `repl` starts an interactive
 read-eval-print loop whose definitions and values persist across entries. `fmt`
@@ -54,6 +55,7 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/fontend/interpreter.zig` | Tree-walking evaluator (the default backend, full language). |
 | `src/fontend/vm.zig` | Alternative backend behind `run --vm`: a bytecode compiler + stack VM covering the whole language, incl. modules + cross-module inheritance (see below). Also `run --disasm`. |
 | `src/fontend/formatter.zig` | Canonical source printer (AST → formatted text) behind `fmt`; re-emits `##` line comments by line. |
+| `src/fontend/lsp.zig` | Language Server (`lsp`): JSON-RPC over stdio. Reuses the parser+analyzer for live diagnostics (`publishDiagnostics`), plus hover, go-to-definition, and document symbols from a declaration scan. |
 | `src/fontend/tests.zig` | Test aggregator; the `zig build test` frontend target roots here. |
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
 | `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. |
@@ -272,6 +274,24 @@ drives the loader, then the analyzer and interpreter over the loaded module set
 - The checker resolves names at **definition time** (unlike the interpreter's
   call-time binding), so a forward reference to a not-yet-defined name is reported —
   define callees first, or put mutually-recursive definitions in one entry.
+
+### Language Server (`lsp`)
+- `lsp` (`lsp.zig`) speaks **LSP over stdio** (JSON-RPC with `Content-Length` framing;
+  `std.json` for parse + serialize). It runs on a freeing allocator (`smp_allocator`),
+  not the CLI arena, since it's long-running and frees per message.
+- **Diagnostics reuse the real front end**: each open/changed document is `parser.parse`d
+  and, if it parses cleanly, `analyzer.analyzeModule`d, and the diagnostics are published
+  (`textDocument/publishDiagnostics`) — so editor errors match `check`. Positions are
+  1-based front-end line/col → 0-based LSP, with the range widened over the identifier.
+- **Features:** `initialize` (advertises full text sync + hover/definition/documentSymbol),
+  `didOpen`/`didChange`/`didSave`/`didClose`, `hover` (stdlib builtin docs, or "kind name"
+  for a declaration), `definition` and `documentSymbol` (both from a grammar-free
+  declaration line scan — funcs/classes/structs/enums/signals/consts/vars). Unknown
+  requests get a null result so the client never hangs.
+- **Scope (v1):** documents are analyzed **standalone** (imports aren't resolved across
+  files, so cross-module member checks are deferred — single-file diagnostics are exact);
+  positions treat a column as a UTF-8 byte offset (correct for ASCII source). The VS Code
+  extension (`vscode-extension/`) is a client for this server.
 
 ### Bytecode VM (`run --vm`)
 - An alternative execution backend (`vm.zig`): a compiler lowers each function to a
