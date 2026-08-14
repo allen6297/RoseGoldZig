@@ -33,6 +33,10 @@
                                 implementationClass="org.rosegold.ide.RoseGoldCompletionContributor"/>
         <externalAnnotator language="RoseGold"
                            implementationClass="org.rosegold.ide.RoseGoldExternalAnnotator"/>
+        <externalFormatProcessor implementation="org.rosegold.ide.RoseGoldFormattingProcessor"/>
+        <lang.psiStructureViewFactory language="RoseGold"
+                                      implementationClass="org.rosegold.ide.structure.RoseGoldStructureViewFactory"/>
+        <lang.foldingBuilder language="RoseGold" implementationClass="org.rosegold.ide.RoseGoldFoldingBuilder"/>
 
         <applicationService serviceImplementation="org.rosegold.ide.RoseGoldSettings"/>
         <applicationConfigurable parentId="language"
