@@ -1552,6 +1552,10 @@ const VM = struct {
     /// Run each module's script in dependency order (populating that module's
     /// globals); the entry script (compiled last) calls `main`.
     fn run(self: *VM, programs: []const Program) VMError!void {
+        // Reserve the value and frame stacks up front so the hot push/call paths
+        // rarely re-check growth (they still grow on demand past this).
+        try self.stack.ensureTotalCapacity(self.alloc, 1024);
+        try self.frames.ensureTotalCapacity(self.alloc, 256);
         for (programs) |program| {
             // Each module gets its own copy of the builtins in its globals.
             inline for (builtin_names, 0..) |name, i| {

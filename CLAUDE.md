@@ -230,7 +230,8 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `Chunk` of stack-machine opcodes + constants, and a `VM` runs it over a value stack
   with a call-frame stack. It has its **own** small `Value` type (no coupling to the
   interpreter) and produces byte-identical output to the tree-walker. It now covers the
-  **entire language** — a genuine drop-in backend.
+  **entire language** — a genuine drop-in backend, and ~2.8–3.9× faster than the
+  tree-walker on compute-heavy code (see `bench/`, built `-Doptimize=ReleaseFast`).
   `run --disasm FILE` prints a human-readable listing of every compiled function's
   bytecode (`Vm.disassemble`) instead of running it — handy for inspecting codegen.
   A `pushFrame` guard bounds recursion (`max_call_depth`) so runaway recursion reports a
