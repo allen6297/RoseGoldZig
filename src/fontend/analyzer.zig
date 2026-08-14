@@ -220,7 +220,13 @@ fn alwaysReturns(stmts: []const Stmt) bool {
 fn stmtReturns(stmt: Stmt) bool {
     return switch (stmt) {
         .return_stmt => true,
+        // A `raise` never falls through to the next statement (it returns control
+        // to a `catch` or propagates), so it terminates this path.
+        .raise => true,
         .if_stmt => |x| ifReturns(x),
+        // `try/catch` guarantees a return only when both the body and the handler
+        // do: the body may raise (→ handler) before it would otherwise return.
+        .try_catch => |x| alwaysReturns(x.body) and alwaysReturns(x.handler),
         // `while true:` never falls through unless a `break` can exit it.
         .while_stmt => |x| switch (x.cond.*) {
             .bool_literal => |b| b.value and !hasBreak(x.body),
@@ -2146,6 +2152,37 @@ test "an if/else where both branches return is exhaustive" {
     var analysis = try analyzeSource(testing.allocator, src);
     defer analysis.deinit();
     try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a try/catch that returns in both arms is exhaustive; a raise terminates" {
+    const src =
+        \\func risky(n: int) -> int:
+        \\    if n < 0:
+        \\        raise "negative"
+        \\    return n
+        \\
+        \\func safe(n: int) -> int:
+        \\    try:
+        \\        return risky(n)
+        \\    catch e:
+        \\        return -1
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a try/catch whose handler falls through does not guarantee a return" {
+    const src =
+        \\func bad(n: int) -> int:
+        \\    try:
+        \\        return n
+        \\    catch e:
+        \\        print(e)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "must return int on all paths");
 }
 
 test "a trailing return satisfies the all-paths check" {

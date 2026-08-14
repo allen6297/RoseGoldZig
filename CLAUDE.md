@@ -24,7 +24,7 @@ zig build run -- run --disasm FILE.rg  # print the compiled VM bytecode (don't r
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (309 as of writing)
+zig build test                  # run every test (311 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -149,7 +149,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `extends`/`uses` validity + inheritance-aware assignability, member access
   (including inherited members) with `private` reachable only inside its own
   type, that every path of a function with a concrete return type returns a
-  value, and collection element types (a list/map literal's inferred element
+  value (a `raise` terminates a path; a `try/catch` counts as returning only when
+  both the body and the handler do), and collection element types (a list/map
+  literal's inferred element
   types, list/map indexing result + index type, `for`-binding types, and the
   collection builtins — `push`/`pop`/`keys`/`values`/`has`/`range` are typed
   element-aware, e.g. `pop(list<T>) → T`, `keys(map<K,V>) → list<K>`, `push`/`has`
