@@ -62,6 +62,7 @@ const Builtin = enum {
     contains, sort, reverse,
     trim,    starts_with, ends_with, find, replace,
     map,     filter, reduce,
+    sqrt,    pow,    floor,  ceil,  round,
 };
 
 /// The names bound to each builtin. Shared with the analyzer (see analyzer.zig)
@@ -73,6 +74,7 @@ pub const builtin_names = [_][]const u8{
     "contains", "sort", "reverse",
     "trim",     "starts_with", "ends_with", "find", "replace",
     "map",      "filter", "reduce",
+    "sqrt",     "pow",  "floor",   "ceil",   "round",
 };
 
 /// A field declared on a class/struct, with its default-value expression.
@@ -1431,6 +1433,32 @@ const Interpreter = struct {
                 }
                 return acc;
             },
+            .sqrt => {
+                if (args.len != 1) return self.fail(span, "sqrt expects 1 argument", .{});
+                const x = toFloat(args[0]) orelse return self.fail(span, "sqrt expects a number", .{});
+                return .{ .float = @sqrt(x) };
+            },
+            .pow => {
+                if (args.len != 2) return self.fail(span, "pow expects 2 arguments", .{});
+                const base = toFloat(args[0]) orelse return self.fail(span, "pow expects numbers", .{});
+                const exp = toFloat(args[1]) orelse return self.fail(span, "pow expects numbers", .{});
+                return .{ .float = std.math.pow(f64, base, exp) };
+            },
+            .floor => {
+                if (args.len != 1) return self.fail(span, "floor expects 1 argument", .{});
+                const x = toFloat(args[0]) orelse return self.fail(span, "floor expects a number", .{});
+                return .{ .int = @intFromFloat(@floor(x)) };
+            },
+            .ceil => {
+                if (args.len != 1) return self.fail(span, "ceil expects 1 argument", .{});
+                const x = toFloat(args[0]) orelse return self.fail(span, "ceil expects a number", .{});
+                return .{ .int = @intFromFloat(@ceil(x)) };
+            },
+            .round => {
+                if (args.len != 1) return self.fail(span, "round expects 1 argument", .{});
+                const x = toFloat(args[0]) orelse return self.fail(span, "round expects a number", .{});
+                return .{ .int = @intFromFloat(@round(x)) };
+            },
         }
     }
 
@@ -2493,6 +2521,17 @@ test "string and collection stdlib builtins" {
         \\    print(abs(-5), min(3, 7), max(3, 7))
     ;
     try expectOutput(src, "HI bye\n[a, b, c]\nx-y-z\ntrue true\n[1, 2, 3] [3, 2, 1]\n5 3 7\n");
+}
+
+test "math builtins: sqrt, pow, floor, ceil, round" {
+    const src =
+        \\func main():
+        \\    print(sqrt(16.0), pow(2.0, 10.0))
+        \\    print(floor(2.9), ceil(2.1), round(2.5), round(2.4))
+        \\    print(floor(-1.5), ceil(-1.5), round(-2.5))
+        \\    print(sqrt(9), pow(2, 8))
+    ;
+    try expectOutput(src, "4 1024\n2 3 3 2\n-2 -1 -3\n3 256\n");
 }
 
 test "map, filter, and reduce apply a callback over a list" {

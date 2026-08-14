@@ -24,7 +24,7 @@ zig build run -- run --disasm FILE.rg  # print the compiled VM bytecode (don't r
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (300 as of writing)
+zig build test                  # run every test (302 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -52,7 +52,7 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/fontend/loader.zig` | Module loader: reads + parses the entry file and its transitive imports into a dependency-ordered `Graph`; path resolution, dedup, cycle detection. |
 | `src/fontend/analyzer.zig` | Combined name resolution + type checking over the AST. |
 | `src/fontend/interpreter.zig` | Tree-walking evaluator (the default backend, full language). |
-| `src/fontend/vm.zig` | Alternative backend behind `run --vm`: a bytecode compiler + stack VM covering nearly all of the language, incl. modules (see below). |
+| `src/fontend/vm.zig` | Alternative backend behind `run --vm`: a bytecode compiler + stack VM covering the whole language, incl. modules + cross-module inheritance (see below). Also `run --disasm`. |
 | `src/fontend/formatter.zig` | Canonical source printer (AST → formatted text) behind `fmt`; re-emits `##` line comments by line. |
 | `src/fontend/tests.zig` | Test aggregator; the `zig build test` frontend target roots here. |
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
@@ -168,9 +168,10 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `range`, `str`, `int`, `float`, `push`, `pop`, `keys`, `values`, `has`, `connect`,
   `emit`, and the stdlib `abs`, `min`, `max`, `upper`, `lower`, `split`, `join`,
   `contains`, `sort`, `reverse`, `trim`, `starts_with`, `ends_with`, `find`
-  (index of substring/element, `-1` if absent), `replace`, and the higher-order
-  list builtins `map(list, f)`, `filter(list, pred)`, `reduce(list, f, init)`
-  (each invokes a callback — any callable).
+  (index of substring/element, `-1` if absent), `replace`, the math builtins
+  `sqrt`/`pow` (→ `float`) and `floor`/`ceil`/`round` (→ `int`), and the
+  higher-order list builtins `map(list, f)`, `filter(list, pred)`,
+  `reduce(list, f, init)` (each invokes a callback — any callable).
 
 ### Modules
 - **A module is a `.rg` file.** `import a.b` loads `a/b.rg` **relative to the importing

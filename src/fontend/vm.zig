@@ -38,6 +38,7 @@ const Builtin = enum {
     trim,    starts_with, ends_with, find, replace,
     map,     filter, reduce,
     connect, emit,
+    sqrt,    pow,    floor,  ceil,  round,
 };
 
 const builtin_names = [_][]const u8{
@@ -46,6 +47,7 @@ const builtin_names = [_][]const u8{
     "trim",  "starts_with", "ends_with", "find", "replace",
     "map",   "filter", "reduce",
     "connect", "emit",
+    "sqrt",  "pow",  "floor", "ceil", "round",
 };
 
 /// A compile-time upvalue descriptor: `is_local` captures local slot `index` of
@@ -2181,6 +2183,32 @@ const VM = struct {
                 }
                 return .nil;
             },
+            .sqrt => {
+                if (args.len != 1) return self.fail("sqrt expects 1 argument", .{});
+                const x = toFloat(args[0]) orelse return self.fail("sqrt expects a number", .{});
+                return .{ .float = @sqrt(x) };
+            },
+            .pow => {
+                if (args.len != 2) return self.fail("pow expects 2 arguments", .{});
+                const base = toFloat(args[0]) orelse return self.fail("pow expects numbers", .{});
+                const exp = toFloat(args[1]) orelse return self.fail("pow expects numbers", .{});
+                return .{ .float = std.math.pow(f64, base, exp) };
+            },
+            .floor => {
+                if (args.len != 1) return self.fail("floor expects 1 argument", .{});
+                const x = toFloat(args[0]) orelse return self.fail("floor expects a number", .{});
+                return .{ .int = @intFromFloat(@floor(x)) };
+            },
+            .ceil => {
+                if (args.len != 1) return self.fail("ceil expects 1 argument", .{});
+                const x = toFloat(args[0]) orelse return self.fail("ceil expects a number", .{});
+                return .{ .int = @intFromFloat(@ceil(x)) };
+            },
+            .round => {
+                if (args.len != 1) return self.fail("round expects 1 argument", .{});
+                const x = toFloat(args[0]) orelse return self.fail("round expects a number", .{});
+                return .{ .int = @intFromFloat(@round(x)) };
+            },
         }
     }
 
@@ -2578,6 +2606,17 @@ test "vm: stdlib builtins" {
         \\    print(replace("a-b", "-", "+"))
     ;
     try expectVMOutput(src, "5 3 7\nHI bye\n[1, 2, 3] [3, 2, 1]\n[a, b, c] x-y\ntrue 1\n[z] true\na+b\n");
+}
+
+test "vm: math builtins" {
+    const src =
+        \\func main():
+        \\    print(sqrt(16.0), pow(2.0, 10.0))
+        \\    print(floor(2.9), ceil(2.1), round(2.5), round(2.4))
+        \\    print(floor(-1.5), ceil(-1.5), round(-2.5))
+        \\    print(sqrt(9), pow(2, 8))
+    ;
+    try expectVMOutput(src, "4 1024\n2 3 3 2\n-2 -1 -3\n3 256\n");
 }
 
 test "vm: map, filter, and reduce with closures" {

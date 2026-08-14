@@ -1510,7 +1510,7 @@ const Analyzer = struct {
             eq(u8, name, "min") or eq(u8, name, "max") or eq(u8, name, "split") or
             eq(u8, name, "join") or eq(u8, name, "contains") or
             eq(u8, name, "starts_with") or eq(u8, name, "ends_with") or eq(u8, name, "find") or
-            eq(u8, name, "map") or eq(u8, name, "filter");
+            eq(u8, name, "map") or eq(u8, name, "filter") or eq(u8, name, "pow");
         const arity: usize = if (three) 3 else if (two) 2 else 1;
         if (c.args.len != arity) {
             try self.report(c.span, "{s} expects {d} argument(s), got {d}", .{ name, arity, c.args.len });
@@ -1594,6 +1594,22 @@ const Analyzer = struct {
         if (eq(u8, name, "reduce")) {
             if (args.len == 3) return args[2];
             return .unknown;
+        }
+        // Math builtins: sqrt/pow -> float; floor/ceil/round -> int. Each expects
+        // numbers (int widens to float).
+        if (eq(u8, name, "sqrt") or eq(u8, name, "pow")) {
+            for (args, 0..) |a, i| {
+                if (!isAnyish(a) and !isNumeric(a)) {
+                    try self.report(parser.exprSpan(c.args[i].*), "{s} expects a number, got {s}", .{ name, typeName(a) });
+                }
+            }
+            return .float;
+        }
+        if (eq(u8, name, "floor") or eq(u8, name, "ceil") or eq(u8, name, "round")) {
+            if (args.len == 1 and !isAnyish(args[0]) and !isNumeric(args[0])) {
+                try self.report(parser.exprSpan(c.args[0].*), "{s} expects a number, got {s}", .{ name, typeName(args[0]) });
+            }
+            return .int;
         }
         return .unknown;
     }
