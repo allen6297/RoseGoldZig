@@ -314,7 +314,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   holes; honors `includeDeclaration`; name-based, not scope-aware), `documentHighlight` (the
   same-file cousin — `collectRefs` over just the current buffer, declarations marked Write
   and other occurrences Read), `foldingRange` (`computeFoldingRanges`: indentation-based
-  colon-block bodies + runs of 2+ `##` comment lines), and `rename` /
+  colon-block bodies + runs of 2+ `##` comment lines), `formatting` (reformats the whole
+  document via `formatter.format` — same output as `fmt` — as one full-document `TextEdit`;
+  no edits when the file doesn't parse or is already canonical), and `rename` /
   `prepareRename`: `prepareRename` returns the identifier's range + placeholder (rejecting
   keywords), and `rename` reuses the same workspace search to emit a `WorkspaceEdit`
   (`documentChanges`: one `TextDocumentEdit` per file replacing every occurrence with the

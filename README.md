@@ -315,8 +315,8 @@ The compiler ships a **Language Server** — `RoseGold_Zig lsp` speaks LSP over
 stdio, reusing the parser + analyzer for live diagnostics (matching `check`),
 plus hover, go-to-definition, a document-symbol outline, completion
 (keywords, builtins, your declarations, and a module's exports after `mod.`),
-signature help, and workspace-wide find-references and rename. Any LSP-capable
-editor can drive it.
+signature help, document highlight, folding, formatting, and workspace-wide
+find-references and rename. Any LSP-capable editor can drive it.
 
 - [`vscode-extension/`](vscode-extension/) — a VS Code client for the language
   server, with a TextMate grammar for highlighting and a "run" command.

@@ -18,6 +18,7 @@ const Io = std.Io;
 const parser = @import("parser.zig");
 const analyzer = @import("analyzer.zig");
 const loader = @import("loader.zig");
+const formatter = @import("formatter.zig");
 const lexer = @import("lexer.zig");
 
 // --- LSP wire types (serialized to JSON by std.json) -------------------------
@@ -744,6 +745,8 @@ const Server = struct {
                 try self.onDocumentHighlight(id.?, params);
             } else if (std.mem.eql(u8, method, "textDocument/foldingRange")) {
                 try self.onFoldingRange(id.?, params);
+            } else if (std.mem.eql(u8, method, "textDocument/formatting")) {
+                try self.onFormatting(id.?, params);
             } else if (std.mem.eql(u8, method, "textDocument/prepareRename")) {
                 try self.onPrepareRename(id.?, params);
             } else if (std.mem.eql(u8, method, "textDocument/rename")) {
@@ -796,6 +799,7 @@ const Server = struct {
             referencesProvider: bool,
             documentHighlightProvider: bool,
             foldingRangeProvider: bool,
+            documentFormattingProvider: bool,
             completionProvider: struct { triggerCharacters: []const []const u8 },
             signatureHelpProvider: struct { triggerCharacters: []const []const u8 },
             renameProvider: struct { prepareProvider: bool },
@@ -811,6 +815,7 @@ const Server = struct {
                 .referencesProvider = true,
                 .documentHighlightProvider = true,
                 .foldingRangeProvider = true,
+                .documentFormattingProvider = true,
                 .completionProvider = .{ .triggerCharacters = &.{"."} },
                 .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
                 .renameProvider = .{ .prepareProvider = true },
@@ -1156,6 +1161,29 @@ const Server = struct {
         var out: std.ArrayList(FoldingRange) = .empty;
         computeFoldingRanges(arena_state.allocator(), text, &out) catch return self.respond(id, empty);
         try self.respond(id, out.items);
+    }
+
+    /// Reformat the whole document through the compiler's formatter, returned as a
+    /// single full-document `TextEdit`. A file that doesn't parse (or is already
+    /// canonical) yields no edits.
+    fn onFormatting(self: *Server, id: std.json.Value, params: ?std.json.Value) !void {
+        const empty = &[_]TextEdit{};
+        const uri = self.uriOf(params) orelse return self.respond(id, empty);
+        const text = self.docs.get(uri) orelse return self.respond(id, empty);
+
+        var tree = parser.parse(self.gpa, text) catch return self.respond(id, empty);
+        defer tree.deinit();
+        if (tree.diagnostics.len > 0) return self.respond(id, empty); // don't reformat a broken file
+
+        const formatted = formatter.format(self.gpa, tree.module, tree.comments) catch return self.respond(id, empty);
+        defer self.gpa.free(formatted);
+        if (std.mem.eql(u8, formatted, text)) return self.respond(id, empty); // already canonical
+
+        const edit = TextEdit{
+            .range = .{ .start = .{ .line = 0, .character = 0 }, .end = offsetToPos(text, text.len) },
+            .newText = formatted,
+        };
+        try self.respond(id, &[_]TextEdit{edit});
     }
 
     /// Highlight every occurrence of the identifier under the cursor within the
