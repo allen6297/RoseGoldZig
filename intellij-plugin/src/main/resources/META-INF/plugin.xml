@@ -37,6 +37,12 @@
         <lang.psiStructureViewFactory language="RoseGold"
                                       implementationClass="org.rosegold.ide.structure.RoseGoldStructureViewFactory"/>
         <lang.foldingBuilder language="RoseGold" implementationClass="org.rosegold.ide.RoseGoldFoldingBuilder"/>
+        <lang.documentationProvider language="RoseGold"
+                                    implementationClass="org.rosegold.ide.RoseGoldDocumentationProvider"/>
+        <enterHandlerDelegate implementation="org.rosegold.ide.RoseGoldEnterHandler"/>
+        <defaultLiveTemplates file="/liveTemplates/RoseGold.xml"/>
+        <liveTemplateContext contextId="ROSEGOLD"
+                             implementation="org.rosegold.ide.RoseGoldTemplateContextType"/>
 
         <applicationService serviceImplementation="org.rosegold.ide.RoseGoldSettings"/>
         <applicationConfigurable parentId="language"
