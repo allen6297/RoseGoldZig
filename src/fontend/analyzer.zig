@@ -1420,6 +1420,7 @@ const Analyzer = struct {
             .call => |c| try self.typeCall(c),
             .index => |i| try self.typeIndex(i),
             .slice => |s| try self.typeSlice(s),
+            .comprehension => |c| try self.typeComprehension(c),
             .member => |m| blk: {
                 const ot = try self.typeOf(m.object.*);
                 break :blk try self.memberType(ot, m.name, m.span);
@@ -1873,6 +1874,45 @@ const Analyzer = struct {
                 break :blk .unknown;
             },
         };
+    }
+
+    fn typeComprehension(self: *Analyzer, c: *const Expr.Comprehension) Error!Type {
+        const iter_t = try self.typeOf(c.iter.*);
+        const child = try self.newScope(self.current);
+        if (c.value_binding) |vb| {
+            const first_t: Type = switch (iter_t) {
+                .map => |m| m.key,
+                .list, .str => .int,
+                else => .unknown,
+            };
+            const second_t: Type = switch (iter_t) {
+                .list => |l| l.elem,
+                .map => |m| m.value,
+                .str => .str,
+                else => .unknown,
+            };
+            try self.declareIn(child, c.binding, .binding, first_t, c.span);
+            try self.declareIn(child, vb, .binding, second_t, c.span);
+        } else {
+            const bt: Type = switch (iter_t) {
+                .list => |l| l.elem,
+                .map => |m| m.key,
+                .str => .str,
+                else => .unknown,
+            };
+            try self.declareIn(child, c.binding, .binding, bt, c.span);
+        }
+        const saved = self.current;
+        self.current = child;
+        defer self.current = saved;
+        if (c.cond) |cond| {
+            const ct = try self.typeOf(cond.*);
+            if (!isBoolish(ct)) {
+                try self.report(parser.exprSpan(cond.*), "comprehension condition must be bool, got {s}", .{typeName(ct)});
+            }
+        }
+        const out_t = try self.typeOf(c.output.*);
+        return self.makeList(out_t);
     }
 
     fn typeMatch(self: *Analyzer, m: Expr.Match) Error!Type {
@@ -2656,6 +2696,16 @@ test "arithmetic on non-numbers is reported" {
     var analysis = try analyzeSource(testing.allocator, "const x: int = true + 1");
     defer analysis.deinit();
     try expectMessageContains(analysis, "'+'");
+}
+
+test "list comprehension types to list of the output type; condition must be bool" {
+    var ok = try analyzeSource(testing.allocator, "func f(xs: list<int>) -> list<int>:\n    return [x * 2 for x in xs if x > 0]");
+    defer ok.deinit();
+    try testing.expectEqual(@as(usize, 0), ok.diagnostics.len);
+
+    var bad = try analyzeSource(testing.allocator, "func f(xs: list<int>):\n    var z = [x for x in xs if x]");
+    defer bad.deinit();
+    try expectMessageContains(bad, "comprehension condition must be bool");
 }
 
 test "named arguments: valid reorder is clean; bad names/dupes/builtins are rejected" {

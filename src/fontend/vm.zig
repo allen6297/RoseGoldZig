@@ -290,6 +290,7 @@ const Op = enum(u8) {
     call_kw, // u8 argc, u16 index into chunk.kw_argnames
     ret,
     build_list, // u16 count
+    list_append, // pop value, pop list, append value to list (for comprehensions)
     build_map, // u16 entry count (2*count values popped)
     build_tuple, // u16 count -> pop count values into a tuple
     unpack, // u16 count -> pop a tuple/list of exactly count, push its elements
@@ -1473,7 +1474,83 @@ const Compiler = struct {
             },
             .lambda => |lam| try self.compileLambda(lam),
             .match => |m| try self.compileMatch(m),
+            .comprehension => |c| try self.compileComprehension(c),
         }
+    }
+
+    /// `[out for x[, v] in iter [if cond]]` compiles to an accumulator loop: a
+    /// hidden `$acc` list (at the result slot) plus the same `iter_*` machinery as
+    /// a for-loop; each round appends `out` (guarded by `cond`). After the loop the
+    /// for-machinery locals are popped, leaving `$acc` as the expression's value.
+    fn compileComprehension(self: *Compiler, c: *const Expr.Comprehension) Error!void {
+        // The hidden locals land at the current stack top; pad the locals array so
+        // each local's index equals its runtime stack slot (as `match` does).
+        const base = self.cur.stack_top;
+        const orig_len = self.cur.locals.items.len;
+        defer self.cur.locals.shrinkRetainingCapacity(orig_len);
+        while (self.cur.locals.items.len < base) {
+            try self.cur.locals.append(self.alloc, .{ .name = "$c", .depth = self.cur.scope_depth });
+        }
+
+        // $acc = [] — this slot holds the result.
+        try self.emit(.build_list, c.span);
+        try self.emitU16(0, c.span);
+        const acc_slot = self.cur.locals.items.len;
+        try self.cur.locals.append(self.alloc, .{ .name = "$acc", .depth = self.cur.scope_depth });
+        // iterable + index + binding(s)
+        try self.expr(c.iter.*);
+        const it_slot = self.cur.locals.items.len;
+        try self.cur.locals.append(self.alloc, .{ .name = "$cit", .depth = self.cur.scope_depth });
+        try self.emitConst(.{ .int = 0 }, c.span);
+        const idx_slot = self.cur.locals.items.len;
+        try self.cur.locals.append(self.alloc, .{ .name = "$cidx", .depth = self.cur.scope_depth });
+        const first_slot = self.cur.locals.items.len;
+        try self.cur.locals.append(self.alloc, .{ .name = c.binding, .depth = self.cur.scope_depth });
+        try self.emit(.nil, c.span);
+        var second_slot: usize = 0;
+        if (c.value_binding) |vb| {
+            second_slot = self.cur.locals.items.len;
+            try self.cur.locals.append(self.alloc, .{ .name = vb, .depth = self.cur.scope_depth });
+            try self.emit(.nil, c.span);
+        }
+
+        const start = self.here();
+        try self.emitLocal(.get_local, idx_slot, c.span);
+        try self.emitLocal(.get_local, it_slot, c.span);
+        try self.emit(.iter_len, c.span);
+        try self.emit(.lt, c.span);
+        const exit = try self.emitJump(.jump_if_false, c.span);
+        if (c.value_binding != null) {
+            try self.emitBind(.iter_key, it_slot, idx_slot, first_slot, c.span);
+            try self.emitBind(.iter_val, it_slot, idx_slot, second_slot, c.span);
+        } else {
+            try self.emitBind(.iter_single, it_slot, idx_slot, first_slot, c.span);
+        }
+        // Optional filter: skip the append when the condition is false.
+        var skip: ?usize = null;
+        if (c.cond) |cond| {
+            self.cur.stack_top = self.cur.locals.items.len;
+            try self.expr(cond.*);
+            skip = try self.emitJump(.jump_if_false, c.span);
+        }
+        // $acc.append(out)
+        try self.emitLocal(.get_local, acc_slot, c.span);
+        self.cur.stack_top = self.cur.locals.items.len + 1;
+        try self.expr(c.output.*);
+        try self.emit(.list_append, c.span);
+        if (skip) |s| self.patchJump(s);
+        // increment
+        try self.emitLocal(.get_local, idx_slot, c.span);
+        try self.emitConst(.{ .int = 1 }, c.span);
+        try self.emit(.add, c.span);
+        try self.emitLocal(.set_local, idx_slot, c.span);
+        try self.emit(.pop, c.span);
+        try self.emitLoopJump(start, c.span);
+        self.patchJump(exit);
+
+        // Pop the for-machinery locals ($cit, $cidx, binding[, value]), leaving $acc.
+        var extras = self.cur.locals.items.len - (acc_slot + 1);
+        while (extras > 0) : (extras -= 1) try self.emit(.pop, c.span);
     }
 
     fn binary(self: *Compiler, b: Expr.Binary) Error!void {
@@ -1957,6 +2034,11 @@ const VM = struct {
                     try l.appendSlice(self.alloc, self.stack.items[start..]);
                     self.stack.shrinkRetainingCapacity(start);
                     try self.push(.{ .list = l });
+                },
+                .list_append => {
+                    const value = self.pop();
+                    const list = self.pop();
+                    try list.list.append(self.alloc, value);
                 },
                 .build_tuple => {
                     const count = self.readU16(frame);
@@ -2975,6 +3057,20 @@ test "vm: reaching an undefined module member is a runtime error" {
 
 test "vm: arithmetic and precedence" {
     try expectVMOutput("func main():\n    print(1 + 2 * 3 - 4)", "3\n");
+}
+
+test "vm: list comprehensions: map, filter, two bindings, and nesting" {
+    const src =
+        \\func main():
+        \\    var xs = [1, 2, 3, 4, 5]
+        \\    print([x * x for x in xs])
+        \\    print([x for x in xs if x % 2 == 0])
+        \\    print([i * v for i, v in xs])
+        \\    print([[y for y in range(x)] for x in range(3)])
+        \\    var n = 10
+        \\    print([x + n for x in xs if x > 3])
+    ;
+    try expectVMOutput(src, "[1, 4, 9, 16, 25]\n[2, 4]\n[0, 2, 6, 12, 20]\n[[], [0], [0, 1]]\n[14, 15]\n");
 }
 
 test "vm: named arguments reorder, skip defaults, and work on lambdas" {

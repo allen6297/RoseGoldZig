@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (356 as of writing)
+zig build test                  # run every test (360 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -59,7 +59,7 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/fontend/tests.zig` | Test aggregator; the `zig build test` frontend target roots here. |
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
 | `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. |
-| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, and `defaults.rg` (run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
+| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, `defaults.rg`, and `features.rg` (bitwise/slicing/named-args/comprehensions — run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
 
 Each layer imports the ones below it (`interpreter`/`analyzer` → `parser` → `lexer`,
 and `loader`/`formatter` → `parser`); there are no upward dependencies. `main.zig`
@@ -134,7 +134,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   defaults — see **Named arguments**), indexing `a[i]`, **slicing** `a[start:end]` (list/string; either
   bound optional → 0 / length; clamped, `end<start` ⇒ empty; negatives clamp to 0),
   member access `x.f`,
-  array `[...]` and map `{k: v}` literals, tuple literals `(a, b, ...)` (two or more
+  array `[...]` and map `{k: v}` literals, **list comprehensions**
+  `[out for x[, v] in iter if cond]` (build a list; the `if` filter and a second
+  `i, x` binding are optional — mirrors `for`), tuple literals `(a, b, ...)` (two or more
   elements; a single `(e)` is just grouping), anonymous functions `func(params): expr`
   (single expression, implicitly returned; or `func(params):` + an indented block)
   that close over the surrounding scope, and `match subj { pattern: body, ... }`

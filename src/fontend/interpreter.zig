@@ -1591,6 +1591,7 @@ const Interpreter = struct {
             .call => |c| try self.evalCall(c),
             .index => |idx| try self.evalIndex(idx),
             .slice => |s| try self.evalSlice(s),
+            .comprehension => |c| try self.evalComprehension(c),
             .array => |a| try self.evalArray(a),
             .map => |m| try self.evalMap(m),
             .match => |m| try self.evalMatch(m),
@@ -1894,6 +1895,52 @@ const Interpreter = struct {
         return .{ .list = l };
     }
 
+    fn evalComprehension(self: *Interpreter, c: *const Expr.Comprehension) Error!Value {
+        const iter = try self.eval(c.iter.*);
+        const two = c.value_binding != null;
+        var firsts: List = .empty;
+        var seconds: List = .empty;
+        var single_first = false;
+        switch (iter) {
+            .list => |l| for (l.items, 0..) |el, i| {
+                try firsts.append(self.arena, .{ .int = @intCast(i) });
+                try seconds.append(self.arena, el);
+            },
+            .str => |s| for (0..s.len) |i| {
+                try firsts.append(self.arena, .{ .int = @intCast(i) });
+                try seconds.append(self.arena, .{ .str = s[i .. i + 1] });
+            },
+            .map => |m| {
+                single_first = true;
+                for (m.entries.items) |entry| {
+                    try firsts.append(self.arena, entry.key);
+                    try seconds.append(self.arena, entry.value);
+                }
+            },
+            else => return self.fail(c.span, "cannot iterate over {s}", .{@tagName(iter)}),
+        }
+
+        const out = try self.arena.create(List);
+        out.* = .empty;
+        for (firsts.items, seconds.items) |first, second| {
+            const child = try self.newEnv(self.env);
+            const saved = self.env;
+            self.env = child;
+            defer self.env = saved;
+            if (two) {
+                try self.define(child, c.binding, first);
+                try self.define(child, c.value_binding.?, second);
+            } else {
+                try self.define(child, c.binding, if (single_first) first else second);
+            }
+            if (c.cond) |cond| {
+                if (!isTruthy(try self.eval(cond.*))) continue;
+            }
+            try out.append(self.arena, try self.eval(c.output.*));
+        }
+        return .{ .list = out };
+    }
+
     /// Evaluate and clamp a slice's `[start:end]` bounds against a length.
     fn sliceBounds(self: *Interpreter, s: Expr.Slice, len: usize, span: Span) Error!struct { start: usize, end: usize } {
         const n: i64 = @intCast(len);
@@ -2132,6 +2179,20 @@ test "recursion" {
         \\    print(fact(5))
     ;
     try expectOutput(src, "120\n");
+}
+
+test "list comprehensions: map, filter, two bindings, and nesting" {
+    const src =
+        \\func main():
+        \\    var xs = [1, 2, 3, 4, 5]
+        \\    print([x * x for x in xs])
+        \\    print([x for x in xs if x % 2 == 0])
+        \\    print([i * v for i, v in xs])
+        \\    print([[y for y in range(x)] for x in range(3)])
+        \\    var n = 10
+        \\    print([x + n for x in xs if x > 3])
+    ;
+    try expectOutput(src, "[1, 4, 9, 16, 25]\n[2, 4]\n[0, 2, 6, 12, 20]\n[[], [0], [0, 1]]\n[14, 15]\n");
 }
 
 test "named arguments reorder, skip defaults, and work on lambdas" {

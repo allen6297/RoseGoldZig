@@ -488,6 +488,23 @@ const Formatter = struct {
                 try self.w(".");
                 try self.w(m.name);
             },
+            .comprehension => |c| {
+                try self.w("[");
+                try self.expr(c.output.*);
+                try self.w(" for ");
+                try self.w(c.binding);
+                if (c.value_binding) |vb| {
+                    try self.w(", ");
+                    try self.w(vb);
+                }
+                try self.w(" in ");
+                try self.expr(c.iter.*);
+                if (c.cond) |cond| {
+                    try self.w(" if ");
+                    try self.expr(cond.*);
+                }
+                try self.w("]");
+            },
             .array => |a| {
                 try self.w("[");
                 for (a.elements, 0..) |el, i| {
@@ -631,6 +648,13 @@ test "formats default parameter values" {
     const out = try fmt(gpa, "func f(a,b=1+1,c=\"x\"):\n    return a");
     defer gpa.free(out);
     try testing.expectEqualStrings("func f(a, b = 1 + 1, c = \"x\"):\n    return a\n", out);
+}
+
+test "formats list comprehensions" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "func main():\n    print([ x*2 for x in xs if x>0 ])\n    print([v for k,v in m])");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("func main():\n    print([x * 2 for x in xs if x > 0])\n    print([v for k, v in m])\n", out);
 }
 
 test "formats named call arguments" {

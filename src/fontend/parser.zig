@@ -102,8 +102,18 @@ pub const Expr = union(enum) {
     interpolation: *const Interpolation,
     range: Range,
     tuple: Tuple,
+    comprehension: *const Comprehension,
 
     pub const Literal = struct { text: []const u8, span: Span };
+    /// `[output for binding[, value_binding] in iter [if cond]]` — builds a list.
+    pub const Comprehension = struct {
+        output: *Expr,
+        binding: []const u8,
+        value_binding: ?[]const u8,
+        iter: *Expr,
+        cond: ?*Expr,
+        span: Span,
+    };
     /// A fixed, ordered group of values: `(a, b, ...)` (two or more elements).
     pub const Tuple = struct { elements: []const *Expr, span: Span };
     pub const Range = struct { start: *Expr, end: *Expr, span: Span };
@@ -299,6 +309,7 @@ pub fn exprSpan(e: Expr) Span {
         .interpolation => |x| x.span,
         .range => |r| r.span,
         .tuple => |t| t.span,
+        .comprehension => |c| c.span,
     };
 }
 
@@ -1253,7 +1264,7 @@ const Parser = struct {
             },
             .kw_func => return self.parseLambda(),
             .kw_match => return self.mkExpr(.{ .match = try self.parseMatch() }),
-            .l_bracket => return self.mkExpr(.{ .array = try self.parseArrayLiteral() }),
+            .l_bracket => return self.parseArrayOrComprehension(),
             .l_brace => return self.mkExpr(.{ .map = try self.parseMapLiteral() }),
             .l_paren => {
                 const lp = self.advance();
@@ -1281,21 +1292,55 @@ const Parser = struct {
 
     /// `[e0, e1, ...]`. Newlines are suppressed inside `[`, so elements are
     /// comma-separated; a trailing comma is allowed.
-    fn parseArrayLiteral(self: *Parser) Error!Expr.Array {
+    /// `[e0, e1, ...]` (array literal) or `[out for x[, v] in iter [if cond]]`
+    /// (list comprehension), distinguished by a `for` after the first expression.
+    fn parseArrayOrComprehension(self: *Parser) Error!*Expr {
         const lbracket = self.advance(); // '['
+        if (self.at(.r_bracket)) {
+            const rbracket = self.advance();
+            return self.mkExpr(.{ .array = .{ .elements = &.{}, .span = spanFrom(lbracket, rbracket) } });
+        }
+        const first = try self.parseExpr();
+        if (self.at(.kw_for)) return self.finishComprehension(lbracket, first);
+
         var elements: std.ArrayList(*Expr) = .empty;
-        if (!self.at(.r_bracket)) {
-            while (true) {
+        try elements.append(self.alloc, first);
+        if (self.eat(.comma)) {
+            while (!self.at(.r_bracket)) {
                 try elements.append(self.alloc, try self.parseExpr());
                 if (!self.eat(.comma)) break;
-                if (self.at(.r_bracket)) break; // trailing comma
             }
         }
         const rbracket = try self.expect(.r_bracket, "expected ']' to close the array");
-        return .{
+        return self.mkExpr(.{ .array = .{
             .elements = try elements.toOwnedSlice(self.alloc),
             .span = spanFrom(lbracket, rbracket),
+        } });
+    }
+
+    fn finishComprehension(self: *Parser, lbracket: Token, output: *Expr) Error!*Expr {
+        _ = self.advance(); // 'for'
+        const binding = try self.expect(.identifier, "expected a loop variable after 'for'");
+        var value_binding: ?[]const u8 = null;
+        if (self.eat(.comma)) {
+            const second = try self.expect(.identifier, "expected a second loop variable after ','");
+            value_binding = second.text;
+        }
+        _ = try self.expect(.kw_in, "expected 'in' after the loop variable");
+        const iter = try self.parseExpr();
+        var cond: ?*Expr = null;
+        if (self.eat(.kw_if)) cond = try self.parseExpr();
+        const rbracket = try self.expect(.r_bracket, "expected ']' to close the comprehension");
+        const c = try self.alloc.create(Expr.Comprehension);
+        c.* = .{
+            .output = output,
+            .binding = binding.text,
+            .value_binding = value_binding,
+            .iter = iter,
+            .cond = cond,
+            .span = spanFrom(lbracket, rbracket),
         };
+        return self.mkExpr(.{ .comprehension = c });
     }
 
     /// `{k0: v0, k1: v1}`. Newlines stay significant inside `{`, so entries may

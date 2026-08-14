@@ -369,6 +369,11 @@ fn findLambdasInExpr(a: std.mem.Allocator, e: *const parser.Expr, scopes: *std.A
         .interpolation => |ip| for (ip.parts) |part| {
             if (part == .expr) try findLambdasInExpr(a, part.expr, scopes);
         },
+        .comprehension => |c| {
+            try findLambdasInExpr(a, c.output, scopes);
+            try findLambdasInExpr(a, c.iter, scopes);
+            if (c.cond) |cond| try findLambdasInExpr(a, cond, scopes);
+        },
         else => {}, // literals, identifier, member name
     }
 }
