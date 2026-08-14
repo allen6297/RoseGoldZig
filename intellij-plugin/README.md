@@ -1,0 +1,71 @@
+# RoseGold — IntelliJ Platform plugin
+
+Editor support for RoseGold (`.rg`) files in IntelliJ IDEA and other JetBrains
+IDEs. Written in Java against the IntelliJ Platform.
+
+## Features
+
+- **Syntax highlighting** — keywords, built-in types, strings, numbers, `##`
+  comments, operators, and brackets, with a configurable color scheme
+  (*Settings | Editor | Color Scheme | RoseGold*).
+- **`##` line-comment toggling** (`Cmd/Ctrl-/`) and **brace matching** for
+  `()`, `[]`, `{}`.
+- **Completion** — keywords, built-in types, and the standard-library builtins
+  (`print`, `map`, `reduce`, `sqrt`, `emit`, …).
+- **Live error highlighting** — an external annotator runs the RoseGold
+  compiler's `check` command and underlines real diagnostics in the editor.
+- **Run configurations** — Run a `.rg` file from the gutter/right-click menu, on
+  the tree-walker or (with a checkbox) the bytecode VM (`run --vm`).
+
+## Build & install
+
+You need a JetBrains IDE (which bundles Gradle) or a standalone Gradle 8.2+.
+
+**From the IDE:** open the `intellij-plugin/` folder in IntelliJ IDEA as a Gradle
+project, then run the **`runIde`** Gradle task to launch a sandbox IDE with the
+plugin, or **`buildPlugin`** to produce `build/distributions/rosegold-intellij-*.zip`.
+
+**From the command line** (with Gradle on PATH):
+
+```bash
+cd intellij-plugin
+gradle buildPlugin          # → build/distributions/rosegold-intellij-0.1.0.zip
+gradle runIde               # launch a sandbox IDE to try it
+```
+
+Then install the zip via *Settings | Plugins | ⚙ | Install Plugin from Disk…*.
+
+> This project has no committed Gradle wrapper (`gradlew`) binary. Either run
+> `gradle wrapper` once to generate it, or just open the project in IntelliJ,
+> which supplies its own Gradle.
+
+## Pointing it at the compiler
+
+The live-error annotator and the run configurations invoke the `RoseGold_Zig`
+executable. It's resolved in this order:
+
+1. the path set in *Settings | Languages & Frameworks | RoseGold*,
+2. `zig-out/bin/RoseGold_Zig` under the project root (i.e. after `zig build`),
+3. `RoseGold_Zig` on your `PATH`.
+
+Live errors reflect the file **on disk**, so they refresh when you save.
+
+## Layout
+
+```
+build.gradle · settings.gradle · gradle.properties
+src/main/resources/META-INF/plugin.xml     — extension-point wiring
+src/main/resources/icons/rosegold.svg      — file-type icon
+src/main/java/org/rosegold/ide/            — language, lexer, highlighting, annotator, completion
+src/main/java/org/rosegold/ide/run/        — run configuration
+```
+
+## Status / caveats
+
+This plugin was written to build against **IntelliJ Platform 2023.3** (`sinceBuild
+233`) with **JDK 17**. It targets stable, long-lived platform APIs. It has **not
+been compiled or run in the environment where it was authored** (no Gradle / no
+IntelliJ SDK there) — so treat it as a solid starting point rather than a shipped
+artifact: opening it in IntelliJ will surface any version-specific API tweaks
+immediately. The run-configuration classes touch the most version-sensitive APIs
+and are the likeliest to need a small adjustment for your exact IDE build.

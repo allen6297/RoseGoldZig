@@ -304,6 +304,14 @@ See [`CLAUDE.md`](CLAUDE.md) for a deeper implementation reference, and
 [`examples/`](examples/) for runnable programs (`demo.rg`, `app.rg` + its modules,
 `signals.rg`, `mathdemo.rg`, `primes.rg`, and `messy.rg` for the formatter).
 
+## Editor support
+
+[`intellij-plugin/`](intellij-plugin/) is a JetBrains IDE plugin (Java + Gradle):
+syntax highlighting, `##` comment toggling, brace matching, keyword/builtin
+completion, live error highlighting via the `check` command, and run
+configurations that execute a file on either backend. See its
+[README](intellij-plugin/README.md) to build it.
+
 ## Status
 
 Feature-complete for a language of this size: full static analysis, two

@@ -1,0 +1,46 @@
+<idea-plugin>
+    <id>org.rosegold.ide</id>
+    <name>RoseGold</name>
+    <version>0.1.0</version>
+    <vendor>RoseGold</vendor>
+
+    <description><![CDATA[
+        Language support for <b>RoseGold</b> (<code>.rg</code>) files:
+        <ul>
+            <li>Syntax highlighting (keywords, types, strings, numbers, comments)</li>
+            <li><code>##</code> line-comment toggling and brace matching</li>
+            <li>Keyword &amp; builtin code completion</li>
+            <li>Live error highlighting via the RoseGold compiler's <code>check</code> command</li>
+            <li>Run configurations that execute a file on the tree-walker or the bytecode VM</li>
+        </ul>
+        Set the path to the <code>RoseGold_Zig</code> executable in
+        <i>Settings | Languages &amp; Frameworks | RoseGold</i>.
+    ]]></description>
+
+    <depends>com.intellij.modules.lang</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <fileType name="RoseGold" implementationClass="org.rosegold.ide.RoseGoldFileType"
+                  fieldName="INSTANCE" language="RoseGold" extensions="rg"/>
+        <lang.parserDefinition language="RoseGold"
+                               implementationClass="org.rosegold.ide.RoseGoldParserDefinition"/>
+        <lang.syntaxHighlighterFactory language="RoseGold"
+                                       implementationClass="org.rosegold.ide.RoseGoldSyntaxHighlighterFactory"/>
+        <colorSettingsPage implementation="org.rosegold.ide.RoseGoldColorSettingsPage"/>
+        <lang.commenter language="RoseGold" implementationClass="org.rosegold.ide.RoseGoldCommenter"/>
+        <lang.braceMatcher language="RoseGold" implementationClass="org.rosegold.ide.RoseGoldBraceMatcher"/>
+        <completion.contributor language="RoseGold"
+                                implementationClass="org.rosegold.ide.RoseGoldCompletionContributor"/>
+        <externalAnnotator language="RoseGold"
+                           implementationClass="org.rosegold.ide.RoseGoldExternalAnnotator"/>
+
+        <applicationService serviceImplementation="org.rosegold.ide.RoseGoldSettings"/>
+        <applicationConfigurable parentId="language"
+                                 id="org.rosegold.ide.RoseGoldConfigurable"
+                                 displayName="RoseGold"
+                                 instance="org.rosegold.ide.RoseGoldConfigurable"/>
+
+        <configurationType implementation="org.rosegold.ide.run.RoseGoldRunConfigurationType"/>
+        <runConfigurationProducer implementation="org.rosegold.ide.run.RoseGoldRunConfigurationProducer"/>
+    </extensions>
+</idea-plugin>
