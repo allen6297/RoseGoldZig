@@ -311,7 +311,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   occurrence of the identifier under the cursor across the workspace — all open buffers plus
   the `.rg` files walked (`Io.Dir.walk`) under the document's directory and the search roots
   (`collectRefs` skips `##` comments and string text but includes identifiers inside `${…}`
-  holes; honors `includeDeclaration`; name-based, not scope-aware), and `rename` /
+  holes; honors `includeDeclaration`; name-based, not scope-aware), `documentHighlight` (the
+  same-file cousin — `collectRefs` over just the current buffer, declarations marked Write
+  and other occurrences Read), and `rename` /
   `prepareRename`: `prepareRename` returns the identifier's range + placeholder (rejecting
   keywords), and `rename` reuses the same workspace search to emit a `WorkspaceEdit`
   (`documentChanges`: one `TextDocumentEdit` per file replacing every occurrence with the

@@ -31,6 +31,8 @@ const LspDiag = struct {
     message: []const u8,
 };
 const Location = struct { uri: []const u8, range: Range };
+/// `kind`: 1 = Text, 2 = Read, 3 = Write.
+const DocumentHighlight = struct { range: Range, kind: u32 };
 
 // rename / workspace-edit wire types
 const TextEdit = struct { range: Range, newText: []const u8 };
@@ -681,6 +683,8 @@ const Server = struct {
                 try self.onSignatureHelp(id.?, params);
             } else if (std.mem.eql(u8, method, "textDocument/references")) {
                 try self.onReferences(id.?, params);
+            } else if (std.mem.eql(u8, method, "textDocument/documentHighlight")) {
+                try self.onDocumentHighlight(id.?, params);
             } else if (std.mem.eql(u8, method, "textDocument/prepareRename")) {
                 try self.onPrepareRename(id.?, params);
             } else if (std.mem.eql(u8, method, "textDocument/rename")) {
@@ -731,6 +735,7 @@ const Server = struct {
             definitionProvider: bool,
             documentSymbolProvider: bool,
             referencesProvider: bool,
+            documentHighlightProvider: bool,
             completionProvider: struct { triggerCharacters: []const []const u8 },
             signatureHelpProvider: struct { triggerCharacters: []const []const u8 },
             renameProvider: struct { prepareProvider: bool },
@@ -744,6 +749,7 @@ const Server = struct {
                 .definitionProvider = true,
                 .documentSymbolProvider = true,
                 .referencesProvider = true,
+                .documentHighlightProvider = true,
                 .completionProvider = .{ .triggerCharacters = &.{"."} },
                 .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
                 .renameProvider = .{ .prepareProvider = true },
@@ -1078,6 +1084,43 @@ const Server = struct {
             .activeParameter = active,
         };
         try self.respond(id, result);
+    }
+
+    /// Highlight every occurrence of the identifier under the cursor within the
+    /// current document (the same-file, single-buffer cousin of references).
+    /// Declaration sites are marked Write, other occurrences Read.
+    fn onDocumentHighlight(self: *Server, id: std.json.Value, params: ?std.json.Value) !void {
+        const empty = &[_]DocumentHighlight{};
+        const p = params orelse return self.respond(id, empty);
+        const uri = self.uriOf(params) orelse return self.respond(id, empty);
+        const text = self.docs.get(uri) orelse return self.respond(id, empty);
+        const pos = objGet(p, "position") orelse return self.respond(id, empty);
+        const line = intField(pos, "line") orelse return self.respond(id, empty);
+        const character = intField(pos, "character") orelse return self.respond(id, empty);
+        const off = offsetAt(text, @intCast(line), @intCast(character)) orelse return self.respond(id, empty);
+        const target = identAt(text, off) orelse return self.respond(id, empty);
+
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+
+        var offs: std.ArrayList(usize) = .empty;
+        collectRefs(a, text, target, &offs) catch return self.respond(id, empty);
+        const decls: []const usize = declNameOffsets(a, text) catch &.{};
+
+        var hls: std.ArrayList(DocumentHighlight) = .empty;
+        for (offs.items) |o| {
+            const ps = offsetToPos(text, o);
+            const kind: u32 = if (std.mem.indexOfScalar(usize, decls, o) != null) 3 else 2; // Write / Read
+            hls.append(a, .{
+                .range = .{
+                    .start = ps,
+                    .end = .{ .line = ps.line, .character = ps.character + @as(u32, @intCast(target.len)) },
+                },
+                .kind = kind,
+            }) catch {};
+        }
+        try self.respond(id, hls.items);
     }
 
     /// Find every reference to the identifier under the cursor across the
