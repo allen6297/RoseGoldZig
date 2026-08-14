@@ -158,6 +158,17 @@ const Value = union(enum) {
     tuple: *List,
 };
 
+fn bitOpSymbol(op: Op) []const u8 {
+    return switch (op) {
+        .bit_and => "&",
+        .bit_or => "|",
+        .bit_xor => "^",
+        .shl => "<<",
+        .shr => ">>",
+        else => "?",
+    };
+}
+
 /// The count of leading parameters with no default value (defaults are
 /// trailing), i.e. the minimum number of arguments a call must supply.
 fn requiredParamCount(params: []const parser.Param) usize {
@@ -253,6 +264,12 @@ const Op = enum(u8) {
     le,
     gt,
     ge,
+    bit_and,
+    bit_or,
+    bit_xor,
+    shl,
+    shr,
+    bit_not,
     get_local, // u8 slot
     set_local, // u8 slot (stores top, keeps it on the stack)
     get_global, // u16 name-const index
@@ -1373,6 +1390,7 @@ const Compiler = struct {
                 try self.emit(switch (u.op) {
                     .neg => .negate,
                     .not => .not,
+                    .bit_not => .bit_not,
                 }, u.span);
             },
             .binary => |b| try self.binary(b),
@@ -1451,6 +1469,11 @@ const Compiler = struct {
             .le => .le,
             .gt => .gt,
             .ge => .ge,
+            .bit_and => .bit_and,
+            .bit_or => .bit_or,
+            .bit_xor => .bit_xor,
+            .shl => .shl,
+            .shr => .shr,
             else => unreachable,
         }, b.span);
     }
@@ -1778,7 +1801,13 @@ const VM = struct {
                     }
                 },
                 .not => try self.push(.{ .bool = !isTruthy(self.pop()) }),
+                .bit_not => {
+                    const v = self.pop();
+                    if (v != .int) return self.fail("unary '~' requires an int, got {s}", .{@tagName(v)});
+                    try self.push(.{ .int = ~v.int });
+                },
                 .add, .sub, .mul, .div, .mod => try self.arith(op),
+                .bit_and, .bit_or, .bit_xor, .shl, .shr => try self.bitwise(op),
                 .eq => {
                     const b = self.pop();
                     const a = self.pop();
@@ -2068,6 +2097,22 @@ const VM = struct {
             .mul => x * y,
             .div => if (y == 0) return self.fail("division by zero", .{}) else x / y,
             .mod => @rem(x, y),
+            else => unreachable,
+        } });
+    }
+
+    fn bitwise(self: *VM, op: Op) VMError!void {
+        const b = self.pop();
+        const a = self.pop();
+        if (a != .int or b != .int) return self.fail("operator '{s}' requires int operands", .{bitOpSymbol(op)});
+        const x = a.int;
+        const y = b.int;
+        try self.push(.{ .int = switch (op) {
+            .bit_and => x & y,
+            .bit_or => x | y,
+            .bit_xor => x ^ y,
+            .shl => if (y < 0) return self.fail("negative shift amount", .{}) else std.math.shl(i64, x, @as(u64, @intCast(y))),
+            .shr => if (y < 0) return self.fail("negative shift amount", .{}) else std.math.shr(i64, x, @as(u64, @intCast(y))),
             else => unreachable,
         } });
     }
@@ -2800,6 +2845,21 @@ test "vm: reaching an undefined module member is a runtime error" {
 
 test "vm: arithmetic and precedence" {
     try expectVMOutput("func main():\n    print(1 + 2 * 3 - 4)", "3\n");
+}
+
+test "vm: bitwise operators and precedence" {
+    const src =
+        \\func main():
+        \\    print(6 & 3)
+        \\    print(6 | 1)
+        \\    print(6 ^ 3)
+        \\    print(~5)
+        \\    print(1 << 4)
+        \\    print(255 >> 2)
+        \\    print(1 << 2 | 1)
+        \\    print(2 + 3 << 1)
+    ;
+    try expectVMOutput(src, "2\n7\n5\n-6\n16\n63\n5\n10\n");
 }
 
 test "vm: default parameters fill omitted trailing arguments" {

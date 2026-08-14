@@ -1608,6 +1608,10 @@ const Interpreter = struct {
                 else => self.fail(u.span, "cannot negate {s}", .{@tagName(v)}),
             },
             .not => return .{ .bool = !isTruthy(v) },
+            .bit_not => return switch (v) {
+                .int => |n| .{ .int = ~n },
+                else => self.fail(u.span, "unary '~' requires an int, got {s}", .{@tagName(v)}),
+            },
         }
     }
 
@@ -1634,6 +1638,23 @@ const Interpreter = struct {
             .eq => .{ .bool = valuesEqual(l, r) },
             .ne => .{ .bool = !valuesEqual(l, r) },
             .lt, .le, .gt, .ge => try self.evalOrder(b.op, l, r, b.span),
+            .bit_and, .bit_or, .bit_xor, .shl, .shr => try self.evalBitwise(b.op, l, r, b.span),
+            else => unreachable,
+        };
+    }
+
+    fn evalBitwise(self: *Interpreter, op: BinaryOp, l: Value, r: Value, span: Span) Error!Value {
+        if (l != .int or r != .int) {
+            return self.fail(span, "operator '{s}' requires int operands", .{opSymbol(op)});
+        }
+        const x = l.int;
+        const y = r.int;
+        return switch (op) {
+            .bit_and => .{ .int = x & y },
+            .bit_or => .{ .int = x | y },
+            .bit_xor => .{ .int = x ^ y },
+            .shl => if (y < 0) self.fail(span, "negative shift amount", .{}) else .{ .int = std.math.shl(i64, x, @as(u64, @intCast(y))) },
+            .shr => if (y < 0) self.fail(span, "negative shift amount", .{}) else .{ .int = std.math.shr(i64, x, @as(u64, @intCast(y))) },
             else => unreachable,
         };
     }
@@ -1928,6 +1949,11 @@ fn opSymbol(op: BinaryOp) []const u8 {
         .mul => "*",
         .div => "/",
         .mod => "%",
+        .bit_and => "&",
+        .bit_or => "|",
+        .bit_xor => "^",
+        .shl => "<<",
+        .shr => ">>",
         else => "?",
     };
 }
@@ -1968,6 +1994,21 @@ test "recursion" {
         \\    print(fact(5))
     ;
     try expectOutput(src, "120\n");
+}
+
+test "bitwise operators and precedence" {
+    const src =
+        \\func main():
+        \\    print(6 & 3)
+        \\    print(6 | 1)
+        \\    print(6 ^ 3)
+        \\    print(~5)
+        \\    print(1 << 4)
+        \\    print(255 >> 2)
+        \\    print(1 << 2 | 1)
+        \\    print(2 + 3 << 1)
+    ;
+    try expectOutput(src, "2\n7\n5\n-6\n16\n63\n5\n10\n");
 }
 
 test "default parameters fill omitted trailing arguments" {

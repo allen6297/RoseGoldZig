@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (343 as of writing)
+zig build test                  # run every test (348 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -126,7 +126,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
 - **Expressions:** literals (incl. `nil`), string interpolation `"a ${expr} b"`
   (the parser splits the literal and sub-parses each hole; `\$` escapes; no string
   literals inside a hole), identifiers, `and`/`or`/`not`,
-  arithmetic/comparison with precedence, a range `a..b` (the ints `a` … `b-1`, as a
+  arithmetic/comparison with precedence, **bitwise** `& | ^ ~ << >>` (int-only, tier
+  between comparison and additive — `|`<`^`<`&`<shift<`+`; `<<`/`>>` lex as two adjacent
+  `<`/`>` so nested generics keep single `>`), a range `a..b` (the ints `a` … `b-1`, as a
   `list<int>`), calls, indexing `a[i]`, member access `x.f`,
   array `[...]` and map `{k: v}` literals, tuple literals `(a, b, ...)` (two or more
   elements; a single `(e)` is just grouping), anonymous functions `func(params): expr`

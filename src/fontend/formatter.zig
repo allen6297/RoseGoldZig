@@ -67,8 +67,12 @@ fn binPrec(op: BinaryOp) u8 {
         .logical_or => 1,
         .logical_and => 2,
         .eq, .ne, .lt, .le, .gt, .ge => 3,
-        .add, .sub => 4,
-        .mul, .div, .mod => 5,
+        .bit_or => 4,
+        .bit_xor => 5,
+        .bit_and => 6,
+        .shl, .shr => 7,
+        .add, .sub => 8,
+        .mul, .div, .mod => 9,
     };
 }
 
@@ -85,6 +89,11 @@ fn opStr(op: BinaryOp) []const u8 {
         .le => "<=",
         .gt => ">",
         .ge => ">=",
+        .bit_and => "&",
+        .bit_or => "|",
+        .bit_xor => "^",
+        .shl => "<<",
+        .shr => ">>",
         .logical_and => "and",
         .logical_or => "or",
     };
@@ -443,6 +452,7 @@ const Formatter = struct {
                 switch (u.op) {
                     .neg => try self.w("-"),
                     .not => try self.w("not "),
+                    .bit_not => try self.w("~"),
                 }
                 try self.operand(u.operand.*);
             },
@@ -609,6 +619,13 @@ test "formats default parameter values" {
     const out = try fmt(gpa, "func f(a,b=1+1,c=\"x\"):\n    return a");
     defer gpa.free(out);
     try testing.expectEqualStrings("func f(a, b = 1 + 1, c = \"x\"):\n    return a\n", out);
+}
+
+test "formats bitwise operators without redundant parens" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "func main():\n    var x=1<<3|6&3^~0");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("func main():\n    var x = 1 << 3 | 6 & 3 ^ ~0\n", out);
 }
 
 test "re-adds precedence-required parentheses" {

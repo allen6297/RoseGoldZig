@@ -91,6 +91,10 @@ pub const TokenKind = enum {
     lt_eq,
     gt,
     gt_eq,
+    amp, // &
+    pipe, // |
+    caret, // ^
+    tilde, // ~
 
     // layout
     newline,
@@ -457,6 +461,10 @@ pub const Lexer = struct {
                 break :blk .dot;
             },
             '?' => .question,
+            '&' => .amp,
+            '|' => .pipe,
+            '^' => .caret,
+            '~' => .tilde,
             '+' => self.oneOrEq(.plus, .plus_eq),
             '*' => self.oneOrEq(.star, .star_eq),
             '/' => self.oneOrEq(.slash, .slash_eq),

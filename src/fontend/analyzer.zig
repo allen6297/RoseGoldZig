@@ -198,6 +198,11 @@ fn opSymbol(op: BinaryOp) []const u8 {
         .le => "<=",
         .gt => ">",
         .ge => ">=",
+        .bit_and => "&",
+        .bit_or => "|",
+        .bit_xor => "^",
+        .shl => "<<",
+        .shr => ">>",
         .logical_and => "and",
         .logical_or => "or",
     };
@@ -1492,6 +1497,13 @@ const Analyzer = struct {
                 }
                 return .bool;
             },
+            .bit_not => {
+                if (!isAnyish(ot) and tagOf(ot) != .int) {
+                    try self.report(u.span, "unary '~' requires an int, got {s}", .{typeName(ot)});
+                    return .unknown;
+                }
+                return .int;
+            },
         }
     }
 
@@ -1526,6 +1538,12 @@ const Analyzer = struct {
                     try self.report(b.span, "cannot order {s} and {s}", .{ typeName(lt), typeName(rt) });
                 }
                 return .bool;
+            },
+            .bit_and, .bit_or, .bit_xor, .shl, .shr => {
+                if (isAnyish(lt) or isAnyish(rt)) return .unknown;
+                if (tagOf(lt) == .int and tagOf(rt) == .int) return .int;
+                try self.reportOperator(b.span, b.op, lt, rt);
+                return .unknown;
             },
             .logical_and, .logical_or => {
                 if (!isBoolish(lt) or !isBoolish(rt)) {
@@ -2535,6 +2553,22 @@ test "arithmetic on non-numbers is reported" {
     var analysis = try analyzeSource(testing.allocator, "const x: int = true + 1");
     defer analysis.deinit();
     try expectMessageContains(analysis, "'+'");
+}
+
+test "bitwise operators require int operands" {
+    var a1 = try analyzeSource(testing.allocator, "const x: int = 2.0 & 1");
+    defer a1.deinit();
+    try expectMessageContains(a1, "'&'");
+
+    var a2 = try analyzeSource(testing.allocator, "const y: int = ~true");
+    defer a2.deinit();
+    try expectMessageContains(a2, "unary '~' requires an int");
+}
+
+test "bitwise on ints type-checks to int" {
+    var analysis = try analyzeSource(testing.allocator, "const x: int = 1 << 3 | 6 & 3 ^ ~0");
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
 }
 
 test "logical operator requires bool operands" {

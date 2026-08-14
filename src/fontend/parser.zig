@@ -71,11 +71,16 @@ pub const BinaryOp = enum {
     le,
     gt,
     ge,
+    bit_and,
+    bit_or,
+    bit_xor,
+    shl,
+    shr,
     logical_and,
     logical_or,
 };
 
-pub const UnaryOp = enum { neg, not };
+pub const UnaryOp = enum { neg, not, bit_not };
 
 pub const Expr = union(enum) {
     int_literal: Literal,
@@ -302,14 +307,23 @@ fn patternSpan(p: Pattern) Span {
 
 // --- operator tables ---------------------------------------------------------
 
+// Precedence tiers (higher binds tighter). Bitwise sits between comparison and
+// additive, Python-style: `|` < `^` < `&` < shift < `+ -` < `* / %`. Shifts
+// (`<<` `>>`) are two adjacent `<`/`>` tokens, handled specially in `parseBinary`
+// (tier 5) so nested generics like `list<list<int>>` still close with single `>`.
 fn precedence(kind: TokenKind) u8 {
     return switch (kind) {
-        .star, .slash, .percent => 3,
-        .plus, .minus => 2,
+        .star, .slash, .percent => 7,
+        .plus, .minus => 6,
+        .amp => 4,
+        .caret => 3,
+        .pipe => 2,
         .eq, .bang_eq, .lt, .lt_eq, .gt, .gt_eq => 1,
         else => 0,
     };
 }
+
+const shift_prec: u8 = 5;
 
 /// The arithmetic op behind a compound-assignment token (`+=` → `add`, …), or
 /// null if the token isn't one.
@@ -337,6 +351,9 @@ fn binaryOp(kind: TokenKind) BinaryOp {
         .lt_eq => .le,
         .gt => .gt,
         .gt_eq => .ge,
+        .amp => .bit_and,
+        .pipe => .bit_or,
+        .caret => .bit_xor,
         else => unreachable,
     };
 }
@@ -1067,9 +1084,36 @@ const Parser = struct {
         return self.parseBinary(1);
     }
 
+    /// If the next two tokens are an adjacent `<<` or `>>`, the shift op. They lex
+    /// as separate `<`/`>` tokens, so a nested generic like `list<list<int>>`
+    /// still closes with single `>` tokens in `parseType`.
+    fn peekShift(self: *Parser) ?BinaryOp {
+        const k = self.peekKind();
+        if (k != .lt and k != .gt) return null;
+        if (self.pos + 1 >= self.tokens.len) return null;
+        const t0 = self.tokens[self.pos];
+        const t1 = self.tokens[self.pos + 1];
+        if (t1.kind != k or t1.span.start != t0.span.end) return null;
+        return if (k == .lt) .shl else .shr;
+    }
+
     fn parseBinary(self: *Parser, min_prec: u8) Error!*Expr {
         var lhs = try self.parseUnary();
         while (true) {
+            if (self.peekShift()) |op| {
+                if (shift_prec < min_prec) break;
+                _ = self.advance(); // first '<' or '>'
+                _ = self.advance(); // second
+                const lhs_span = exprSpan(lhs.*);
+                const rhs = try self.parseBinary(shift_prec + 1);
+                lhs = try self.mkExpr(.{ .binary = .{
+                    .op = op,
+                    .lhs = lhs,
+                    .rhs = rhs,
+                    .span = joinSpan(lhs_span, exprSpan(rhs.*)),
+                } });
+                continue;
+            }
             const prec = precedence(self.peekKind());
             if (prec == 0 or prec < min_prec) break;
             const op_tok = self.advance();
@@ -1086,11 +1130,11 @@ const Parser = struct {
     }
 
     fn parseUnary(self: *Parser) Error!*Expr {
-        if (self.at(.minus)) {
+        if (self.at(.minus) or self.at(.tilde)) {
             const op = self.advance();
             const operand = try self.parseUnary();
             return self.mkExpr(.{ .unary = .{
-                .op = .neg,
+                .op = if (op.kind == .tilde) .bit_not else .neg,
                 .operand = operand,
                 .span = joinSpan(op.span, exprSpan(operand.*)),
             } });
