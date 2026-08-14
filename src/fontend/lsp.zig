@@ -31,6 +31,13 @@ const LspDiag = struct {
     message: []const u8,
 };
 const Location = struct { uri: []const u8, range: Range };
+
+// rename / workspace-edit wire types
+const TextEdit = struct { range: Range, newText: []const u8 };
+const OptVersionedDocId = struct { uri: []const u8, version: ?i64 = null };
+const TextDocumentEdit = struct { textDocument: OptVersionedDocId, edits: []const TextEdit };
+const WorkspaceEdit = struct { documentChanges: []const TextDocumentEdit };
+const PrepareRename = struct { range: Range, placeholder: []const u8 };
 const SymbolInformation = struct {
     name: []const u8,
     kind: u32,
@@ -374,9 +381,11 @@ fn builtinSignature(a: std.mem.Allocator, name: []const u8) ?Signature {
     return null;
 }
 
-/// The identifier surrounding `offset` (the cursor may sit just past its end),
-/// or null if there's no identifier there.
-fn identAt(text: []const u8, offset: usize) ?[]const u8 {
+const IdentBounds = struct { start: usize, end: usize };
+
+/// The byte bounds of the identifier surrounding `offset` (the cursor may sit
+/// just past its end), or null if there's no identifier there.
+fn identBoundsAt(text: []const u8, offset: usize) ?IdentBounds {
     var o = offset;
     if (o > 0 and (o >= text.len or !isIdentChar(text[o])) and isIdentChar(text[o - 1])) o -= 1;
     if (o >= text.len or !isIdentChar(text[o])) return null;
@@ -384,7 +393,30 @@ fn identAt(text: []const u8, offset: usize) ?[]const u8 {
     while (s > 0 and isIdentChar(text[s - 1])) s -= 1;
     var e = o;
     while (e < text.len and isIdentChar(text[e])) e += 1;
-    return text[s..e];
+    return .{ .start = s, .end = e };
+}
+
+/// The identifier surrounding `offset`, or null if there's none.
+fn identAt(text: []const u8, offset: usize) ?[]const u8 {
+    const b = identBoundsAt(text, offset) orelse return null;
+    return text[b.start..b.end];
+}
+
+fn isKeyword(name: []const u8) bool {
+    for (KEYWORDS) |k| {
+        if (std.mem.eql(u8, k, name)) return true;
+    }
+    return false;
+}
+
+/// Whether `name` is usable as a new identifier for rename (a valid, non-keyword
+/// identifier).
+fn isValidIdent(name: []const u8) bool {
+    if (name.len == 0 or !isIdentStart(name[0])) return false;
+    for (name) |c| {
+        if (!isIdentChar(c)) return false;
+    }
+    return !isKeyword(name);
 }
 
 // --- builtin documentation ---------------------------------------------------
@@ -649,6 +681,10 @@ const Server = struct {
                 try self.onSignatureHelp(id.?, params);
             } else if (std.mem.eql(u8, method, "textDocument/references")) {
                 try self.onReferences(id.?, params);
+            } else if (std.mem.eql(u8, method, "textDocument/prepareRename")) {
+                try self.onPrepareRename(id.?, params);
+            } else if (std.mem.eql(u8, method, "textDocument/rename")) {
+                try self.onRename(id.?, params);
             } else if (id) |rid| {
                 // Any other request: reply with null so the client isn't left waiting.
                 try self.respond(rid, @as(?u8, null));
@@ -697,6 +733,7 @@ const Server = struct {
             referencesProvider: bool,
             completionProvider: struct { triggerCharacters: []const []const u8 },
             signatureHelpProvider: struct { triggerCharacters: []const []const u8 },
+            renameProvider: struct { prepareProvider: bool },
         },
         serverInfo: struct { name: []const u8, version: []const u8 },
     } {
@@ -709,6 +746,7 @@ const Server = struct {
                 .referencesProvider = true,
                 .completionProvider = .{ .triggerCharacters = &.{"."} },
                 .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
+                .renameProvider = .{ .prepareProvider = true },
             },
             .serverInfo = .{ .name = "rosegold-lsp", .version = "0.1.0" },
         };
@@ -1068,18 +1106,8 @@ const Server = struct {
         defer arena_state.deinit();
         const a = arena_state.allocator();
 
-        // Candidate files: path → source. Open buffers win over disk.
         var files: std.StringHashMapUnmanaged([]const u8) = .{};
-        var it = self.docs.iterator();
-        while (it.next()) |e| {
-            const path = uriToPath(a, e.key_ptr.*) orelse continue;
-            files.put(a, path, e.value_ptr.*) catch {};
-        }
-        var budget: usize = 4000; // cap files walked, guarding pathological trees
-        if (uriToPath(a, uri)) |dp| {
-            if (std.fs.path.dirname(dp)) |dir| self.walkRgFiles(a, dir, &files, &budget);
-        }
-        for (self.roots.items) |r| self.walkRgFiles(a, r, &files, &budget);
+        self.gatherWorkspaceFiles(a, uri, &files);
 
         var locs: std.ArrayList(Location) = .empty;
         var fit = files.iterator();
@@ -1105,6 +1133,89 @@ const Server = struct {
             }
         }
         try self.respond(id, locs.items);
+    }
+
+    /// Populate `files` (path → source) with every candidate `.rg` file for a
+    /// workspace-wide query: all open buffers (they win over disk), then the files
+    /// walked from the document's directory and the search roots.
+    fn gatherWorkspaceFiles(self: *Server, a: std.mem.Allocator, uri: []const u8, files: *std.StringHashMapUnmanaged([]const u8)) void {
+        var it = self.docs.iterator();
+        while (it.next()) |e| {
+            const path = uriToPath(a, e.key_ptr.*) orelse continue;
+            files.put(a, path, e.value_ptr.*) catch {};
+        }
+        var budget: usize = 4000; // cap files walked, guarding pathological trees
+        if (uriToPath(a, uri)) |dp| {
+            if (std.fs.path.dirname(dp)) |dir| self.walkRgFiles(a, dir, files, &budget);
+        }
+        for (self.roots.items) |r| self.walkRgFiles(a, r, files, &budget);
+    }
+
+    /// Validate a rename request: reply with the identifier's range + placeholder,
+    /// or null when the cursor isn't on a renameable identifier (e.g. a keyword).
+    fn onPrepareRename(self: *Server, id: std.json.Value, params: ?std.json.Value) !void {
+        const p = params orelse return self.respond(id, @as(?u8, null));
+        const uri = self.uriOf(params) orelse return self.respond(id, @as(?u8, null));
+        const text = self.docs.get(uri) orelse return self.respond(id, @as(?u8, null));
+        const pos = objGet(p, "position") orelse return self.respond(id, @as(?u8, null));
+        const line = intField(pos, "line") orelse return self.respond(id, @as(?u8, null));
+        const character = intField(pos, "character") orelse return self.respond(id, @as(?u8, null));
+        const off = offsetAt(text, @intCast(line), @intCast(character)) orelse return self.respond(id, @as(?u8, null));
+        const b = identBoundsAt(text, off) orelse return self.respond(id, @as(?u8, null));
+        const name = text[b.start..b.end];
+        if (isKeyword(name)) return self.respond(id, @as(?u8, null));
+        try self.respond(id, PrepareRename{
+            .range = .{ .start = offsetToPos(text, b.start), .end = offsetToPos(text, b.end) },
+            .placeholder = name,
+        });
+    }
+
+    /// Rename the identifier under the cursor to `newName` everywhere in the
+    /// workspace: the same whole-word search as find-references, emitted as a
+    /// WorkspaceEdit (one TextDocumentEdit per file). Name-based, not scope-aware.
+    fn onRename(self: *Server, id: std.json.Value, params: ?std.json.Value) !void {
+        const p = params orelse return self.respond(id, @as(?u8, null));
+        const uri = self.uriOf(params) orelse return self.respond(id, @as(?u8, null));
+        const text = self.docs.get(uri) orelse return self.respond(id, @as(?u8, null));
+        const new_name = strField(p, "newName") orelse return self.respond(id, @as(?u8, null));
+        const pos = objGet(p, "position") orelse return self.respond(id, @as(?u8, null));
+        const line = intField(pos, "line") orelse return self.respond(id, @as(?u8, null));
+        const character = intField(pos, "character") orelse return self.respond(id, @as(?u8, null));
+        const off = offsetAt(text, @intCast(line), @intCast(character)) orelse return self.respond(id, @as(?u8, null));
+        const target = identAt(text, off) orelse return self.respond(id, @as(?u8, null));
+        if (isKeyword(target) or !isValidIdent(new_name)) return self.respond(id, @as(?u8, null));
+
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+
+        var files: std.StringHashMapUnmanaged([]const u8) = .{};
+        self.gatherWorkspaceFiles(a, uri, &files);
+
+        var changes: std.ArrayList(TextDocumentEdit) = .empty;
+        var fit = files.iterator();
+        while (fit.next()) |e| {
+            const path = e.key_ptr.*;
+            const src = e.value_ptr.*;
+            var offs: std.ArrayList(usize) = .empty;
+            collectRefs(a, src, target, &offs) catch continue;
+            if (offs.items.len == 0) continue;
+            const file_uri = pathToUri(a, path) orelse continue;
+
+            var edits: std.ArrayList(TextEdit) = .empty;
+            for (offs.items) |o| {
+                const ps = offsetToPos(src, o);
+                edits.append(a, .{
+                    .range = .{
+                        .start = ps,
+                        .end = .{ .line = ps.line, .character = ps.character + @as(u32, @intCast(target.len)) },
+                    },
+                    .newText = new_name,
+                }) catch {};
+            }
+            changes.append(a, .{ .textDocument = .{ .uri = file_uri }, .edits = edits.items }) catch {};
+        }
+        try self.respond(id, WorkspaceEdit{ .documentChanges = changes.items });
     }
 
     /// Add every `.rg` file under `dir_abs` (recursively) to `files`, reading from
@@ -1415,6 +1526,26 @@ test "uriToPath strips file:// and percent-decodes" {
     try testing.expectEqualStrings("/a/My Code/app.rg", p2);
 
     try testing.expect(uriToPath(gpa, "untitled:Untitled-1") == null);
+}
+
+test "isValidIdent / isKeyword gate rename targets" {
+    try testing.expect(isValidIdent("foo"));
+    try testing.expect(isValidIdent("_x1"));
+    try testing.expect(!isValidIdent("func")); // keyword
+    try testing.expect(!isValidIdent("1bad")); // starts with a digit
+    try testing.expect(!isValidIdent("a b")); // has a space
+    try testing.expect(!isValidIdent("")); // empty
+    try testing.expect(isKeyword("class"));
+    try testing.expect(!isKeyword("classy"));
+}
+
+test "identBoundsAt returns the identifier's byte range" {
+    const src = "  foo.bar";
+    const b = identBoundsAt(src, 3).?; // inside "foo"
+    try testing.expectEqual(@as(usize, 2), b.start);
+    try testing.expectEqual(@as(usize, 5), b.end);
+    try testing.expectEqualStrings("foo", src[b.start..b.end]);
+    try testing.expect(identBoundsAt(src, 0) == null); // whitespace
 }
 
 test "collectRefs finds whole-word refs, skipping comments and string text" {
