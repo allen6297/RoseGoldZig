@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (342 as of writing)
+zig build test                  # run every test (343 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -307,21 +307,28 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   marked. `callContext` scans back through balanced brackets to find the callee + comma
   index; the signature comes from a builtin table, or the function's `(…)` header read
   straight from source (`signatureFromSource`, so types/defaults show as written) for a
-  document func/method or an imported `mod.func`, and `references`: every whole-word
-  occurrence of the identifier under the cursor across the workspace — all open buffers plus
-  the `.rg` files walked (`Io.Dir.walk`) under the document's directory and the search roots
-  (`collectRefs` skips `##` comments and string text but includes identifiers inside `${…}`
-  holes; honors `includeDeclaration`; name-based, not scope-aware), `documentHighlight` (the
-  same-file cousin — `collectRefs` over just the current buffer, declarations marked Write
-  and other occurrences Read), `foldingRange` (`computeFoldingRanges`: indentation-based
+  document func/method or an imported `mod.func`, and `references`: every occurrence of the
+  identifier under the cursor (`collectRefs` skips `##` comments and string text but includes
+  identifiers inside `${…}` holes; honors `includeDeclaration`). **Scope-aware**
+  (`resolveTargetScope`): the AST is walked for function/lambda scopes (`collectScopes`,
+  each carrying its param + body-local names); a target declared by an enclosing scope is a
+  **local**, confined to that scope's byte span in the current buffer (so a local `x` in one
+  function isn't conflated with an `x` in another), while a name no scope declares is a
+  **module global**, searched workspace-wide — all open buffers plus the `.rg` files walked
+  (`Io.Dir.walk`) under the document's directory and the search roots. (Whole-body scope
+  granularity — precise across functions, conservative about shadowing *within* one.)
+  `documentHighlight` is the same-file cousin (bounded to the local's scope, declarations
+  marked Write and other occurrences Read), `foldingRange` (`computeFoldingRanges`: indentation-based
   colon-block bodies + runs of 2+ `##` comment lines), `formatting` (reformats the whole
   document via `formatter.format` — same output as `fmt` — as one full-document `TextEdit`;
   no edits when the file doesn't parse or is already canonical), and `rename` /
   `prepareRename`: `prepareRename` returns the identifier's range + placeholder (rejecting
   keywords), and `rename` reuses the same workspace search to emit a `WorkspaceEdit`
   (`documentChanges`: one `TextDocumentEdit` per file replacing every occurrence with the
-  new name; rejects an invalid new name). Both find-references and rename share
-  `gatherWorkspaceFiles`. Unknown requests get a null result so the client never hangs.
+  new name; rejects an invalid new name) — also scope-aware, so renaming a local only
+  touches its scope. References/highlight/rename share `resolveTargetScope` +
+  `appendFileRefs`/`appendFileEdits`; the global path shares `gatherWorkspaceFiles`. Unknown
+  requests get a null result so the client never hangs.
 - **Workspace search roots.** `initialize` captures the workspace folders (and legacy
   `rootUri`), plus an optional `initializationOptions.importPaths` (paths or `file://`
   URIs), as module search roots (`onInitialize` → `addRoot`/`addRootUri`, deduped). They're

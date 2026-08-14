@@ -12,7 +12,7 @@ Editor support for RoseGold (`.rg`) files in Visual Studio Code:
   types, builtins, your declarations, and a module's exports after `mod.`),
   **signature help** (parameter hints while typing a call's arguments),
   **document highlight**, **folding**, **formatting** (via the compiler's `fmt`),
-  **find all references**, and **rename** across the workspace.
+  and scope-aware **find all references** and **rename** across the workspace.
 - **Run command** — *RoseGold: Run Current File* (command palette) runs the file
   on the tree-walker, or the bytecode VM when `rosegold.useVm` is set.
 

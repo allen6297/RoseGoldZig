@@ -244,6 +244,145 @@ fn computeFoldingRanges(a: std.mem.Allocator, text: []const u8, out: *std.ArrayL
     }
 }
 
+// --- scope resolution --------------------------------------------------------
+//
+// Makes references/rename/highlight scope-aware: a local (a parameter or a local
+// binding) resolves to the byte span of the function/lambda that declares it, so
+// it isn't conflated with a same-named local elsewhere or a module global. A name
+// not declared by any enclosing scope is treated as a module global (searched
+// workspace-wide). Block sub-scopes are merged into their function (whole-body
+// granularity), so this is precise across functions but conservative about
+// shadowing *within* one function.
+
+const Scope = struct { start: u32, end: u32, names: std.StringHashMapUnmanaged(void) = .{} };
+const Bounds = struct { start: usize, end: usize };
+const ScopeResult = union(enum) { local: Bounds, global };
+
+/// Names bound directly by `body`'s statements (var/const, destructure, for
+/// bindings, catch), recursing into control-flow sub-blocks but not lambdas.
+fn addBodyNames(a: std.mem.Allocator, body: []const parser.Stmt, names: *std.StringHashMapUnmanaged(void)) std.mem.Allocator.Error!void {
+    for (body) |s| switch (s) {
+        .var_decl => |v| try names.put(a, v.name, {}),
+        .destructure => |d| for (d.names) |n| try names.put(a, n, {}),
+        .for_stmt => |f| {
+            try names.put(a, f.binding, {});
+            if (f.value_binding) |vb| try names.put(a, vb, {});
+            try addBodyNames(a, f.body, names);
+        },
+        .while_stmt => |w| try addBodyNames(a, w.body, names),
+        .if_stmt => |i| {
+            try addBodyNames(a, i.then_body, names);
+            for (i.elifs) |e| try addBodyNames(a, e.body, names);
+            if (i.else_body) |eb| try addBodyNames(a, eb, names);
+        },
+        .try_catch => |t| {
+            try addBodyNames(a, t.body, names);
+            try names.put(a, t.catch_name, {});
+            try addBodyNames(a, t.handler, names);
+        },
+        else => {},
+    };
+}
+
+/// Record a function/lambda scope (its params + body-local names) and recurse to
+/// register any lambdas nested in its body as their own scopes.
+fn addFuncScope(a: std.mem.Allocator, span: lexer.Span, params: []const parser.Param, body: []const parser.Stmt, scopes: *std.ArrayList(Scope)) std.mem.Allocator.Error!void {
+    var scope = Scope{ .start = span.start, .end = span.end };
+    for (params) |p| try scope.names.put(a, p.name, {});
+    try addBodyNames(a, body, &scope.names);
+    try scopes.append(a, scope);
+    try findLambdasInStmts(a, body, scopes);
+}
+
+fn findLambdasInStmts(a: std.mem.Allocator, body: []const parser.Stmt, scopes: *std.ArrayList(Scope)) std.mem.Allocator.Error!void {
+    for (body) |s| switch (s) {
+        .var_decl => |v| if (v.value) |e| try findLambdasInExpr(a, e, scopes),
+        .destructure => |d| try findLambdasInExpr(a, d.value, scopes),
+        .return_stmt => |r| if (r.value) |e| try findLambdasInExpr(a, e, scopes),
+        .if_stmt => |i| {
+            try findLambdasInExpr(a, i.cond, scopes);
+            try findLambdasInStmts(a, i.then_body, scopes);
+            for (i.elifs) |e| {
+                try findLambdasInExpr(a, e.cond, scopes);
+                try findLambdasInStmts(a, e.body, scopes);
+            }
+            if (i.else_body) |eb| try findLambdasInStmts(a, eb, scopes);
+        },
+        .while_stmt => |w| {
+            try findLambdasInExpr(a, w.cond, scopes);
+            try findLambdasInStmts(a, w.body, scopes);
+        },
+        .for_stmt => |f| {
+            try findLambdasInExpr(a, f.iter, scopes);
+            try findLambdasInStmts(a, f.body, scopes);
+        },
+        .assign => |x| {
+            try findLambdasInExpr(a, x.target, scopes);
+            try findLambdasInExpr(a, x.value, scopes);
+        },
+        .expr_stmt => |e| try findLambdasInExpr(a, e, scopes),
+        .try_catch => |t| {
+            try findLambdasInStmts(a, t.body, scopes);
+            try findLambdasInStmts(a, t.handler, scopes);
+        },
+        .raise => |r| try findLambdasInExpr(a, r.value, scopes),
+        else => {},
+    };
+}
+
+fn findLambdasInExpr(a: std.mem.Allocator, e: *const parser.Expr, scopes: *std.ArrayList(Scope)) std.mem.Allocator.Error!void {
+    switch (e.*) {
+        .lambda => |l| try addFuncScope(a, l.span, l.params, l.body, scopes),
+        .unary => |u| try findLambdasInExpr(a, u.operand, scopes),
+        .binary => |b| {
+            try findLambdasInExpr(a, b.lhs, scopes);
+            try findLambdasInExpr(a, b.rhs, scopes);
+        },
+        .call => |c| {
+            try findLambdasInExpr(a, c.callee, scopes);
+            for (c.args) |arg| try findLambdasInExpr(a, arg, scopes);
+        },
+        .index => |ix| {
+            try findLambdasInExpr(a, ix.object, scopes);
+            try findLambdasInExpr(a, ix.index, scopes);
+        },
+        .member => |m| try findLambdasInExpr(a, m.object, scopes),
+        .array => |arr| for (arr.elements) |el| try findLambdasInExpr(a, el, scopes),
+        .map => |mp| for (mp.entries) |en| {
+            try findLambdasInExpr(a, en.key, scopes);
+            try findLambdasInExpr(a, en.value, scopes);
+        },
+        .match => |mt| {
+            try findLambdasInExpr(a, mt.subject, scopes);
+            for (mt.arms) |arm| try findLambdasInExpr(a, arm.body, scopes);
+        },
+        .range => |rg| {
+            try findLambdasInExpr(a, rg.start, scopes);
+            try findLambdasInExpr(a, rg.end, scopes);
+        },
+        .tuple => |t| for (t.elements) |el| try findLambdasInExpr(a, el, scopes),
+        .interpolation => |ip| for (ip.parts) |part| {
+            if (part == .expr) try findLambdasInExpr(a, part.expr, scopes);
+        },
+        else => {}, // literals, identifier, member name
+    }
+}
+
+fn collectScopesInDecl(a: std.mem.Allocator, d: parser.Decl, scopes: *std.ArrayList(Scope)) std.mem.Allocator.Error!void {
+    switch (d) {
+        .func => |f| try addFuncScope(a, f.span, f.params, f.body, scopes),
+        .class => |c| for (c.members) |m| try collectScopesInDecl(a, m, scopes),
+        .struct_decl => |s| for (s.members) |m| try collectScopesInDecl(a, m, scopes),
+        .var_decl => |v| if (v.value) |e| try findLambdasInExpr(a, e, scopes), // a lambda in a const/var initializer
+        else => {},
+    }
+}
+
+/// Every function/method/lambda scope in the module.
+fn collectScopes(a: std.mem.Allocator, module: parser.Module, scopes: *std.ArrayList(Scope)) std.mem.Allocator.Error!void {
+    for (module.decls) |d| try collectScopesInDecl(a, d, scopes);
+}
+
 // --- position helpers --------------------------------------------------------
 
 /// The byte offset of a 0-based (line, character) position, or null if the line
@@ -1207,9 +1346,15 @@ const Server = struct {
         var offs: std.ArrayList(usize) = .empty;
         collectRefs(a, text, target, &offs) catch return self.respond(id, empty);
         const decls: []const usize = declNameOffsets(a, text) catch &.{};
+        // If it's a local, confine highlights to its scope.
+        const lb: ?Bounds = switch (self.resolveTargetScope(a, text, target, off)) {
+            .local => |b| b,
+            .global => null,
+        };
 
         var hls: std.ArrayList(DocumentHighlight) = .empty;
         for (offs.items) |o| {
+            if (!inBounds(o, lb)) continue;
             const ps = offsetToPos(text, o);
             const kind: u32 = if (std.mem.indexOfScalar(usize, decls, o) != null) 3 else 2; // Write / Read
             hls.append(a, .{
@@ -1249,31 +1394,20 @@ const Server = struct {
         defer arena_state.deinit();
         const a = arena_state.allocator();
 
-        var files: std.StringHashMapUnmanaged([]const u8) = .{};
-        self.gatherWorkspaceFiles(a, uri, &files);
-
         var locs: std.ArrayList(Location) = .empty;
-        var fit = files.iterator();
-        while (fit.next()) |e| {
-            const path = e.key_ptr.*;
-            const src = e.value_ptr.*;
-            const file_uri = pathToUri(a, path) orelse continue;
-            var offs: std.ArrayList(usize) = .empty;
-            collectRefs(a, src, target, &offs) catch continue;
-            const decl_offs: ?[]usize = if (include_decl) null else (declNameOffsets(a, src) catch null);
-            for (offs.items) |o| {
-                if (decl_offs) |ds| {
-                    if (std.mem.indexOfScalar(usize, ds, o) != null) continue;
+        switch (self.resolveTargetScope(a, text, target, off)) {
+            // A local: search only its scope within the current document.
+            .local => |lb| appendFileRefs(a, uri, text, target, include_decl, lb, &locs),
+            // A module global: search the whole workspace.
+            .global => {
+                var files: std.StringHashMapUnmanaged([]const u8) = .{};
+                self.gatherWorkspaceFiles(a, uri, &files);
+                var fit = files.iterator();
+                while (fit.next()) |e| {
+                    const file_uri = pathToUri(a, e.key_ptr.*) orelse continue;
+                    appendFileRefs(a, file_uri, e.value_ptr.*, target, include_decl, null, &locs);
                 }
-                const ps = offsetToPos(src, o);
-                locs.append(a, .{
-                    .uri = file_uri,
-                    .range = .{
-                        .start = ps,
-                        .end = .{ .line = ps.line, .character = ps.character + @as(u32, @intCast(target.len)) },
-                    },
-                }) catch {};
-            }
+            },
         }
         try self.respond(id, locs.items);
     }
@@ -1332,31 +1466,20 @@ const Server = struct {
         defer arena_state.deinit();
         const a = arena_state.allocator();
 
-        var files: std.StringHashMapUnmanaged([]const u8) = .{};
-        self.gatherWorkspaceFiles(a, uri, &files);
-
         var changes: std.ArrayList(TextDocumentEdit) = .empty;
-        var fit = files.iterator();
-        while (fit.next()) |e| {
-            const path = e.key_ptr.*;
-            const src = e.value_ptr.*;
-            var offs: std.ArrayList(usize) = .empty;
-            collectRefs(a, src, target, &offs) catch continue;
-            if (offs.items.len == 0) continue;
-            const file_uri = pathToUri(a, path) orelse continue;
-
-            var edits: std.ArrayList(TextEdit) = .empty;
-            for (offs.items) |o| {
-                const ps = offsetToPos(src, o);
-                edits.append(a, .{
-                    .range = .{
-                        .start = ps,
-                        .end = .{ .line = ps.line, .character = ps.character + @as(u32, @intCast(target.len)) },
-                    },
-                    .newText = new_name,
-                }) catch {};
-            }
-            changes.append(a, .{ .textDocument = .{ .uri = file_uri }, .edits = edits.items }) catch {};
+        switch (self.resolveTargetScope(a, text, target, off)) {
+            // A local: edit only its scope within the current document.
+            .local => |lb| appendFileEdits(a, uri, text, target, new_name, lb, &changes),
+            // A module global: edit across the whole workspace.
+            .global => {
+                var files: std.StringHashMapUnmanaged([]const u8) = .{};
+                self.gatherWorkspaceFiles(a, uri, &files);
+                var fit = files.iterator();
+                while (fit.next()) |e| {
+                    const file_uri = pathToUri(a, e.key_ptr.*) orelse continue;
+                    appendFileEdits(a, file_uri, e.value_ptr.*, target, new_name, null, &changes);
+                }
+            },
         }
         try self.respond(id, WorkspaceEdit{ .documentChanges = changes.items });
     }
@@ -1392,6 +1515,34 @@ const Server = struct {
         const p = params orelse return null;
         const td = objGet(p, "textDocument") orelse return null;
         return strField(td, "uri");
+    }
+
+    /// Classify the identifier `target` at byte `offset` in `text`: a local
+    /// (bound to the byte span of the innermost enclosing scope that declares it)
+    /// or a module global (workspace-wide). Falls back to global if the document
+    /// doesn't parse.
+    fn resolveTargetScope(self: *Server, a: std.mem.Allocator, text: []const u8, target: []const u8, offset: usize) ScopeResult {
+        var tree = parser.parse(self.gpa, text) catch return .global;
+        defer tree.deinit();
+        if (tree.diagnostics.len > 0) return .global;
+
+        var scopes: std.ArrayList(Scope) = .empty;
+        collectScopes(a, tree.module, &scopes) catch return .global;
+
+        var best: ?Bounds = null;
+        var best_width: usize = std.math.maxInt(usize);
+        for (scopes.items) |s| {
+            const start: usize = s.start;
+            const end: usize = s.end;
+            if (offset >= start and offset < end and s.names.contains(target)) {
+                if (end - start < best_width) {
+                    best_width = end - start;
+                    best = .{ .start = start, .end = end };
+                }
+            }
+        }
+        if (best) |b| return .{ .local = b };
+        return .global;
     }
 
     /// The identifier under the request's position, using the stored document.
@@ -1551,6 +1702,48 @@ fn declNameOffsets(a: std.mem.Allocator, text: []const u8) ![]usize {
     return offs.toOwnedSlice(a);
 }
 
+fn inBounds(o: usize, lb: ?Bounds) bool {
+    if (lb) |b| return o >= b.start and o < b.end;
+    return true;
+}
+
+/// Append a `Location` for each occurrence of `target` in `src`, optionally
+/// bounded to a byte range (a local's scope) and optionally excluding
+/// declaration sites.
+fn appendFileRefs(a: std.mem.Allocator, file_uri: []const u8, src: []const u8, target: []const u8, include_decl: bool, lb: ?Bounds, locs: *std.ArrayList(Location)) void {
+    var offs: std.ArrayList(usize) = .empty;
+    collectRefs(a, src, target, &offs) catch return;
+    const decl_offs: ?[]usize = if (include_decl) null else (declNameOffsets(a, src) catch null);
+    for (offs.items) |o| {
+        if (!inBounds(o, lb)) continue;
+        if (decl_offs) |ds| {
+            if (std.mem.indexOfScalar(usize, ds, o) != null) continue;
+        }
+        const ps = offsetToPos(src, o);
+        locs.append(a, .{
+            .uri = file_uri,
+            .range = .{ .start = ps, .end = .{ .line = ps.line, .character = ps.character + @as(u32, @intCast(target.len)) } },
+        }) catch {};
+    }
+}
+
+/// Append a `TextDocumentEdit` renaming every occurrence of `target` in `src` to
+/// `new_name`, optionally bounded to a local's scope. No entry if there are none.
+fn appendFileEdits(a: std.mem.Allocator, file_uri: []const u8, src: []const u8, target: []const u8, new_name: []const u8, lb: ?Bounds, changes: *std.ArrayList(TextDocumentEdit)) void {
+    var offs: std.ArrayList(usize) = .empty;
+    collectRefs(a, src, target, &offs) catch return;
+    var edits: std.ArrayList(TextEdit) = .empty;
+    for (offs.items) |o| {
+        if (!inBounds(o, lb)) continue;
+        const ps = offsetToPos(src, o);
+        edits.append(a, .{
+            .range = .{ .start = ps, .end = .{ .line = ps.line, .character = ps.character + @as(u32, @intCast(target.len)) } },
+            .newText = new_name,
+        }) catch {};
+    }
+    if (edits.items.len > 0) changes.append(a, .{ .textDocument = .{ .uri = file_uri }, .edits = edits.items }) catch {};
+}
+
 /// Convert a `file://` URI to a filesystem path (percent-decoded), or null for a
 /// non-file URI. The returned slice is owned by `gpa`.
 fn uriToPath(gpa: std.mem.Allocator, uri: []const u8) ?[]u8 {
@@ -1669,6 +1862,22 @@ test "uriToPath strips file:// and percent-decodes" {
     try testing.expectEqualStrings("/a/My Code/app.rg", p2);
 
     try testing.expect(uriToPath(gpa, "untitled:Untitled-1") == null);
+}
+
+test "resolveTargetScope separates locals from module globals" {
+    var server = Server{ .gpa = testing.allocator, .io = undefined, .out = undefined, .in = undefined };
+    defer server.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = "const G = 1\n\nfunc f(n: int) -> int:\n    var x = n\n    return x + G\n";
+
+    const x_off = std.mem.indexOf(u8, text, "var x").? + 4; // the local `x`
+    try testing.expect(server.resolveTargetScope(a, text, "x", x_off) != .global);
+    const n_off = std.mem.indexOf(u8, text, "f(n").? + 2; // the parameter `n`
+    try testing.expect(server.resolveTargetScope(a, text, "n", n_off) != .global);
+    const g_off = std.mem.indexOf(u8, text, "G = 1").?; // the module global `G`
+    try testing.expect(server.resolveTargetScope(a, text, "G", g_off) == .global);
 }
 
 test "computeFoldingRanges folds colon blocks and comment runs" {
