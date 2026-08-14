@@ -23,4 +23,5 @@ public interface RoseGoldTokenTypes {
 
     TokenSet COMMENTS = TokenSet.create(COMMENT);
     TokenSet STRINGS = TokenSet.create(STRING);
+    TokenSet IDENTIFIERS = TokenSet.create(IDENTIFIER);
 }

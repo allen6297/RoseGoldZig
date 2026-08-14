@@ -54,6 +54,20 @@ public final class RoseGoldDeclarations {
         return roots;
     }
 
+    /** Every declaration in the tree, flattened (roots first, then descendants). */
+    public static List<RoseGoldDeclaration> scanFlat(CharSequence text) {
+        List<RoseGoldDeclaration> out = new ArrayList<>();
+        collect(scan(text), out);
+        return out;
+    }
+
+    private static void collect(List<RoseGoldDeclaration> decls, List<RoseGoldDeclaration> out) {
+        for (RoseGoldDeclaration d : decls) {
+            out.add(d);
+            collect(d.children, out);
+        }
+    }
+
     private static RoseGoldDeclaration match(String line, int lineStartOffset) {
         Matcher m = DECL.matcher(line);
         if (!m.find()) {

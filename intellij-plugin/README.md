@@ -12,10 +12,22 @@ IDEs. Written in Java against the IntelliJ Platform.
   (identifier before `(`), each with its own color.
 - **`##` line-comment toggling** (`Cmd/Ctrl-/`) and **brace matching** for
   `()`, `[]`, `{}`.
-- **Completion** — keywords, built-in types, and the standard-library builtins
-  (`print`, `map`, `reduce`, `sqrt`, `emit`, …).
+- **Completion & quick-doc** — keywords, built-in types, and the standard-library
+  builtins (`print`, `map`, `reduce`, `sqrt`, `emit`, …), each with a one-line
+  signature shown on `Ctrl-Q`.
 - **Live error highlighting** — an external annotator runs the RoseGold
   compiler's `check` command and underlines real diagnostics in the editor.
+- **Structure view & folding** — a tree of the file's functions, classes,
+  structs, enums, signals, and top-level consts/vars, and folding of colon-block
+  bodies (both driven by an indentation-aware line scan, not a second grammar).
+- **Reformatting** — *Reformat Code* (`Cmd/Ctrl-Alt-L`) pipes the file through
+  the compiler's `fmt` command.
+- **Editing ergonomics** — live templates (`func`, `for`, `class`, `match`,
+  `try`, …), and auto-indent after a line whose code ends in `:`.
+- **Navigation** — go-to-declaration (`Cmd/Ctrl-B`) jumps an identifier to its
+  top-level or class-member declaration, and *Find Usages* indexes identifier
+  words. (Rename isn't offered — it needs a real named-element PSI tree rather
+  than this flat token stream.)
 - **Run configurations** — Run a `.rg` file from the gutter/right-click menu, on
   the tree-walker or (with a checkbox) the bytecode VM (`run --vm`).
 
@@ -60,7 +72,10 @@ Live errors reflect the file **on disk**, so they refresh when you save.
 build.gradle · settings.gradle · gradle.properties
 src/main/resources/META-INF/plugin.xml     — extension-point wiring
 src/main/resources/icons/rosegold.svg      — file-type icon
-src/main/java/org/rosegold/ide/            — language, lexer, highlighting, annotator, completion
+src/main/resources/liveTemplates/          — live-template definitions
+src/main/java/org/rosegold/ide/            — language, lexer, highlighting, annotator, completion,
+                                             docs, formatting, folding, references, find-usages
+src/main/java/org/rosegold/ide/structure/  — structure view
 src/main/java/org/rosegold/ide/run/        — run configuration
 ```
 
