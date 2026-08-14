@@ -71,6 +71,9 @@ const Function = struct {
 const RtModule = struct {
     name: []const u8,
     globals: std.StringHashMapUnmanaged(Value) = .{},
+    /// Upper bound on the number of globals, so the map can be sized once up
+    /// front — it then never rehashes, keeping inline-cached value pointers valid.
+    global_count: usize = 0,
 };
 
 /// A runtime upvalue: while `stack_index` is set it aliases that stack slot
@@ -303,7 +306,7 @@ pub fn run(gpa: std.mem.Allocator, module: Module) Error!Result {
     return runProgram(gpa, &.{.{ .module = module }});
 }
 
-const Compiled = struct { programs: []const Program, all_functions: []const *const Function };
+const Compiled = struct { programs: []const Program, all_functions: []const *const Function, global_cache_count: usize };
 
 /// Compile every module in dependency order into per-module `Program`s. Modules
 /// share nothing but their imports: each keeps its own type/enum tables, and an
@@ -334,7 +337,7 @@ fn compileAll(alloc: std.mem.Allocator, diagnostics: *std.ArrayList(lexer.Diagno
         programs[i] = try c.compileModule(pm.module, pm.imports, rtmods, i == modules.len - 1);
         module_types[i] = c.types; // reachable by later modules that import this one
     }
-    return .{ .programs = programs, .all_functions = c.all_functions.items };
+    return .{ .programs = programs, .all_functions = c.all_functions.items, .global_cache_count = c.global_cache_count };
 }
 
 /// Compile and run a set of modules in dependency order (entry last). Each
@@ -350,8 +353,10 @@ pub fn runProgram(gpa: std.mem.Allocator, modules: []const ProgramModule) Error!
         else => return e,
     };
 
+    const cache = try alloc.alloc(?*Value, compiled.global_cache_count);
+    @memset(cache, null);
     var output: std.ArrayList(u8) = .empty;
-    var vm = VM{ .alloc = alloc, .output = &output };
+    var vm = VM{ .alloc = alloc, .output = &output, .global_cache = cache };
     vm.run(compiled.programs) catch |e| switch (e) {
         error.Runtime => return .{ .arena = arena, .output = try output.toOwnedSlice(alloc), .runtime_error = vm.runtime_error, .diagnostics = &.{} },
         error.OutOfMemory => return error.OutOfMemory,
@@ -461,6 +466,9 @@ const Compiler = struct {
     /// Every compiled function (scripts, funcs, methods, constructors, lambdas),
     /// in creation order — used by the disassembler.
     all_functions: std.ArrayList(*Function) = .empty,
+    /// Number of `get_global`/`set_global` sites, each of which gets a unique
+    /// inline-cache slot (see the VM's `global_cache`).
+    global_cache_count: usize = 0,
     /// The type whose method/constructor/field-default is being compiled, so a
     /// bare name can resolve to a field or method of the receiver.
     current_type: ?*TypeDef = null,
@@ -490,6 +498,10 @@ const Compiler = struct {
         // Every top-level declaration kind now compiles; deeper constructs the VM
         // can't handle (imported bases, unknown class members) are rejected where
         // they're processed.
+
+        // An upper bound on this module's globals (builtins + every top-level
+        // decl), so the map is sized once and never rehashes at runtime.
+        self.current_module.global_count = builtin_names.len + module.decls.len;
 
         // Register enum and class/struct declarations (names first) so they can
         // reference each other, then resolve inheritance across the whole set.
@@ -600,7 +612,7 @@ const Compiler = struct {
         // globals when their script runs.
         if (is_entry and funcs.get("main") != null) {
             self.cur.stack_top = 0;
-            try self.emitGlobal(.get_global, "main", zeroSpan);
+            try self.emitCachedGlobal(.get_global, "main", zeroSpan);
             try self.emit(.call, zeroSpan);
             try self.emitByte(0, zeroSpan); // argc
             try self.emit(.pop, zeroSpan);
@@ -1133,7 +1145,7 @@ const Compiler = struct {
                     try self.emitGlobal(.set_field, id.name, a.span);
                 } else {
                     try self.expr(a.value.*);
-                    try self.emitGlobal(.set_global, id.name, a.span);
+                    try self.emitCachedGlobal(.set_global, id.name, a.span);
                     try self.emit(.pop, a.span);
                 }
             },
@@ -1300,7 +1312,7 @@ const Compiler = struct {
                     try self.emitTypeConst(self.current_static_type.?, id.span);
                     try self.emitGlobal(.get_member, id.name, id.span);
                 } else {
-                    try self.emitGlobal(.get_global, id.name, id.span);
+                    try self.emitCachedGlobal(.get_global, id.name, id.span);
                 }
             },
             .unary => |u| {
@@ -1500,6 +1512,14 @@ const Compiler = struct {
         try self.emitGlobal(.define_global, name, span);
     }
 
+    /// Emit a `get_global`/`set_global` with its name constant plus a unique
+    /// inline-cache slot index (u16), so the VM resolves the name once per site.
+    fn emitCachedGlobal(self: *Compiler, op: Op, name: []const u8, span: Span) Error!void {
+        try self.emitGlobal(op, name, span);
+        try self.emitU16(@intCast(self.global_cache_count), span);
+        self.global_cache_count += 1;
+    }
+
     /// Emit a jump with a placeholder target; returns the operand offset to patch.
     fn emitJump(self: *Compiler, op: Op, span: Span) Error!usize {
         try self.emit(op, span);
@@ -1586,6 +1606,9 @@ const VM = struct {
     handlers: std.ArrayList(Handler) = .empty,
     /// The value from a `raise` (else a built-in error uses `runtime_error`).
     thrown_value: ?Value = null,
+    /// Per-site inline cache of resolved global pointers (see `get_global`). Valid
+    /// because a site always runs in its own module and the map never rehashes.
+    global_cache: []?*Value = &.{},
     runtime_error: ?RuntimeError = null,
 
     fn fail(self: *VM, comptime fmt: []const u8, args: anytype) VMError {
@@ -1615,9 +1638,13 @@ const VM = struct {
         try self.stack.ensureTotalCapacity(self.alloc, 1024);
         try self.frames.ensureTotalCapacity(self.alloc, 256);
         for (programs) |program| {
+            const mod = program.script.module;
+            // Size each module's globals once so it never rehashes — the inline
+            // cache stores pointers into its value storage.
+            try mod.globals.ensureTotalCapacity(self.alloc, @intCast(mod.global_count));
             // Each module gets its own copy of the builtins in its globals.
             inline for (builtin_names, 0..) |name, i| {
-                try program.script.module.globals.put(self.alloc, name, .{ .builtin = @enumFromInt(i) });
+                try mod.globals.put(self.alloc, name, .{ .builtin = @enumFromInt(i) });
             }
             try self.frames.append(self.alloc, .{ .func = program.script, .upvalues = &.{}, .ip = 0, .base = 0 });
             try self.exec();
@@ -1720,11 +1747,23 @@ const VM = struct {
                 },
                 .get_global => {
                     const name = chunk.constants.items[self.readU16(frame)].str;
-                    if (frame.func.module.globals.get(name)) |v| try self.push(v) else return self.fail("undefined name '{s}'", .{name});
+                    const cache = self.readU16(frame);
+                    const slot = self.global_cache[cache] orelse blk: {
+                        const p = frame.func.module.globals.getPtr(name) orelse return self.fail("undefined name '{s}'", .{name});
+                        self.global_cache[cache] = p;
+                        break :blk p;
+                    };
+                    try self.push(slot.*);
                 },
                 .set_global => {
                     const name = chunk.constants.items[self.readU16(frame)].str;
-                    if (frame.func.module.globals.getPtr(name)) |slot| slot.* = self.peek(0) else return self.fail("undefined name '{s}'", .{name});
+                    const cache = self.readU16(frame);
+                    const slot = self.global_cache[cache] orelse blk: {
+                        const p = frame.func.module.globals.getPtr(name) orelse return self.fail("undefined name '{s}'", .{name});
+                        self.global_cache[cache] = p;
+                        break :blk p;
+                    };
+                    slot.* = self.peek(0);
                 },
                 .define_global => {
                     const name = chunk.constants.items[self.readU16(frame)].str;
@@ -2522,9 +2561,14 @@ fn disasmInstr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), ch: *const Chu
             try out.print(alloc, " {d}", .{code[offset + 1]});
             break :blk offset + 2;
         },
-        .get_global, .set_global, .define_global, .get_member, .set_field => blk: {
+        .define_global, .get_member, .set_field => blk: {
             try out.print(alloc, " {s}", .{ch.constants.items[readU16At(code, offset + 1)].str});
             break :blk offset + 3;
+        },
+        // A get/set_global carries its name constant plus an inline-cache slot.
+        .get_global, .set_global => blk: {
+            try out.print(alloc, " {s} [cache {d}]", .{ ch.constants.items[readU16At(code, offset + 1)].str, readU16At(code, offset + 3) });
+            break :blk offset + 5;
         },
         .constant => blk: {
             try out.append(alloc, ' ');

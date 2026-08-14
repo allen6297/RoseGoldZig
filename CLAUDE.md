@@ -257,6 +257,10 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   bytecode (`Vm.disassemble`) instead of running it — handy for inspecting codegen.
   A `pushFrame` guard bounds recursion (`max_call_depth`) so runaway recursion reports a
   clean "call stack overflow" rather than exhausting memory.
+  Each `get_global`/`set_global` carries an **inline-cache slot**: a module's globals map
+  is sized once up front (`RtModule.global_count`) so it never rehashes, letting the VM
+  cache the resolved value pointer per site (`VM.global_cache`) and skip the string hash
+  on repeat lookups (helps global-heavy code like recursion).
 - **Classes/structs** compile too: construction (`Name(...)` binds the type name to a
   synthetic constructor closure that creates the instance via a `new_instance` opcode,
   runs field defaults with the instance as receiver, then calls `init`), field get/set
