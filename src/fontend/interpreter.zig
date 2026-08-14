@@ -1592,6 +1592,7 @@ const Interpreter = struct {
             .index => |idx| try self.evalIndex(idx),
             .slice => |s| try self.evalSlice(s),
             .comprehension => |c| try self.evalComprehension(c),
+            .map_comprehension => |c| try self.evalMapComprehension(c),
             .conditional => |c| if (isTruthy(try self.eval(c.cond.*)))
                 try self.eval(c.then_val.*)
             else
@@ -1945,6 +1946,55 @@ const Interpreter = struct {
         return .{ .list = out };
     }
 
+    fn evalMapComprehension(self: *Interpreter, c: *const Expr.MapComprehension) Error!Value {
+        const iter = try self.eval(c.iter.*);
+        const two = c.value_binding != null;
+        var firsts: List = .empty;
+        var seconds: List = .empty;
+        var single_first = false;
+        switch (iter) {
+            .list => |l| for (l.items, 0..) |el, i| {
+                try firsts.append(self.arena, .{ .int = @intCast(i) });
+                try seconds.append(self.arena, el);
+            },
+            .str => |s| for (0..s.len) |i| {
+                try firsts.append(self.arena, .{ .int = @intCast(i) });
+                try seconds.append(self.arena, .{ .str = s[i .. i + 1] });
+            },
+            .map => |m| {
+                single_first = true;
+                for (m.entries.items) |entry| {
+                    try firsts.append(self.arena, entry.key);
+                    try seconds.append(self.arena, entry.value);
+                }
+            },
+            else => return self.fail(c.span, "cannot iterate over {s}", .{@tagName(iter)}),
+        }
+
+        const out = try self.arena.create(Map);
+        out.* = .{};
+        const out_val: Value = .{ .map = out };
+        for (firsts.items, seconds.items) |first, second| {
+            const child = try self.newEnv(self.env);
+            const saved = self.env;
+            self.env = child;
+            defer self.env = saved;
+            if (two) {
+                try self.define(child, c.binding, first);
+                try self.define(child, c.value_binding.?, second);
+            } else {
+                try self.define(child, c.binding, if (single_first) first else second);
+            }
+            if (c.cond) |cond| {
+                if (!isTruthy(try self.eval(cond.*))) continue;
+            }
+            const k = try self.eval(c.key.*);
+            const v = try self.eval(c.value.*);
+            try self.setIndex(out_val, k, v, c.span); // last-wins on duplicate keys
+        }
+        return out_val;
+    }
+
     /// Evaluate and clamp a slice's `[start:end]` bounds against a length.
     fn sliceBounds(self: *Interpreter, s: Expr.Slice, len: usize, span: Span) Error!struct { start: usize, end: usize } {
         const n: i64 = @intCast(len);
@@ -2228,6 +2278,17 @@ test "list and string slicing with clamping" {
         \\    print(s[6:])
     ;
     try expectOutput(src, "[20, 30]\n[10, 20]\n[40, 50]\n[30, 40, 50]\n[]\nhello\nworld\n");
+}
+
+test "map comprehensions" {
+    const src =
+        \\func main():
+        \\    print({x: x * x for x in range(4)})
+        \\    print({k: v * 10 for k, v in {"a": 1, "b": 2}})
+        \\    print({w: len(w) for w in ["hi", "bye"]})
+        \\    print({x: x for x in range(3) if x > 0})
+    ;
+    try expectOutput(src, "{0: 0, 1: 1, 2: 4, 3: 9}\n{a: 10, b: 20}\n{hi: 2, bye: 3}\n{1: 1, 2: 2}\n");
 }
 
 test "conditional (ternary) expression" {

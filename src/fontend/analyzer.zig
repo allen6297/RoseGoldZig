@@ -1421,6 +1421,7 @@ const Analyzer = struct {
             .index => |i| try self.typeIndex(i),
             .slice => |s| try self.typeSlice(s),
             .comprehension => |c| try self.typeComprehension(c),
+            .map_comprehension => |c| try self.typeMapComprehension(c),
             .conditional => |c| try self.typeConditional(c),
             .member => |m| blk: {
                 const ot = try self.typeOf(m.object.*);
@@ -1875,6 +1876,46 @@ const Analyzer = struct {
                 break :blk .unknown;
             },
         };
+    }
+
+    fn typeMapComprehension(self: *Analyzer, c: *const Expr.MapComprehension) Error!Type {
+        const iter_t = try self.typeOf(c.iter.*);
+        const child = try self.newScope(self.current);
+        if (c.value_binding) |vb| {
+            const first_t: Type = switch (iter_t) {
+                .map => |m| m.key,
+                .list, .str => .int,
+                else => .unknown,
+            };
+            const second_t: Type = switch (iter_t) {
+                .list => |l| l.elem,
+                .map => |m| m.value,
+                .str => .str,
+                else => .unknown,
+            };
+            try self.declareIn(child, c.binding, .binding, first_t, c.span);
+            try self.declareIn(child, vb, .binding, second_t, c.span);
+        } else {
+            const bt: Type = switch (iter_t) {
+                .list => |l| l.elem,
+                .map => |m| m.key,
+                .str => .str,
+                else => .unknown,
+            };
+            try self.declareIn(child, c.binding, .binding, bt, c.span);
+        }
+        const saved = self.current;
+        self.current = child;
+        defer self.current = saved;
+        if (c.cond) |cond| {
+            const ct = try self.typeOf(cond.*);
+            if (!isBoolish(ct)) {
+                try self.report(parser.exprSpan(cond.*), "comprehension condition must be bool, got {s}", .{typeName(ct)});
+            }
+        }
+        const kt = try self.typeOf(c.key.*);
+        const vt = try self.typeOf(c.value.*);
+        return self.makeMap(kt, vt);
     }
 
     fn typeConditional(self: *Analyzer, c: *const Expr.Conditional) Error!Type {
@@ -2709,6 +2750,16 @@ test "arithmetic on non-numbers is reported" {
     var analysis = try analyzeSource(testing.allocator, "const x: int = true + 1");
     defer analysis.deinit();
     try expectMessageContains(analysis, "'+'");
+}
+
+test "map comprehension types to map of key/value types" {
+    var ok = try analyzeSource(testing.allocator, "func f(xs: list<int>) -> map<int, int>:\n    return {x: x * 2 for x in xs}");
+    defer ok.deinit();
+    try testing.expectEqual(@as(usize, 0), ok.diagnostics.len);
+
+    var bad = try analyzeSource(testing.allocator, "func f(xs: list<int>):\n    var z = {x: x for x in xs if x}");
+    defer bad.deinit();
+    try expectMessageContains(bad, "comprehension condition must be bool");
 }
 
 test "conditional expression: bool condition, unified branches, nil makes it optional" {

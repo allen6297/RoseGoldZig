@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (367 as of writing)
+zig build test                  # run every test (371 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -136,8 +136,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   defaults — see **Named arguments**), indexing `a[i]`, **slicing** `a[start:end]` (list/string; either
   bound optional → 0 / length; clamped, `end<start` ⇒ empty; negatives clamp to 0),
   member access `x.f`,
-  array `[...]` and map `{k: v}` literals, **list comprehensions**
-  `[out for x[, v] in iter if cond]` (build a list; the `if` filter and a second
+  array `[...]` and map `{k: v}` literals, **list/map comprehensions**
+  `[out for x[, v] in iter if cond]` and `{key: value for x[, v] in iter if cond}`
+  (the map form builds a map, last-wins on duplicate keys; the `if` filter and a second
   `i, x` binding are optional — mirrors `for`), a **conditional (ternary) expression**
   `then if cond else else_val` (loosest precedence, right-associative; branches unify like
   `match` arms — a `nil` branch yields `?T`; parsed *above* the range level, via

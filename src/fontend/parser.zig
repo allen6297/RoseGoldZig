@@ -103,12 +103,23 @@ pub const Expr = union(enum) {
     range: Range,
     tuple: Tuple,
     comprehension: *const Comprehension,
+    map_comprehension: *const MapComprehension,
     conditional: *const Conditional,
 
     pub const Literal = struct { text: []const u8, span: Span };
     /// `[output for binding[, value_binding] in iter [if cond]]` — builds a list.
     pub const Comprehension = struct {
         output: *Expr,
+        binding: []const u8,
+        value_binding: ?[]const u8,
+        iter: *Expr,
+        cond: ?*Expr,
+        span: Span,
+    };
+    /// `{key: value for binding[, value_binding] in iter [if cond]}` — builds a map.
+    pub const MapComprehension = struct {
+        key: *Expr,
+        value: *Expr,
         binding: []const u8,
         value_binding: ?[]const u8,
         iter: *Expr,
@@ -313,6 +324,7 @@ pub fn exprSpan(e: Expr) Span {
         .range => |r| r.span,
         .tuple => |t| t.span,
         .comprehension => |c| c.span,
+        .map_comprehension => |c| c.span,
         .conditional => |c| c.span,
     };
 }
@@ -1294,7 +1306,7 @@ const Parser = struct {
             .kw_func => return self.parseLambda(),
             .kw_match => return self.mkExpr(.{ .match = try self.parseMatch() }),
             .l_bracket => return self.parseArrayOrComprehension(),
-            .l_brace => return self.mkExpr(.{ .map = try self.parseMapLiteral() }),
+            .l_brace => return self.parseMapOrComprehension(),
             .l_paren => {
                 const lp = self.advance();
                 const first = try self.parseExpr();
@@ -1374,10 +1386,24 @@ const Parser = struct {
 
     /// `{k0: v0, k1: v1}`. Newlines stay significant inside `{`, so entries may
     /// be separated by commas, newlines, or both.
-    fn parseMapLiteral(self: *Parser) Error!Expr.Map {
+    /// `{k0: v0, ...}` (map literal) or `{k: v for x[, v2] in iter [if cond]}`
+    /// (map comprehension), told apart by a `for` after the first entry.
+    fn parseMapOrComprehension(self: *Parser) Error!*Expr {
         const lbrace = self.advance(); // '{'
         self.skipNewlines();
+        if (self.at(.r_brace)) {
+            const rbrace = self.advance();
+            return self.mkExpr(.{ .map = .{ .entries = &.{}, .span = spanFrom(lbrace, rbrace) } });
+        }
+        const key0 = try self.parseExpr();
+        _ = try self.expect(.colon, "expected ':' between a map key and value");
+        const val0 = try self.parseExpr();
+        if (self.at(.kw_for)) return self.finishMapComprehension(lbrace, key0, val0);
+
         var entries: std.ArrayList(MapEntry) = .empty;
+        try entries.append(self.alloc, .{ .key = key0, .value = val0 });
+        _ = self.eat(.comma);
+        self.skipNewlines();
         while (!self.at(.r_brace) and !self.atEnd()) {
             const key = try self.parseExpr();
             _ = try self.expect(.colon, "expected ':' between a map key and value");
@@ -1387,10 +1413,36 @@ const Parser = struct {
             self.skipNewlines();
         }
         const rbrace = try self.expect(.r_brace, "expected '}' to close the map");
-        return .{
+        return self.mkExpr(.{ .map = .{
             .entries = try entries.toOwnedSlice(self.alloc),
             .span = spanFrom(lbrace, rbrace),
+        } });
+    }
+
+    fn finishMapComprehension(self: *Parser, lbrace: Token, key: *Expr, value: *Expr) Error!*Expr {
+        _ = self.advance(); // 'for'
+        const binding = try self.expect(.identifier, "expected a loop variable after 'for'");
+        var value_binding: ?[]const u8 = null;
+        if (self.eat(.comma)) {
+            const second = try self.expect(.identifier, "expected a second loop variable after ','");
+            value_binding = second.text;
+        }
+        _ = try self.expect(.kw_in, "expected 'in' after the loop variable");
+        const iter = try self.parseRangeExpr(); // not parseExpr: leave the filter `if` for us
+        var cond: ?*Expr = null;
+        if (self.eat(.kw_if)) cond = try self.parseRangeExpr();
+        const rbrace = try self.expect(.r_brace, "expected '}' to close the map comprehension");
+        const c = try self.alloc.create(Expr.MapComprehension);
+        c.* = .{
+            .key = key,
+            .value = value,
+            .binding = binding.text,
+            .value_binding = value_binding,
+            .iter = iter,
+            .cond = cond,
+            .span = spanFrom(lbrace, rbrace),
         };
+        return self.mkExpr(.{ .map_comprehension = c });
     }
 
     fn parseMatch(self: *Parser) Error!Expr.Match {

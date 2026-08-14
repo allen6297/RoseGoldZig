@@ -256,6 +256,22 @@ const Formatter = struct {
         try self.nl();
     }
 
+    /// The ` for x[, v] in iter [if cond]` tail shared by list/map comprehensions.
+    fn comprehensionTail(self: *Formatter, binding: []const u8, value_binding: ?[]const u8, iter: Expr, cond: ?*const Expr) Error!void {
+        try self.w(" for ");
+        try self.w(binding);
+        if (value_binding) |vb| {
+            try self.w(", ");
+            try self.w(vb);
+        }
+        try self.w(" in ");
+        try self.expr(iter);
+        if (cond) |c| {
+            try self.w(" if ");
+            try self.expr(c.*);
+        }
+    }
+
     fn params(self: *Formatter, ps: []const Param) Error!void {
         try self.w("(");
         for (ps, 0..) |p, i| {
@@ -498,19 +514,16 @@ const Formatter = struct {
             .comprehension => |c| {
                 try self.w("[");
                 try self.expr(c.output.*);
-                try self.w(" for ");
-                try self.w(c.binding);
-                if (c.value_binding) |vb| {
-                    try self.w(", ");
-                    try self.w(vb);
-                }
-                try self.w(" in ");
-                try self.expr(c.iter.*);
-                if (c.cond) |cond| {
-                    try self.w(" if ");
-                    try self.expr(cond.*);
-                }
+                try self.comprehensionTail(c.binding, c.value_binding, c.iter.*, c.cond);
                 try self.w("]");
+            },
+            .map_comprehension => |c| {
+                try self.w("{");
+                try self.expr(c.key.*);
+                try self.w(": ");
+                try self.expr(c.value.*);
+                try self.comprehensionTail(c.binding, c.value_binding, c.iter.*, c.cond);
+                try self.w("}");
             },
             .array => |a| {
                 try self.w("[");
@@ -655,6 +668,13 @@ test "formats default parameter values" {
     const out = try fmt(gpa, "func f(a,b=1+1,c=\"x\"):\n    return a");
     defer gpa.free(out);
     try testing.expectEqualStrings("func f(a, b = 1 + 1, c = \"x\"):\n    return a\n", out);
+}
+
+test "formats map comprehensions" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "func main():\n    print({ k : v*2 for k,v in m if v>0 })");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("func main():\n    print({k: v * 2 for k, v in m if v > 0})\n", out);
 }
 
 test "formats conditional expressions" {

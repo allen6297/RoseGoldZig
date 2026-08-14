@@ -1475,6 +1475,7 @@ const Compiler = struct {
             .lambda => |lam| try self.compileLambda(lam),
             .match => |m| try self.compileMatch(m),
             .comprehension => |c| try self.compileComprehension(c),
+            .map_comprehension => |c| try self.compileMapComprehension(c),
             .conditional => |c| {
                 // `then if cond else else_val` — jump-based; each branch runs with
                 // the condition already popped, so both compile at `before`.
@@ -1563,6 +1564,73 @@ const Compiler = struct {
         self.patchJump(exit);
 
         // Pop the for-machinery locals ($cit, $cidx, binding[, value]), leaving $acc.
+        var extras = self.cur.locals.items.len - (acc_slot + 1);
+        while (extras > 0) : (extras -= 1) try self.emit(.pop, c.span);
+    }
+
+    /// `{k: v for x[, v2] in iter [if cond]}` — like `compileComprehension`, but the
+    /// accumulator is an empty map and each round does `acc[key] = value`.
+    fn compileMapComprehension(self: *Compiler, c: *const Expr.MapComprehension) Error!void {
+        const base = self.cur.stack_top;
+        const orig_len = self.cur.locals.items.len;
+        defer self.cur.locals.shrinkRetainingCapacity(orig_len);
+        while (self.cur.locals.items.len < base) {
+            try self.cur.locals.append(self.alloc, .{ .name = "$c", .depth = self.cur.scope_depth });
+        }
+
+        try self.emit(.build_map, c.span); // empty map at the result slot
+        try self.emitU16(0, c.span);
+        const acc_slot = self.cur.locals.items.len;
+        try self.cur.locals.append(self.alloc, .{ .name = "$acc", .depth = self.cur.scope_depth });
+        try self.expr(c.iter.*);
+        const it_slot = self.cur.locals.items.len;
+        try self.cur.locals.append(self.alloc, .{ .name = "$cit", .depth = self.cur.scope_depth });
+        try self.emitConst(.{ .int = 0 }, c.span);
+        const idx_slot = self.cur.locals.items.len;
+        try self.cur.locals.append(self.alloc, .{ .name = "$cidx", .depth = self.cur.scope_depth });
+        const first_slot = self.cur.locals.items.len;
+        try self.cur.locals.append(self.alloc, .{ .name = c.binding, .depth = self.cur.scope_depth });
+        try self.emit(.nil, c.span);
+        var second_slot: usize = 0;
+        if (c.value_binding) |vb| {
+            second_slot = self.cur.locals.items.len;
+            try self.cur.locals.append(self.alloc, .{ .name = vb, .depth = self.cur.scope_depth });
+            try self.emit(.nil, c.span);
+        }
+
+        const start = self.here();
+        try self.emitLocal(.get_local, idx_slot, c.span);
+        try self.emitLocal(.get_local, it_slot, c.span);
+        try self.emit(.iter_len, c.span);
+        try self.emit(.lt, c.span);
+        const exit = try self.emitJump(.jump_if_false, c.span);
+        if (c.value_binding != null) {
+            try self.emitBind(.iter_key, it_slot, idx_slot, first_slot, c.span);
+            try self.emitBind(.iter_val, it_slot, idx_slot, second_slot, c.span);
+        } else {
+            try self.emitBind(.iter_single, it_slot, idx_slot, first_slot, c.span);
+        }
+        var skip: ?usize = null;
+        if (c.cond) |cond| {
+            self.cur.stack_top = self.cur.locals.items.len;
+            try self.expr(cond.*);
+            skip = try self.emitJump(.jump_if_false, c.span);
+        }
+        // acc[key] = value
+        try self.emitLocal(.get_local, acc_slot, c.span);
+        self.cur.stack_top = self.cur.locals.items.len + 1;
+        try self.expr(c.key.*);
+        try self.expr(c.value.*);
+        try self.emit(.index_set, c.span);
+        if (skip) |s| self.patchJump(s);
+        try self.emitLocal(.get_local, idx_slot, c.span);
+        try self.emitConst(.{ .int = 1 }, c.span);
+        try self.emit(.add, c.span);
+        try self.emitLocal(.set_local, idx_slot, c.span);
+        try self.emit(.pop, c.span);
+        try self.emitLoopJump(start, c.span);
+        self.patchJump(exit);
+
         var extras = self.cur.locals.items.len - (acc_slot + 1);
         while (extras > 0) : (extras -= 1) try self.emit(.pop, c.span);
     }
@@ -3116,6 +3184,17 @@ test "vm: list and string slicing with clamping" {
         \\    print(s[6:])
     ;
     try expectVMOutput(src, "[20, 30]\n[10, 20]\n[40, 50]\n[30, 40, 50]\n[]\nhello\nworld\n");
+}
+
+test "vm: map comprehensions" {
+    const src =
+        \\func main():
+        \\    print({x: x * x for x in range(4)})
+        \\    print({k: v * 10 for k, v in {"a": 1, "b": 2}})
+        \\    print({w: len(w) for w in ["hi", "bye"]})
+        \\    print({x: x for x in range(3) if x > 0})
+    ;
+    try expectVMOutput(src, "{0: 0, 1: 1, 2: 4, 3: 9}\n{a: 10, b: 20}\n{hi: 2, bye: 3}\n{1: 1, 2: 2}\n");
 }
 
 test "vm: conditional (ternary) expression" {
