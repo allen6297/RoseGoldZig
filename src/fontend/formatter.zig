@@ -57,6 +57,8 @@ fn stmtLine(s: Stmt) u32 {
         .pass => |sp| sp.line,
         .break_stmt => |sp| sp.line,
         .continue_stmt => |sp| sp.line,
+        .try_catch => |x| x.span.line,
+        .raise => |x| x.span.line,
     };
 }
 
@@ -375,6 +377,24 @@ const Formatter = struct {
             .pass => try self.keywordLine("pass"),
             .break_stmt => try self.keywordLine("break"),
             .continue_stmt => try self.keywordLine("continue"),
+            .raise => |x| {
+                try self.pad();
+                try self.w("raise ");
+                try self.expr(x.value.*);
+                try self.nl();
+            },
+            .try_catch => |x| {
+                try self.pad();
+                try self.w("try:");
+                try self.nl();
+                try self.block(x.body);
+                try self.pad();
+                try self.w("catch ");
+                try self.w(x.catch_name);
+                try self.w(":");
+                try self.nl();
+                try self.block(x.handler);
+            },
         }
     }
 

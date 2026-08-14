@@ -53,6 +53,9 @@ pub const TokenKind = enum {
     kw_or,
     kw_not,
     kw_signal,
+    kw_try,
+    kw_catch,
+    kw_raise,
 
     // punctuation
     colon,
@@ -129,6 +132,9 @@ const keywords = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "or", .kw_or },
     .{ "not", .kw_not },
     .{ "signal", .kw_signal },
+    .{ "try", .kw_try },
+    .{ "catch", .kw_catch },
+    .{ "raise", .kw_raise },
 });
 
 /// Byte offsets plus line/col, threaded through every token so the parser and

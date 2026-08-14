@@ -24,7 +24,7 @@ zig build run -- run --disasm FILE.rg  # print the compiled VM bytecode (don't r
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (305 as of writing)
+zig build test                  # run every test (309 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -116,7 +116,8 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   key+value for a map), `break`, `continue`, `pass`, assignment (incl. compound
   `+= -= *= /= %=`, which
   the parser desugars to `x = x <op> e`), tuple **destructuring** `var a, b = tuple`
-  (also destructures a list; arity is checked), expression statements. All statement
+  (also destructures a list; arity is checked), `raise expr` and
+  `try: ... catch e: ...` (see **Error handling**), expression statements. All statement
   blocks are colon-blocks (indentation); braces `{ }` are only for `enum`/`match`
   bodies.
 - **Expressions:** literals (incl. `nil`), string interpolation `"a ${expr} b"`
@@ -176,6 +177,22 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `sqrt`/`pow` (→ `float`) and `floor`/`ceil`/`round` (→ `int`), and the
   higher-order list builtins `map(list, f)`, `filter(list, pred)`,
   `reduce(list, f, init)` (each invokes a callback — any callable).
+
+### Error handling
+- `raise expr` throws a value; `try: body catch e: handler` runs `body` and, on a raised
+  error, runs `handler` with `e` bound to the thrown value. **Built-in runtime errors are
+  catchable too** (a caught built-in error binds its message string); an uncaught error is
+  the top-level runtime error as before. Both backends behave identically — the built-in
+  error message text is aligned between them so the caught string matches.
+- **Interpreter:** `raise` sets `thrown_value` and returns `error.Runtime`; `try/catch`
+  catches it (Zig `defer`s in the call chain restore the environment as it unwinds) and
+  binds `thrown_value` (or the runtime-error message for a built-in error).
+- **VM:** a `push_handler`/`pop_handler`/`raise` opcode trio plus a `handlers` stack. The
+  exec loop is split into `execFrames` (a wrapper that catches `error.Runtime`) over
+  `runLoop`; on a catchable error it unwinds frames/stack to the handler's `try` point,
+  pushes the error value, and jumps to the catch. A handler is only caught **within its
+  own re-entrant scope** (`frame_len > stop_at`), so a `raise` inside a `map`/`emit`
+  callback correctly propagates out through the builtin to an outer `try`.
 
 ### Modules
 - **A module is a `.rg` file.** `import a.b` loads `a/b.rg` **relative to the importing

@@ -167,9 +167,16 @@ pub const Stmt = union(enum) {
     pass: Span,
     break_stmt: Span,
     continue_stmt: Span,
+    try_catch: TryCatch,
+    raise: Raise,
 
     /// `var a, b, ... = tuple` — binds each name to the corresponding element.
     pub const Destructure = struct { names: []const []const u8, value: *Expr, is_const: bool, span: Span };
+    /// `try: ... catch name: ...` — runs the body, and on a raised error runs the
+    /// handler with `name` bound to the error value.
+    pub const TryCatch = struct { body: []const Stmt, catch_name: []const u8, handler: []const Stmt, span: Span };
+    /// `raise expr` — throws `expr`'s value, unwinding to the nearest `catch`.
+    pub const Raise = struct { value: *Expr, span: Span };
     pub const Return = struct { value: ?*Expr, span: Span };
     pub const ElseIf = struct { cond: *Expr, body: []const Stmt };
     pub const If = struct {
@@ -883,6 +890,12 @@ const Parser = struct {
                 return .{ .continue_stmt = t.span };
             },
             .kw_var, .kw_const => return self.parseVarOrDestructure(),
+            .kw_raise => {
+                const kw = self.advance();
+                const value = try self.parseExpr();
+                return .{ .raise = .{ .value = value, .span = spanFrom(kw, self.prev()) } };
+            },
+            .kw_try => return .{ .try_catch = try self.parseTryCatch() },
             else => {
                 const expr = try self.parseExpr();
                 if (self.eat(.assign)) {
@@ -937,6 +950,15 @@ const Parser = struct {
             .else_body = else_body,
             .span = spanFrom(kw, self.prev()),
         };
+    }
+
+    fn parseTryCatch(self: *Parser) Error!Stmt.TryCatch {
+        const kw = self.advance(); // 'try'
+        const body = try self.parseColonStmtBlock();
+        _ = try self.expect(.kw_catch, "expected 'catch' after a try block");
+        const name = try self.expect(.identifier, "expected an error variable name after 'catch'");
+        const handler = try self.parseColonStmtBlock();
+        return .{ .body = body, .catch_name = name.text, .handler = handler, .span = spanFrom(kw, self.prev()) };
     }
 
     fn parseWhile(self: *Parser) Error!Stmt.While {

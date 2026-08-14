@@ -405,6 +405,9 @@ const Interpreter = struct {
     output: *std.ArrayList(u8),
     ret_value: Value = .nil,
     runtime_error: ?RuntimeError = null,
+    /// Set by `raise` to the thrown value, carried out via `error.Runtime` until a
+    /// `try`/`catch` binds it (or it becomes the top-level runtime error).
+    thrown_value: ?Value = null,
     /// The instance whose method is currently executing, so bare `field` names
     /// inside a method resolve to (and assign to) that instance.
     current_receiver: ?*Instance = null,
@@ -910,6 +913,31 @@ const Interpreter = struct {
         return self.execBlock(stmts);
     }
 
+    /// Run `try`'s body; on a raised error (or built-in runtime error) run the
+    /// handler with the error value bound. Zig `defer`s in the call chain restore
+    /// the environment as the error unwinds, so `catch` resumes cleanly.
+    fn execTryCatch(self: *Interpreter, tc: Stmt.TryCatch) Error!Flow {
+        return self.execChildBlock(tc.body) catch |e| {
+            if (e != error.Runtime) return e; // OutOfMemory etc. still propagate
+            const errval = self.thrown_value orelse
+                Value{ .str = if (self.runtime_error) |re| re.message else "error" };
+            self.thrown_value = null;
+            self.runtime_error = null;
+            const child = try self.newEnv(self.env);
+            try self.define(child, tc.catch_name, errval);
+            const saved = self.env;
+            self.env = child;
+            defer self.env = saved;
+            return self.execBlock(tc.handler);
+        };
+    }
+
+    fn valueToString(self: *Interpreter, v: Value) Error![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        try self.appendValue(&buf, v);
+        return buf.toOwnedSlice(self.arena);
+    }
+
     fn execStmt(self: *Interpreter, stmt: Stmt) Error!Flow {
         switch (stmt) {
             .pass => {},
@@ -929,6 +957,12 @@ const Interpreter = struct {
                 }
                 for (d.names, items) |n, item| try self.define(self.env, n, item);
             },
+            .raise => |r| {
+                self.thrown_value = try self.eval(r.value.*);
+                self.runtime_error = .{ .message = try self.valueToString(self.thrown_value.?), .line = r.span.line, .col = r.span.col };
+                return error.Runtime;
+            },
+            .try_catch => |tc| return self.execTryCatch(tc),
             .assign => |x| try self.execAssign(x),
             .return_stmt => |x| {
                 self.ret_value = if (x.value) |v| try self.eval(v.*) else Value.nil;
@@ -2555,6 +2589,30 @@ test "string and collection stdlib builtins" {
         \\    print(abs(-5), min(3, 7), max(3, 7))
     ;
     try expectOutput(src, "HI bye\n[a, b, c]\nx-y-z\ntrue true\n[1, 2, 3] [3, 2, 1]\n5 3 7\n");
+}
+
+test "error handling: raise, catch, and built-in errors" {
+    const src =
+        \\func checked(a: int, b: int) -> int:
+        \\    if b == 0:
+        \\        raise "div by zero"
+        \\    return a / b
+        \\
+        \\func main():
+        \\    try:
+        \\        print(checked(10, 2))
+        \\        print(checked(10, 0))
+        \\        print("unreached")
+        \\    catch e:
+        \\        print("caught:", e)
+        \\    try:
+        \\        var xs = [1, 2]
+        \\        print(xs[9])
+        \\    catch e:
+        \\        print("builtin:", e)
+        \\    print("done")
+    ;
+    try expectOutput(src, "5\ncaught: div by zero\nbuiltin: list index 9 out of range (len 2)\ndone\n");
 }
 
 test "tuples: literals, multiple return, destructuring, equality" {

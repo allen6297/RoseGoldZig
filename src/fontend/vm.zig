@@ -245,6 +245,9 @@ const Op = enum(u8) {
     close_upvalue, // close the open upvalue for the top slot, then pop it
     jump, // u16 (absolute target)
     jump_if_false, // u16
+    push_handler, // u16 catch target -> install a try handler
+    pop_handler, // remove the innermost try handler (body finished normally)
+    raise, // pop a value and throw it, unwinding to the nearest handler
     call, // u8 argc
     ret,
     build_list, // u16 count
@@ -1079,7 +1082,30 @@ const Compiler = struct {
                 const j = try self.emitJump(.jump, sp);
                 try loop.continues.append(self.alloc, j);
             },
+            .raise => |r| {
+                try self.expr(r.value.*);
+                try self.emit(.raise, r.span);
+            },
+            .try_catch => |tc| try self.tryCatch(tc),
         }
+    }
+
+    /// Compile `try: body catch e: handler`. The body runs under a handler that,
+    /// on a raised error, jumps to the catch with the error value on the stack;
+    /// on normal completion the handler is popped and the catch is skipped.
+    fn tryCatch(self: *Compiler, tc: Stmt.TryCatch) Error!void {
+        const handler_at = try self.emitJump(.push_handler, tc.span);
+        try self.block(tc.body);
+        try self.emit(.pop_handler, tc.span);
+        const skip = try self.emitJump(.jump, tc.span);
+
+        // Catch target: the unwind leaves the error value on the stack; bind it.
+        self.patchJumpTo(handler_at, self.here());
+        self.cur.scope_depth += 1;
+        try self.cur.locals.append(self.alloc, .{ .name = tc.catch_name, .depth = self.cur.scope_depth });
+        for (tc.handler) |s| try self.stmt(s);
+        try self.endScope();
+        self.patchJump(skip);
     }
 
     fn assign(self: *Compiler, a: Stmt.Assign) Error!void {
@@ -1546,12 +1572,20 @@ const max_call_depth = 900;
 /// its closure's upvalues. `base` is the stack index of slot 0.
 const Frame = struct { func: *const Function, upvalues: []*UpvalueObj, ip: usize, base: usize };
 
+/// An active `try`: where to resume (`catch_ip`) and the frame/stack heights to
+/// unwind back to when an error is raised inside its body.
+const Handler = struct { frame_len: usize, stack_len: usize, catch_ip: usize };
+
 const VM = struct {
     alloc: std.mem.Allocator,
     output: *std.ArrayList(u8),
     stack: std.ArrayList(Value) = .empty,
     frames: std.ArrayList(Frame) = .empty,
     open_upvalues: std.ArrayList(*UpvalueObj) = .empty,
+    /// Active `try` handlers, innermost last.
+    handlers: std.ArrayList(Handler) = .empty,
+    /// The value from a `raise` (else a built-in error uses `runtime_error`).
+    thrown_value: ?Value = null,
     runtime_error: ?RuntimeError = null,
 
     fn fail(self: *VM, comptime fmt: []const u8, args: anytype) VMError {
@@ -1606,10 +1640,44 @@ const VM = struct {
         return self.execFrames(0);
     }
 
-    /// Run the exec loop until the frame stack shrinks back to `stop_at` frames
-    /// (0 for the top-level script). `stop_at > 0` supports re-entrant calls: a
-    /// builtin can invoke a user callback and run just that call to completion.
+    /// Run bytecode until the frame stack shrinks to `stop_at` frames. Wraps the
+    /// interpreter loop so a raised error (or a built-in runtime error) can be
+    /// caught by an enclosing `try` whose handler is within this call's scope;
+    /// otherwise the error propagates out (to an outer `execFrames` or the top).
     fn execFrames(self: *VM, stop_at: usize) VMError!void {
+        while (true) {
+            self.runLoop(stop_at) catch |e| {
+                // Only catch a handler installed *inside* this call's scope
+                // (`frame_len > stop_at`). A handler at or below the boundary
+                // belongs to a caller — propagate so it unwinds there, not while
+                // we're still nested inside a builtin's re-entrant callback.
+                if (e == error.Runtime and self.handlers.items.len > 0 and self.handlers.getLast().frame_len > stop_at) {
+                    try self.unwindToHandler();
+                    continue; // re-enter the loop at the catch handler
+                }
+                return e;
+            };
+            return; // runLoop finished normally
+        }
+    }
+
+    /// Pop the top handler, unwind frames/stack to where its `try` began, and push
+    /// the error value so the catch body binds it.
+    fn unwindToHandler(self: *VM) VMError!void {
+        const h = self.handlers.pop().?;
+        while (self.frames.items.len > h.frame_len) {
+            const finished = self.frames.pop().?;
+            self.closeUpvalues(finished.base);
+        }
+        self.stack.shrinkRetainingCapacity(h.stack_len);
+        const errval = self.thrown_value orelse Value{ .str = if (self.runtime_error) |re| re.message else "error" };
+        self.thrown_value = null;
+        self.runtime_error = null;
+        try self.push(errval);
+        self.frames.items[self.frames.items.len - 1].ip = h.catch_ip;
+    }
+
+    fn runLoop(self: *VM, stop_at: usize) VMError!void {
         var frame = &self.frames.items[self.frames.items.len - 1];
         while (true) {
             const chunk = &frame.func.chunk;
@@ -1693,6 +1761,17 @@ const VM = struct {
                 .jump_if_false => {
                     const target = self.readU16(frame);
                     if (!isTruthy(self.pop())) frame.ip = target;
+                },
+                .push_handler => {
+                    const catch_ip = self.readU16(frame);
+                    try self.handlers.append(self.alloc, .{ .frame_len = self.frames.items.len, .stack_len = self.stack.items.len, .catch_ip = catch_ip });
+                },
+                .pop_handler => _ = self.handlers.pop(),
+                .raise => {
+                    const v = self.pop();
+                    self.thrown_value = v;
+                    self.runtime_error = .{ .message = try self.valueToStr(v), .line = self.currentLine(), .col = 1 };
+                    return error.Runtime; // caught by `execFrames`, or fatal
                 },
                 .call => {
                     const argc = self.readByte(frame);
@@ -2263,7 +2342,7 @@ const VM = struct {
         switch (container) {
             .list => |l| {
                 if (key != .int) return self.fail("list index must be an int", .{});
-                if (key.int < 0 or key.int >= l.items.len) return self.fail("list index {d} out of range", .{key.int});
+                if (key.int < 0 or key.int >= l.items.len) return self.fail("list index {d} out of range (len {d})", .{ key.int, l.items.len });
                 return l.items[@intCast(key.int)];
             },
             .str => |s| {
@@ -2283,7 +2362,7 @@ const VM = struct {
         switch (container) {
             .list => |l| {
                 if (key != .int) return self.fail("list index must be an int", .{});
-                if (key.int < 0 or key.int >= l.items.len) return self.fail("list index {d} out of range", .{key.int});
+                if (key.int < 0 or key.int >= l.items.len) return self.fail("list index {d} out of range (len {d})", .{ key.int, l.items.len });
                 l.items[@intCast(key.int)] = value;
             },
             .map => |m| try self.mapSet(m, key, value),
@@ -2322,6 +2401,12 @@ const VM = struct {
 
     fn appendValue(self: *VM, v: Value) VMError!void {
         try self.appendValueTo(self.output, v);
+    }
+
+    fn valueToStr(self: *VM, v: Value) VMError![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        try self.appendValueTo(&buf, v);
+        return buf.toOwnedSlice(self.alloc);
     }
 
     fn appendValueTo(self: *VM, buf: *std.ArrayList(u8), v: Value) VMError!void {
@@ -2454,7 +2539,7 @@ fn disasmInstr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), ch: *const Chu
             try out.print(alloc, " {s}", .{ch.rttypes.items[readU16At(code, offset + 1)].name});
             break :blk offset + 3;
         },
-        .jump, .jump_if_false => blk: {
+        .jump, .jump_if_false, .push_handler => blk: {
             try out.print(alloc, " -> {d}", .{readU16At(code, offset + 1)});
             break :blk offset + 3;
         },
@@ -2661,6 +2746,54 @@ test "vm: stdlib builtins" {
         \\    print(replace("a-b", "-", "+"))
     ;
     try expectVMOutput(src, "5 3 7\nHI bye\n[1, 2, 3] [3, 2, 1]\n[a, b, c] x-y\ntrue 1\n[z] true\na+b\n");
+}
+
+test "vm: try/catch catches raises and built-in errors" {
+    const src =
+        \\func checked(a: int, b: int) -> int:
+        \\    if b == 0:
+        \\        raise "div by zero"
+        \\    return a / b
+        \\
+        \\func main():
+        \\    try:
+        \\        print(checked(10, 2))
+        \\        print(checked(10, 0))
+        \\        print("unreached")
+        \\    catch e:
+        \\        print("caught:", e)
+        \\    try:
+        \\        var xs = [1, 2]
+        \\        print(xs[9])
+        \\    catch e:
+        \\        print("builtin:", e)
+        \\    print("done")
+    ;
+    try expectVMOutput(src, "5\ncaught: div by zero\nbuiltin: list index 9 out of range (len 2)\ndone\n");
+}
+
+test "vm: a raise inside a map callback unwinds to an outer catch" {
+    const src =
+        \\func no_twos(x: int) -> int:
+        \\    if x == 2:
+        \\        raise "no twos"
+        \\    return x * 10
+        \\
+        \\func main():
+        \\    try:
+        \\        print(map([1, 2, 3], no_twos))
+        \\    catch e:
+        \\        print("caught:", e)
+        \\    print("done")
+    ;
+    try expectVMOutput(src, "caught: no twos\ndone\n");
+}
+
+test "vm: an uncaught raise is a runtime error" {
+    var result = try runSource(testing.allocator, "func main():\n    raise \"boom\"");
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "boom") != null);
 }
 
 test "vm: tuples, multiple return, and destructuring" {

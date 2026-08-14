@@ -1309,6 +1309,17 @@ const Analyzer = struct {
             .continue_stmt => |span| {
                 if (self.loop_depth == 0) try self.report(span, "'continue' outside a loop", .{});
             },
+            .raise => |r| _ = try self.typeOf(r.value.*),
+            .try_catch => |tc| {
+                try self.analyzeChildBlock(tc.body);
+                // The handler runs with the error bound (its value is unconstrained).
+                const child = try self.newScope(self.current);
+                try self.declareIn(child, tc.catch_name, .variable, .any, tc.span);
+                const saved = self.current;
+                self.current = child;
+                defer self.current = saved;
+                try self.analyzeStmts(tc.handler);
+            },
         }
     }
 
