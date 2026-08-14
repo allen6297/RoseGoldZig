@@ -488,6 +488,13 @@ const Formatter = struct {
                 try self.w(".");
                 try self.w(m.name);
             },
+            .conditional => |c| {
+                try self.expr(c.then_val.*);
+                try self.w(" if ");
+                try self.expr(c.cond.*);
+                try self.w(" else ");
+                try self.expr(c.else_val.*);
+            },
             .comprehension => |c| {
                 try self.w("[");
                 try self.expr(c.output.*);
@@ -648,6 +655,13 @@ test "formats default parameter values" {
     const out = try fmt(gpa, "func f(a,b=1+1,c=\"x\"):\n    return a");
     defer gpa.free(out);
     try testing.expectEqualStrings("func f(a, b = 1 + 1, c = \"x\"):\n    return a\n", out);
+}
+
+test "formats conditional expressions" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "func main():\n    var x =  a  if  c  else  b");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("func main():\n    var x = a if c else b\n", out);
 }
 
 test "formats list comprehensions" {

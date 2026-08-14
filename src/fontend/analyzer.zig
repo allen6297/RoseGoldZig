@@ -1421,6 +1421,7 @@ const Analyzer = struct {
             .index => |i| try self.typeIndex(i),
             .slice => |s| try self.typeSlice(s),
             .comprehension => |c| try self.typeComprehension(c),
+            .conditional => |c| try self.typeConditional(c),
             .member => |m| blk: {
                 const ot = try self.typeOf(m.object.*);
                 break :blk try self.memberType(ot, m.name, m.span);
@@ -1874,6 +1875,18 @@ const Analyzer = struct {
                 break :blk .unknown;
             },
         };
+    }
+
+    fn typeConditional(self: *Analyzer, c: *const Expr.Conditional) Error!Type {
+        const ct = try self.typeOf(c.cond.*);
+        if (!isBoolish(ct)) {
+            try self.report(parser.exprSpan(c.cond.*), "conditional condition must be bool, got {s}", .{typeName(ct)});
+        }
+        const then_t = try self.typeOf(c.then_val.*);
+        const else_t = try self.typeOf(c.else_val.*);
+        if (try self.join(then_t, else_t)) |joined| return joined;
+        try self.report(c.span, "conditional branches have incompatible types {s} and {s}", .{ typeName(then_t), typeName(else_t) });
+        return .unknown;
     }
 
     fn typeComprehension(self: *Analyzer, c: *const Expr.Comprehension) Error!Type {
@@ -2696,6 +2709,20 @@ test "arithmetic on non-numbers is reported" {
     var analysis = try analyzeSource(testing.allocator, "const x: int = true + 1");
     defer analysis.deinit();
     try expectMessageContains(analysis, "'+'");
+}
+
+test "conditional expression: bool condition, unified branches, nil makes it optional" {
+    var ok = try analyzeSource(testing.allocator, "func f(b: bool) -> int:\n    return 1 if b else 2");
+    defer ok.deinit();
+    try testing.expectEqual(@as(usize, 0), ok.diagnostics.len);
+
+    var badc = try analyzeSource(testing.allocator, "func main():\n    var x = 1 if 5 else 2");
+    defer badc.deinit();
+    try expectMessageContains(badc, "conditional condition must be bool");
+
+    var incompat = try analyzeSource(testing.allocator, "func f(b: bool):\n    var x = 1 if b else \"s\"");
+    defer incompat.deinit();
+    try expectMessageContains(incompat, "incompatible types");
 }
 
 test "list comprehension types to list of the output type; condition must be bool" {

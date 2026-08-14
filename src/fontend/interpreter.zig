@@ -1592,6 +1592,10 @@ const Interpreter = struct {
             .index => |idx| try self.evalIndex(idx),
             .slice => |s| try self.evalSlice(s),
             .comprehension => |c| try self.evalComprehension(c),
+            .conditional => |c| if (isTruthy(try self.eval(c.cond.*)))
+                try self.eval(c.then_val.*)
+            else
+                try self.eval(c.else_val.*),
             .array => |a| try self.evalArray(a),
             .map => |m| try self.evalMap(m),
             .match => |m| try self.evalMatch(m),
@@ -2224,6 +2228,20 @@ test "list and string slicing with clamping" {
         \\    print(s[6:])
     ;
     try expectOutput(src, "[20, 30]\n[10, 20]\n[40, 50]\n[30, 40, 50]\n[]\nhello\nworld\n");
+}
+
+test "conditional (ternary) expression" {
+    const src =
+        \\func sign(n: int) -> str:
+        \\    return "neg" if n < 0 else ("zero" if n == 0 else "pos")
+        \\
+        \\func main():
+        \\    print(sign(-5))
+        \\    print(sign(0))
+        \\    print(sign(7))
+        \\    print([("even" if i % 2 == 0 else "odd") for i in range(3)])
+    ;
+    try expectOutput(src, "neg\nzero\npos\n[even, odd, even]\n");
 }
 
 test "hex, binary, and underscore number literals" {

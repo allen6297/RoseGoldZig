@@ -103,6 +103,7 @@ pub const Expr = union(enum) {
     range: Range,
     tuple: Tuple,
     comprehension: *const Comprehension,
+    conditional: *const Conditional,
 
     pub const Literal = struct { text: []const u8, span: Span };
     /// `[output for binding[, value_binding] in iter [if cond]]` — builds a list.
@@ -117,6 +118,8 @@ pub const Expr = union(enum) {
     /// A fixed, ordered group of values: `(a, b, ...)` (two or more elements).
     pub const Tuple = struct { elements: []const *Expr, span: Span };
     pub const Range = struct { start: *Expr, end: *Expr, span: Span };
+    /// `then_val if cond else else_val` — a conditional (ternary) expression.
+    pub const Conditional = struct { cond: *Expr, then_val: *Expr, else_val: *Expr, span: Span };
     pub const Bool = struct { value: bool, span: Span };
     pub const Ident = struct { name: []const u8, span: Span };
     pub const Unary = struct { op: UnaryOp, operand: *Expr, span: Span };
@@ -310,6 +313,7 @@ pub fn exprSpan(e: Expr) Span {
         .range => |r| r.span,
         .tuple => |t| t.span,
         .comprehension => |c| c.span,
+        .conditional => |c| c.span,
     };
 }
 
@@ -1040,8 +1044,33 @@ const Parser = struct {
     fn parseExpr(self: *Parser) Error!*Expr {
         try self.enter();
         defer self.leave();
+        const left = try self.parseRangeExpr();
+        // A conditional (ternary) `then if cond else else`, looser than anything
+        // above and right-associative. Only fires when `if` follows on the same
+        // line (a statement-leading `if` sits after a NEWLINE). Parsed here so it
+        // stays *outside* a comprehension's iterable/filter (which use
+        // `parseRangeExpr`), keeping `[x for x in xs if cond]` unambiguous.
+        if (self.at(.kw_if)) {
+            _ = self.advance();
+            const cond = try self.parseRangeExpr();
+            _ = try self.expect(.kw_else, "expected 'else' in a conditional expression");
+            const else_val = try self.parseExpr();
+            const c = try self.alloc.create(Expr.Conditional);
+            c.* = .{
+                .cond = cond,
+                .then_val = left,
+                .else_val = else_val,
+                .span = joinSpan(exprSpan(left.*), exprSpan(else_val.*)),
+            };
+            return self.mkExpr(.{ .conditional = c });
+        }
+        return left;
+    }
+
+    /// `or`/`and`/comparison/arithmetic/bitwise, plus a trailing range `a..b`.
+    /// Everything below the conditional (ternary) level.
+    fn parseRangeExpr(self: *Parser) Error!*Expr {
         const left = try self.parseOr();
-        // A range `start..end` (lowest precedence, non-chaining).
         if (self.eat(.dot_dot)) {
             const right = try self.parseOr();
             return self.mkExpr(.{ .range = .{
@@ -1327,9 +1356,9 @@ const Parser = struct {
             value_binding = second.text;
         }
         _ = try self.expect(.kw_in, "expected 'in' after the loop variable");
-        const iter = try self.parseExpr();
+        const iter = try self.parseRangeExpr(); // not parseExpr: leave the filter `if` for us
         var cond: ?*Expr = null;
-        if (self.eat(.kw_if)) cond = try self.parseExpr();
+        if (self.eat(.kw_if)) cond = try self.parseRangeExpr();
         const rbracket = try self.expect(.r_bracket, "expected ']' to close the comprehension");
         const c = try self.alloc.create(Expr.Comprehension);
         c.* = .{

@@ -1475,6 +1475,20 @@ const Compiler = struct {
             .lambda => |lam| try self.compileLambda(lam),
             .match => |m| try self.compileMatch(m),
             .comprehension => |c| try self.compileComprehension(c),
+            .conditional => |c| {
+                // `then if cond else else_val` — jump-based; each branch runs with
+                // the condition already popped, so both compile at `before`.
+                const before = self.cur.stack_top;
+                try self.expr(c.cond.*);
+                const to_else = try self.emitJump(.jump_if_false, c.span); // pops cond
+                self.cur.stack_top = before;
+                try self.expr(c.then_val.*);
+                const done = try self.emitJump(.jump, c.span);
+                self.patchJump(to_else);
+                self.cur.stack_top = before;
+                try self.expr(c.else_val.*);
+                self.patchJump(done);
+            },
         }
     }
 
@@ -3102,6 +3116,20 @@ test "vm: list and string slicing with clamping" {
         \\    print(s[6:])
     ;
     try expectVMOutput(src, "[20, 30]\n[10, 20]\n[40, 50]\n[30, 40, 50]\n[]\nhello\nworld\n");
+}
+
+test "vm: conditional (ternary) expression" {
+    const src =
+        \\func sign(n: int) -> str:
+        \\    return "neg" if n < 0 else ("zero" if n == 0 else "pos")
+        \\
+        \\func main():
+        \\    print(sign(-5))
+        \\    print(sign(0))
+        \\    print(sign(7))
+        \\    print([("even" if i % 2 == 0 else "odd") for i in range(3)])
+    ;
+    try expectVMOutput(src, "neg\nzero\npos\n[even, odd, even]\n");
 }
 
 test "vm: hex, binary, and underscore number literals" {
