@@ -233,6 +233,10 @@ const Server = struct {
     in: *Io.Reader,
     /// uri → document text, both owned by `gpa`.
     docs: std.StringHashMapUnmanaged([]const u8) = .{},
+    /// Module search roots (workspace folders + configured import paths), each a
+    /// `gpa`-owned filesystem path; imports not found relative to the importer are
+    /// looked up here, in order.
+    roots: std.ArrayListUnmanaged([]const u8) = .empty,
     shutting_down: bool = false,
 
     fn deinit(self: *Server) void {
@@ -242,6 +246,24 @@ const Server = struct {
             self.gpa.free(e.value_ptr.*);
         }
         self.docs.deinit(self.gpa);
+        for (self.roots.items) |r| self.gpa.free(r);
+        self.roots.deinit(self.gpa);
+    }
+
+    /// Add `path` as a search root (owned copy), skipping duplicates and empties.
+    fn addRoot(self: *Server, path: []const u8) !void {
+        if (path.len == 0) return;
+        for (self.roots.items) |r| {
+            if (std.mem.eql(u8, r, path)) return;
+        }
+        try self.roots.append(self.gpa, try self.gpa.dupe(u8, path));
+    }
+
+    /// Add a search root given as a `file://` URI, if it decodes to a path.
+    fn addRootUri(self: *Server, uri: []const u8) !void {
+        const p = uriToPath(self.gpa, uri) orelse return;
+        defer self.gpa.free(p);
+        try self.addRoot(p);
     }
 
     /// Store (or replace) a document's text, taking ownership of a fresh copy.
@@ -322,7 +344,7 @@ const Server = struct {
             const params = obj.get("params");
 
             if (std.mem.eql(u8, method, "initialize")) {
-                try self.respond(id.?, initializeResult());
+                try self.onInitialize(id.?, params);
             } else if (std.mem.eql(u8, method, "shutdown")) {
                 self.shutting_down = true;
                 try self.respond(id.?, @as(?u8, null));
@@ -347,6 +369,38 @@ const Server = struct {
                 try self.respond(rid, @as(?u8, null));
             }
         }
+    }
+
+    /// Capture the workspace's module search roots from the `initialize` request
+    /// (workspace folders, the legacy `rootUri`, and an optional
+    /// `initializationOptions.importPaths` array of paths or `file://` URIs), then
+    /// reply with capabilities.
+    fn onInitialize(self: *Server, id: std.json.Value, params: ?std.json.Value) !void {
+        if (params) |p| {
+            if (objGet(p, "workspaceFolders")) |wf| {
+                if (wf == .array) {
+                    for (wf.array.items) |folder| {
+                        if (strField(folder, "uri")) |u| try self.addRootUri(u);
+                    }
+                }
+            }
+            if (strField(p, "rootUri")) |u| try self.addRootUri(u);
+            if (objGet(p, "initializationOptions")) |opts| {
+                if (objGet(opts, "importPaths")) |ip| {
+                    if (ip == .array) {
+                        for (ip.array.items) |v| {
+                            if (v != .string) continue;
+                            if (std.mem.startsWith(u8, v.string, "file://")) {
+                                try self.addRootUri(v.string);
+                            } else {
+                                try self.addRoot(v.string);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        try self.respond(id, initializeResult());
     }
 
     fn initializeResult() struct {
@@ -475,7 +529,7 @@ const Server = struct {
             try overlays.append(self.gpa, .{ .path = p, .src = e.value_ptr.* });
         }
 
-        var graph = try loader.loadWithOverlay(self.gpa, self.io, entry_path, &.{}, overlays.items);
+        var graph = try loader.loadWithOverlay(self.gpa, self.io, entry_path, self.roots.items, overlays.items);
         defer graph.deinit();
         if (graph.units.len == 0) return;
         const entry = graph.units[graph.units.len - 1]; // dependency order: entry last
@@ -758,6 +812,21 @@ test "uriToPath strips file:// and percent-decodes" {
     try testing.expectEqualStrings("/a/My Code/app.rg", p2);
 
     try testing.expect(uriToPath(gpa, "untitled:Untitled-1") == null);
+}
+
+test "addRoot dedups and addRootUri decodes file URIs" {
+    var server = Server{ .gpa = testing.allocator, .io = undefined, .out = undefined, .in = undefined };
+    defer server.deinit();
+    try server.addRoot("/a");
+    try server.addRoot("/a"); // duplicate: ignored
+    try server.addRoot(""); // empty: ignored
+    try server.addRoot("/b");
+    try server.addRootUri("file:///c/d");
+    try server.addRootUri("untitled:x"); // not a file URI: ignored
+    try testing.expectEqual(@as(usize, 3), server.roots.items.len);
+    try testing.expectEqualStrings("/a", server.roots.items[0]);
+    try testing.expectEqualStrings("/b", server.roots.items[1]);
+    try testing.expectEqualStrings("/c/d", server.roots.items[2]);
 }
 
 test "hasImports detects import declarations" {

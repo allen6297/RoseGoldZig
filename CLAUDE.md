@@ -300,9 +300,15 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   for a declaration), `definition` and `documentSymbol` (both from a grammar-free
   declaration line scan — funcs/classes/structs/enums/signals/consts/vars). Unknown
   requests get a null result so the client never hangs.
+- **Workspace search roots.** `initialize` captures the workspace folders (and legacy
+  `rootUri`), plus an optional `initializationOptions.importPaths` (paths or `file://`
+  URIs), as module search roots (`onInitialize` → `addRoot`/`addRootUri`, deduped). They're
+  passed to `loadWithOverlay`, so an import not found relative to the importer resolves
+  against the workspace — e.g. `import util.strutil` from `src/app.rg` finds
+  `<workspace>/util/strutil.rg`. The VS Code extension forwards `rosegold.importPaths` via
+  `initializationOptions` (workspace folders are sent by the client automatically).
 - **Scope (v1):** positions treat a column as a UTF-8 byte offset (correct for ASCII
-  source); imports resolve importer-relative (no configured search roots yet). The VS Code
-  extension (`vscode-extension/`) is a client for this server.
+  source). The VS Code extension (`vscode-extension/`) is a client for this server.
 
 ### Bytecode VM (`run --vm`)
 - An alternative execution backend (`vm.zig`): a compiler lowers each function to a

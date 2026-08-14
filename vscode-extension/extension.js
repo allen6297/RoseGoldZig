@@ -5,8 +5,17 @@
 // is found.
 
 const vscode = require("vscode");
+const path = require("path");
 
 let client; // the running LanguageClient, if any
+
+/** Resolve configured import paths to absolute (relative ones against the workspace). */
+function importPaths() {
+  const configured = vscode.workspace.getConfiguration("rosegold").get("importPaths") || [];
+  const folders = vscode.workspace.workspaceFolders;
+  const base = folders && folders.length ? folders[0].uri.fsPath : undefined;
+  return configured.map((p) => (path.isAbsolute(p) || !base ? p : path.join(base, p)));
+}
 
 /** The configured executable path, or `RoseGold_Zig` from PATH. */
 function serverExe() {
@@ -39,6 +48,8 @@ function startLanguageServer(context) {
   };
   const clientOptions = {
     documentSelector: [{ scheme: "file", language: "rosegold" }],
+    // Workspace folders are sent automatically; pass any extra search roots too.
+    initializationOptions: { importPaths: importPaths() },
   };
 
   client = new node.LanguageClient("rosegold", "RoseGold Language Server", serverOptions, clientOptions);

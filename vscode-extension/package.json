@@ -52,6 +52,12 @@
           "type": "boolean",
           "default": true,
           "description": "Start the RoseGold language server for live diagnostics, hover, and navigation."
+        },
+        "rosegold.importPaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra module search roots for imports not found relative to the importing file. Relative paths resolve against the first workspace folder. The workspace folders themselves are always searched."
         }
       }
     }

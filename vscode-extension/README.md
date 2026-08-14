@@ -42,6 +42,7 @@ code --install-extension rosegold-0.1.0.vsix
 | `rosegold.serverPath` | `""` | Path to `RoseGold_Zig`; empty ⇒ found on `PATH`. |
 | `rosegold.useVm` | `false` | Run files on the bytecode VM (`run --vm`). |
 | `rosegold.enableLanguageServer` | `true` | Start the language server for diagnostics/hover/navigation. |
+| `rosegold.importPaths` | `[]` | Extra module search roots for imports (relative paths resolve against the workspace). Workspace folders are always searched. |
 
 ## Status / caveats
 
@@ -50,5 +51,6 @@ VS Code and `vscode-languageclient` 9 APIs but has **not been run in the
 environment where it was authored** — treat it as a solid starting point. If
 `vscode-languageclient` isn't installed, the extension degrades gracefully to
 highlighting + the run command only. The language server (`RoseGold_Zig lsp`)
-resolves imports across files — with unsaved buffers overlaid on disk — so
-diagnostics are accurate across modules and reflect live edits.
+resolves imports across files — searching the workspace folders (and
+`rosegold.importPaths`), with unsaved buffers overlaid on disk — so diagnostics
+are accurate across modules and reflect live edits.
