@@ -53,14 +53,30 @@ pub const Graph = struct {
     }
 };
 
+/// An in-memory source that overrides the file at `path` (e.g. an editor's
+/// unsaved buffer). Passed to `loadWithOverlay`.
+pub const Overlay = struct { path: []const u8, src: []const u8 };
+
 pub fn load(gpa: std.mem.Allocator, io: Io, entry_path: []const u8) Error!Graph {
-    return loadWithPaths(gpa, io, entry_path, &.{});
+    return loadFull(gpa, io, entry_path, &.{}, &.{});
 }
 
 /// Like `load`, but imports not found relative to the importer are then looked
 /// up against each directory in `roots`, in order. Roots are normalized
 /// lexically; the importer-relative lookup always takes precedence.
 pub fn loadWithPaths(gpa: std.mem.Allocator, io: Io, entry_path: []const u8, roots: []const []const u8) Error!Graph {
+    return loadFull(gpa, io, entry_path, roots, &.{});
+}
+
+/// Like `loadWithPaths`, but any file whose path matches an `overlays` entry is
+/// read from that entry's in-memory source instead of disk. Lets a language
+/// server analyze unsaved buffers (the entry and any other open file) while
+/// resolving the rest from disk.
+pub fn loadWithOverlay(gpa: std.mem.Allocator, io: Io, entry_path: []const u8, roots: []const []const u8, overlays: []const Overlay) Error!Graph {
+    return loadFull(gpa, io, entry_path, roots, overlays);
+}
+
+fn loadFull(gpa: std.mem.Allocator, io: Io, entry_path: []const u8, roots: []const []const u8, overlays: []const Overlay) Error!Graph {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const alloc = arena.allocator();
@@ -68,7 +84,11 @@ pub fn loadWithPaths(gpa: std.mem.Allocator, io: Io, entry_path: []const u8, roo
     const clean_roots = try alloc.alloc([]const u8, roots.len);
     for (roots, 0..) |r, i| clean_roots[i] = try cleanPath(alloc, r);
 
-    var loader = Loader{ .gpa = gpa, .arena = alloc, .io = io, .roots = clean_roots };
+    // Key overlays by their normalized path, matching how `visit` sees paths.
+    var overlay: std.StringHashMapUnmanaged([]const u8) = .{};
+    for (overlays) |o| try overlay.put(alloc, try cleanPath(alloc, o.path), o.src);
+
+    var loader = Loader{ .gpa = gpa, .arena = alloc, .io = io, .roots = clean_roots, .overlay = overlay };
     const entry = try cleanPath(alloc, entry_path);
     switch (try loader.visit(entry)) {
         .missing => {
@@ -96,6 +116,8 @@ const Loader = struct {
     arena: std.mem.Allocator,
     io: Io,
     roots: []const []const u8 = &.{},
+    /// Normalized path → in-memory source that shadows disk (see `loadWithOverlay`).
+    overlay: std.StringHashMapUnmanaged([]const u8) = .{},
     states: std.StringHashMapUnmanaged(State) = .{},
     units: std.ArrayList(Unit) = .empty,
     trees: std.ArrayList(*parser.Tree) = .empty,
@@ -113,12 +135,15 @@ const Loader = struct {
         }
         try self.states.put(self.arena, path, .loading);
 
-        const src = Io.Dir.cwd().readFileAlloc(self.io, path, self.arena, .limited(16 << 20)) catch {
-            // Not loadable: forget it so a second import of the same path is
-            // reported at its own site too.
-            _ = self.states.remove(path);
-            return .missing;
-        };
+        const src = if (self.overlay.get(path)) |ov|
+            try self.arena.dupe(u8, ov) // an unsaved buffer shadows disk
+        else
+            Io.Dir.cwd().readFileAlloc(self.io, path, self.arena, .limited(16 << 20)) catch {
+                // Not loadable: forget it so a second import of the same path is
+                // reported at its own site too.
+                _ = self.states.remove(path);
+                return .missing;
+            };
 
         const tree = try self.arena.create(parser.Tree);
         tree.* = try parser.parse(self.gpa, src);
@@ -323,4 +348,35 @@ test "loadWithPaths resolves an import from a search root" {
         try testing.expectEqual(@as(usize, 1), app.imports.len);
         try testing.expectEqualStrings("greet", app.imports[0].name);
     }
+}
+
+test "loadWithOverlay reads an unsaved buffer instead of disk" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // On disk: a module and an app that imports it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "greet.rg", .data =
+        \\pub func hi() -> str:
+        \\    return "hi"
+        \\
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.rg", .data = "import greet\n" });
+
+    const app_path = try tmp.dir.realPathFileAlloc(io, "app.rg", gpa);
+    defer gpa.free(app_path);
+
+    // An in-memory version of app.rg that actually uses the (real, on-disk) import.
+    const buffer = "import greet\n\nfunc main():\n    print(greet.hi())\n";
+    var g = try loadWithOverlay(gpa, io, app_path, &.{}, &.{.{ .path = app_path, .src = buffer }});
+    defer g.deinit();
+
+    try testing.expectEqual(@as(usize, 0), g.diagnostics.len);
+    try testing.expectEqual(@as(usize, 2), g.units.len);
+    // The entry unit's source is the overlay buffer, not the one-line disk file.
+    const app = g.units[g.units.len - 1];
+    try testing.expect(std.mem.indexOf(u8, app.src, "greet.hi()") != null);
+    try testing.expectEqual(@as(usize, 1), app.imports.len);
 }

@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (326 as of writing)
+zig build test                  # run every test (329 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -215,7 +215,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   analyzes each in that order (handing every module the exports of the ones it imports)
   and runs them (dependencies first; the entry's `main()` last). `load` resolves imports
   importer-relative only; `loadWithPaths(…, roots)` adds the search roots (a `.missing`
-  candidate falls through to the next root, a cycle stops the search).
+  candidate falls through to the next root, a cycle stops the search); `loadWithOverlay(…,
+  overlays)` shadows on-disk files with in-memory sources (used by the LSP for unsaved
+  buffers).
 - **Closures over the home module.** A function/method value carries the globals of the
   module that defined it (`FuncValue.module`, `TypeInfo.module`), so when it's called
   from another module its body still resolves names in *its own* module — it can use its
@@ -280,17 +282,26 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `std.json` for parse + serialize). It runs on a freeing allocator (`smp_allocator`),
   not the CLI arena, since it's long-running and frees per message.
 - **Diagnostics reuse the real front end**: each open/changed document is `parser.parse`d
-  and, if it parses cleanly, `analyzer.analyzeModule`d, and the diagnostics are published
+  and, if it parses cleanly, analyzed, and the diagnostics are published
   (`textDocument/publishDiagnostics`) — so editor errors match `check`. Positions are
   1-based front-end line/col → 0-based LSP, with the range widened over the identifier.
+  Messages are duped into the LSP's own allocator (`appendDiag`) so they outlive the
+  parse/analysis arenas before serialization.
+- **Cross-file analysis.** A document that `import`s is analyzed through the module loader
+  via `loader.loadWithOverlay`, which **overlays every open (unsaved) buffer on disk** —
+  so imported names/types resolve and diagnostics reflect live edits in the entry *and*
+  in imported files, before either is saved. The loader returns the dependency-ordered
+  graph; the LSP analyzes each module handing it the exports of what it imports (keeping
+  all analyses alive, since a dependent's exports point into its dependency's arena) and
+  publishes only the entry's diagnostics. A no-import or untitled document takes a
+  standalone fast path; any loader/analyze failure falls back to standalone.
 - **Features:** `initialize` (advertises full text sync + hover/definition/documentSymbol),
   `didOpen`/`didChange`/`didSave`/`didClose`, `hover` (stdlib builtin docs, or "kind name"
   for a declaration), `definition` and `documentSymbol` (both from a grammar-free
   declaration line scan — funcs/classes/structs/enums/signals/consts/vars). Unknown
   requests get a null result so the client never hangs.
-- **Scope (v1):** documents are analyzed **standalone** (imports aren't resolved across
-  files, so cross-module member checks are deferred — single-file diagnostics are exact);
-  positions treat a column as a UTF-8 byte offset (correct for ASCII source). The VS Code
+- **Scope (v1):** positions treat a column as a UTF-8 byte offset (correct for ASCII
+  source); imports resolve importer-relative (no configured search roots yet). The VS Code
   extension (`vscode-extension/`) is a client for this server.
 
 ### Bytecode VM (`run --vm`)

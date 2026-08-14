@@ -6,15 +6,18 @@
 //! answers hover, go-to-definition, and document-symbol requests using a
 //! lightweight declaration scan over the buffer.
 //!
-//! Scope (v1): each document is analyzed **standalone** (imports are not resolved
-//! across files), so cross-module member checks are deferred — single-file
-//! programs get fully accurate diagnostics. Positions are treated as UTF-8 byte
-//! offsets within a line (correct for ASCII source).
+//! Cross-file analysis: a document with `import`s is analyzed through the module
+//! loader, with every open (unsaved) buffer overlaid on disk — so imported names
+//! and types are resolved and diagnostics reflect live edits across files. A
+//! document with no imports (or an untitled buffer) is analyzed standalone.
+//! Positions are treated as UTF-8 byte offsets within a line (correct for ASCII
+//! source).
 
 const std = @import("std");
 const Io = std.Io;
 const parser = @import("parser.zig");
 const analyzer = @import("analyzer.zig");
+const loader = @import("loader.zig");
 const lexer = @import("lexer.zig");
 
 // --- LSP wire types (serialized to JSON by std.json) -------------------------
@@ -225,6 +228,7 @@ fn declKindWord(k: DeclKind) []const u8 {
 
 const Server = struct {
     gpa: std.mem.Allocator,
+    io: Io,
     out: *Io.Writer,
     in: *Io.Reader,
     /// uri → document text, both owned by `gpa`.
@@ -406,24 +410,105 @@ const Server = struct {
 
     // --- diagnostics ---
 
+    /// Map a front-end diagnostic and append it with a `gpa`-owned message, so it
+    /// outlives the parse tree / analysis arena it came from.
+    fn appendDiag(self: *Server, diags: *std.ArrayList(LspDiag), text: []const u8, d: lexer.Diagnostic) !void {
+        var m = mapDiag(text, d);
+        m.message = try self.gpa.dupe(u8, m.message);
+        try diags.append(self.gpa, m);
+    }
+
     fn publishDiagnostics(self: *Server, uri: []const u8, text: []const u8) !void {
         var diags: std.ArrayList(LspDiag) = .empty;
-        defer diags.deinit(self.gpa);
+        defer {
+            for (diags.items) |d| self.gpa.free(d.message);
+            diags.deinit(self.gpa);
+        }
 
         var tree = try parser.parse(self.gpa, text);
         defer tree.deinit();
-        for (tree.diagnostics) |d| try diags.append(self.gpa, mapDiag(text, d));
-
-        // Only analyze once it parses cleanly (analysis over a broken tree is noise).
-        if (tree.diagnostics.len == 0) {
-            var analysis = try analyzer.analyzeModule(self.gpa, tree.module, &.{});
-            defer analysis.deinit();
-            for (analysis.diagnostics) |d| try diags.append(self.gpa, mapDiag(text, d));
-            // Serialize while the analysis arena (which owns the messages) is alive.
+        // A broken parse: report its errors and stop (analysis over it is noise).
+        if (tree.diagnostics.len > 0) {
+            for (tree.diagnostics) |d| try self.appendDiag(&diags, text, d);
             try self.notify("textDocument/publishDiagnostics", .{ .uri = uri, .diagnostics = diags.items });
             return;
         }
+
+        // Cross-file when the document imports and lives on disk; else standalone.
+        const path = uriToPath(self.gpa, uri);
+        defer if (path) |p| self.gpa.free(p);
+        if (path != null and hasImports(tree.module)) {
+            self.diagnoseCrossFile(path.?, &diags) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                // Any loader/analyze trouble: fall back to a standalone pass.
+                else => try self.diagnoseStandalone(tree.module, text, &diags),
+            };
+        } else {
+            try self.diagnoseStandalone(tree.module, text, &diags);
+        }
         try self.notify("textDocument/publishDiagnostics", .{ .uri = uri, .diagnostics = diags.items });
+    }
+
+    fn diagnoseStandalone(self: *Server, module: parser.Module, text: []const u8, diags: *std.ArrayList(LspDiag)) !void {
+        var analysis = try analyzer.analyzeModule(self.gpa, module, &.{});
+        defer analysis.deinit();
+        for (analysis.diagnostics) |d| try self.appendDiag(diags, text, d);
+    }
+
+    /// Analyze `entry_path` through the module loader, overlaying every open
+    /// buffer on disk, and collect the entry document's own diagnostics (import
+    /// resolution errors plus its analysis, with imported modules resolved).
+    fn diagnoseCrossFile(self: *Server, entry_path: []const u8, diags: *std.ArrayList(LspDiag)) !void {
+        // Overlay every open document so unsaved edits (here and in imported
+        // files) are what gets analyzed.
+        var overlays: std.ArrayList(loader.Overlay) = .empty;
+        defer overlays.deinit(self.gpa);
+        var paths: std.ArrayList([]u8) = .empty;
+        defer {
+            for (paths.items) |p| self.gpa.free(p);
+            paths.deinit(self.gpa);
+        }
+        var it = self.docs.iterator();
+        while (it.next()) |e| {
+            const p = uriToPath(self.gpa, e.key_ptr.*) orelse continue;
+            try paths.append(self.gpa, p);
+            try overlays.append(self.gpa, .{ .path = p, .src = e.value_ptr.* });
+        }
+
+        var graph = try loader.loadWithOverlay(self.gpa, self.io, entry_path, &.{}, overlays.items);
+        defer graph.deinit();
+        if (graph.units.len == 0) return;
+        const entry = graph.units[graph.units.len - 1]; // dependency order: entry last
+
+        // Load/resolution errors attributed to the entry file (e.g. missing import).
+        for (graph.diagnostics) |ld| {
+            if (std.mem.eql(u8, ld.path, entry.path)) try self.appendDiag(diags, entry.src, ld.diag);
+        }
+
+        // Analyze every module in dependency order, handing each the exports of the
+        // modules it imports. Keep all analyses alive: a dependent's exports point
+        // into its dependency's analysis arena.
+        const analyses = try self.gpa.alloc(analyzer.Analysis, graph.units.len);
+        var built: usize = 0;
+        defer {
+            for (analyses[0..built]) |*a| a.deinit();
+            self.gpa.free(analyses);
+        }
+        const exports = try self.gpa.alloc(*const analyzer.ModuleExports, graph.units.len);
+        defer self.gpa.free(exports);
+
+        for (graph.units, 0..) |unit, i| {
+            const imports = try self.gpa.alloc(analyzer.ModuleImport, unit.imports.len);
+            defer self.gpa.free(imports);
+            for (unit.imports, 0..) |imp, j| {
+                imports[j] = .{ .name = imp.name, .exports = exports[imp.module_index] };
+            }
+            analyses[i] = try analyzer.analyzeModule(self.gpa, unit.module, imports);
+            built = i + 1;
+            exports[i] = analyses[i].exports;
+        }
+        // Only the entry document's analysis belongs under this uri.
+        for (analyses[graph.units.len - 1].diagnostics) |d| try self.appendDiag(diags, entry.src, d);
     }
 
     // --- language features ---
@@ -539,6 +624,50 @@ fn intField(v: std.json.Value, key: []const u8) ?i64 {
     return if (f == .integer) f.integer else null;
 }
 
+fn hasImports(module: parser.Module) bool {
+    for (module.decls) |d| {
+        if (d == .import) return true;
+    }
+    return false;
+}
+
+fn hexVal(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+/// Convert a `file://` URI to a filesystem path (percent-decoded), or null for a
+/// non-file URI. The returned slice is owned by `gpa`.
+fn uriToPath(gpa: std.mem.Allocator, uri: []const u8) ?[]u8 {
+    const prefix = "file://";
+    if (!std.mem.startsWith(u8, uri, prefix)) return null;
+    const enc = uri[prefix.len..];
+    const buf = gpa.alloc(u8, enc.len) catch return null;
+    defer gpa.free(buf);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < enc.len) {
+        if (enc[i] == '%' and i + 2 < enc.len) {
+            const hi = hexVal(enc[i + 1]);
+            const lo = hexVal(enc[i + 2]);
+            if (hi != null and lo != null) {
+                buf[n] = hi.? * 16 + lo.?;
+                n += 1;
+                i += 3;
+                continue;
+            }
+        }
+        buf[n] = enc[i];
+        n += 1;
+        i += 1;
+    }
+    return gpa.dupe(u8, buf[0..n]) catch null;
+}
+
 /// Map a front-end diagnostic (1-based line/col) to an LSP diagnostic (0-based),
 /// extending the range over the identifier at that spot when there is one.
 fn mapDiag(text: []const u8, d: lexer.Diagnostic) LspDiag {
@@ -563,7 +692,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer) !u8 {
     var in_buf: [64 * 1024]u8 = undefined;
     var reader: Io.File.Reader = .init(.stdin(), io, &in_buf);
 
-    var server = Server{ .gpa = gpa, .out = out, .in = &reader.interface };
+    var server = Server{ .gpa = gpa, .io = io, .out = out, .in = &reader.interface };
     defer server.deinit();
     try server.run();
     return 0;
@@ -616,4 +745,27 @@ test "builtinDoc returns docs for known builtins only" {
     try testing.expect(builtinDoc("map") != null);
     try testing.expect(builtinDoc("reduce") != null);
     try testing.expect(builtinDoc("not_a_builtin") == null);
+}
+
+test "uriToPath strips file:// and percent-decodes" {
+    const gpa = testing.allocator;
+    const p1 = uriToPath(gpa, "file:///Users/x/app.rg").?;
+    defer gpa.free(p1);
+    try testing.expectEqualStrings("/Users/x/app.rg", p1);
+
+    const p2 = uriToPath(gpa, "file:///a/My%20Code/app.rg").?;
+    defer gpa.free(p2);
+    try testing.expectEqualStrings("/a/My Code/app.rg", p2);
+
+    try testing.expect(uriToPath(gpa, "untitled:Untitled-1") == null);
+}
+
+test "hasImports detects import declarations" {
+    var t1 = try parser.parse(testing.allocator, "func main():\n    pass");
+    defer t1.deinit();
+    try testing.expect(!hasImports(t1.module));
+
+    var t2 = try parser.parse(testing.allocator, "import foo\n\nfunc main():\n    pass");
+    defer t2.deinit();
+    try testing.expect(hasImports(t2.module));
 }

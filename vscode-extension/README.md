@@ -49,7 +49,6 @@ The extension is written in plain JavaScript (no build step). It targets stable
 VS Code and `vscode-languageclient` 9 APIs but has **not been run in the
 environment where it was authored** — treat it as a solid starting point. If
 `vscode-languageclient` isn't installed, the extension degrades gracefully to
-highlighting + the run command only. The language server itself
-(`RoseGold_Zig lsp`) analyzes each file standalone (no cross-file import
-resolution yet), so single-file diagnostics are exact and multi-file member
-checks are deferred.
+highlighting + the run command only. The language server (`RoseGold_Zig lsp`)
+resolves imports across files — with unsaved buffers overlaid on disk — so
+diagnostics are accurate across modules and reflect live edits.
