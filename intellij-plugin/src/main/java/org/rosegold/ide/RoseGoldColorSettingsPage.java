@@ -23,6 +23,8 @@ public final class RoseGoldColorSettingsPage implements ColorSettingsPage {
             new AttributesDescriptor("Parentheses", RoseGoldSyntaxHighlighter.PARENS),
             new AttributesDescriptor("Brackets", RoseGoldSyntaxHighlighter.BRACKETS),
             new AttributesDescriptor("Braces", RoseGoldSyntaxHighlighter.BRACES),
+            new AttributesDescriptor("Function call", RoseGoldSyntaxHighlighter.FUN_CALL),
+            new AttributesDescriptor("Function declaration", RoseGoldSyntaxHighlighter.FUN_DEF)
     };
 
     @Override
@@ -42,18 +44,20 @@ public final class RoseGoldColorSettingsPage implements ColorSettingsPage {
                 "enum Color { RED, GREEN }\n\n" +
                 "class Circle extends Shape:\n" +
                 "    var r: float = 1.0\n" +
-                "    func area() -> float:\n" +
+                "    func <fdef>area</fdef>() -> float:\n" +
                 "        return 3.14 * r * r\n\n" +
-                "func main():\n" +
-                "    var c = Circle()\n" +
-                "    print(\"area = ${c.area()}\")\n" +
+                "func <fdef>main</fdef>():\n" +
+                "    var c = <fcall>Circle</fcall>()\n" +
+                "    <fcall>print</fcall>(\"area = ${c.<fcall>area</fcall>()}\")\n" +
                 "    for i in 0..5:\n" +
-                "        print(i)\n";
+                "        <fcall>print</fcall>(i)\n";
     }
 
     @Override
     public @Nullable Map<String, TextAttributesKey> getAdditionalHighlightingTagToDescriptorMap() {
-        return null;
+        return Map.of(
+                "fdef", RoseGoldSyntaxHighlighter.FUN_DEF,
+                "fcall", RoseGoldSyntaxHighlighter.FUN_CALL);
     }
 
     @Override

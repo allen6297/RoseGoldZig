@@ -7,7 +7,9 @@ IDEs. Written in Java against the IntelliJ Platform.
 
 - **Syntax highlighting** — keywords, built-in types, strings, numbers, `##`
   comments, operators, and brackets, with a configurable color scheme
-  (*Settings | Editor | Color Scheme | RoseGold*).
+  (*Settings | Editor | Color Scheme | RoseGold*). A context-aware annotator also
+  distinguishes **function declarations** (after `func`) from **function calls**
+  (identifier before `(`), each with its own color.
 - **`##` line-comment toggling** (`Cmd/Ctrl-/`) and **brace matching** for
   `()`, `[]`, `{}`.
 - **Completion** — keywords, built-in types, and the standard-library builtins

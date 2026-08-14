@@ -34,6 +34,10 @@ public final class RoseGoldSyntaxHighlighter extends SyntaxHighlighterBase {
             createTextAttributesKey("ROSEGOLD_BRACES", DefaultLanguageHighlighterColors.BRACES);
     public static final TextAttributesKey BAD_CHARACTER =
             createTextAttributesKey("ROSEGOLD_BAD_CHARACTER", HighlighterColors.BAD_CHARACTER);
+    public static final TextAttributesKey FUN_DEF =
+            createTextAttributesKey("ROSEGOLD_FUN_DEF", DefaultLanguageHighlighterColors.FUNCTION_DECLARATION);
+    public static final TextAttributesKey FUN_CALL =
+            createTextAttributesKey("ROSEGOLD_FUN_CALL", DefaultLanguageHighlighterColors.FUNCTION_CALL);
 
     private static final TextAttributesKey[] EMPTY = new TextAttributesKey[0];
 

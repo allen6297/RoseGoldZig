@@ -28,6 +28,7 @@
         <colorSettingsPage implementation="org.rosegold.ide.RoseGoldColorSettingsPage"/>
         <lang.commenter language="RoseGold" implementationClass="org.rosegold.ide.RoseGoldCommenter"/>
         <lang.braceMatcher language="RoseGold" implementationClass="org.rosegold.ide.RoseGoldBraceMatcher"/>
+        <annotator language="RoseGold" implementationClass="org.rosegold.ide.RoseGoldHighlightAnnotator"/>
         <completion.contributor language="RoseGold"
                                 implementationClass="org.rosegold.ide.RoseGoldCompletionContributor"/>
         <externalAnnotator language="RoseGold"
