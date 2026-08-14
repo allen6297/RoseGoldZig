@@ -85,6 +85,27 @@ const CompletionItem = struct {
     detail: ?[]const u8 = null,
 };
 
+// signatureHelp wire types
+const SigParam = struct { label: []const u8 };
+const SignatureInfo = struct {
+    label: []const u8,
+    parameters: []const SigParam,
+    documentation: ?[]const u8 = null,
+};
+const SignatureHelpResult = struct {
+    signatures: []const SignatureInfo,
+    activeSignature: u32 = 0,
+    activeParameter: u32,
+};
+
+/// An intermediate signature (label + parameter labels + optional docs) before
+/// it's shaped into the LSP response.
+const Signature = struct { label: []const u8, params: []const []const u8, doc: ?[]const u8 = null };
+
+/// A found call the cursor sits inside: the callee name, an optional receiver
+/// (`recv.callee(…)`), and the 0-based index of the argument being typed.
+const CallContext = struct { callee: []const u8, receiver: ?[]const u8, active: u32 };
+
 fn isIdentChar(c: u8) bool {
     return c == '_' or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9');
 }
@@ -216,6 +237,143 @@ fn importRelPath(a: std.mem.Allocator, text: []const u8, leaf: []const u8) ?[]co
     return null;
 }
 
+/// If `offset` sits inside a call's argument list, return the callee (and any
+/// `receiver.`) and which argument (0-based) is being typed. Scans backward
+/// through balanced brackets; naive about strings/comments.
+fn callContext(text: []const u8, offset: usize) ?CallContext {
+    var depth: usize = 0;
+    var active: u32 = 0;
+    var open: ?usize = null;
+    var i = offset;
+    while (i > 0) {
+        i -= 1;
+        switch (text[i]) {
+            ')', ']', '}' => depth += 1,
+            '(', '[', '{' => {
+                if (depth > 0) {
+                    depth -= 1;
+                } else {
+                    if (text[i] == '(') open = i; // '[' or '{' ⇒ not a call
+                    break;
+                }
+            },
+            ',' => if (depth == 0) {
+                active += 1;
+            },
+            else => {},
+        }
+    }
+    const p = open orelse return null;
+    var j = p;
+    while (j > 0 and (text[j - 1] == ' ' or text[j - 1] == '\t')) j -= 1;
+    const e = j;
+    while (j > 0 and isIdentChar(text[j - 1])) j -= 1;
+    if (j == e) return null; // '(' not preceded by a name: a grouping, not a call
+    const callee = text[j..e];
+    var receiver: ?[]const u8 = null;
+    if (j > 0 and text[j - 1] == '.') {
+        var rs = j - 1;
+        const re = rs;
+        while (rs > 0 and isIdentChar(text[rs - 1])) rs -= 1;
+        if (rs < re) receiver = text[rs..re];
+    }
+    return .{ .callee = callee, .receiver = receiver, .active = active };
+}
+
+/// Build a `Signature` for the function whose name starts at `name_offset` by
+/// reading its `(…)` header straight from the source (so types and defaults show
+/// as written), splitting the parameters on top-level commas.
+fn signatureFromSource(a: std.mem.Allocator, text: []const u8, name_offset: usize, doc: ?[]const u8) ?Signature {
+    var i = name_offset;
+    while (i < text.len and text[i] != '(' and text[i] != '\n') i += 1;
+    if (i >= text.len or text[i] != '(') return null;
+    const open = i;
+    var depth: usize = 0;
+    var j = open;
+    var closed = false;
+    while (j < text.len) : (j += 1) {
+        switch (text[j]) {
+            '(', '[', '{' => depth += 1,
+            ')', ']', '}' => {
+                depth -= 1;
+                if (depth == 0) {
+                    closed = true;
+                    break;
+                }
+            },
+            else => {},
+        }
+    }
+    if (!closed) return null;
+    const inner = text[open + 1 .. j];
+    var params: std.ArrayList([]const u8) = .empty;
+    var d: usize = 0;
+    var start: usize = 0;
+    var k: usize = 0;
+    while (k < inner.len) : (k += 1) {
+        switch (inner[k]) {
+            '(', '[', '{' => d += 1,
+            ')', ']', '}' => {
+                if (d > 0) d -= 1;
+            },
+            ',' => if (d == 0) {
+                params.append(a, std.mem.trim(u8, inner[start..k], " \t")) catch return null;
+                start = k + 1;
+            },
+            else => {},
+        }
+    }
+    const last = std.mem.trim(u8, inner[start..], " \t");
+    if (last.len > 0 or params.items.len > 0) params.append(a, last) catch return null;
+    return .{
+        .label = text[name_offset .. j + 1], // `name(params…)`
+        .params = params.toOwnedSlice(a) catch return null,
+        .doc = doc,
+    };
+}
+
+/// A signature for a top-level or member `func` named `name` declared in `text`.
+fn findDocSignature(a: std.mem.Allocator, text: []const u8, name: []const u8) ?Signature {
+    const decls = scanDecls(a, text) catch return null;
+    for (decls) |d| {
+        if (d.kind == .func and std.mem.eql(u8, d.name, name)) {
+            const off = offsetAt(text, d.line, d.character) orelse continue;
+            if (signatureFromSource(a, text, off, null)) |s| return s;
+        }
+    }
+    return null;
+}
+
+/// A signature for a `pub` top-level `func` named `name` in `text` (an imported
+/// module's export surface).
+fn findPubDocSignature(a: std.mem.Allocator, text: []const u8, name: []const u8) ?Signature {
+    const decls = scanDecls(a, text) catch return null;
+    for (decls) |d| {
+        if (d.kind == .func and d.is_pub and d.indent == 0 and std.mem.eql(u8, d.name, name)) {
+            const off = offsetAt(text, d.line, d.character) orelse continue;
+            if (signatureFromSource(a, text, off, null)) |s| return s;
+        }
+    }
+    return null;
+}
+
+/// A signature for a stdlib builtin, or null.
+fn builtinSignature(a: std.mem.Allocator, name: []const u8) ?Signature {
+    for (BUILTIN_SIGS) |b| {
+        if (!std.mem.eql(u8, b.n, name)) continue;
+        var label: std.ArrayList(u8) = .empty;
+        label.appendSlice(a, name) catch return null;
+        label.append(a, '(') catch return null;
+        for (b.params, 0..) |pp, idx| {
+            if (idx > 0) label.appendSlice(a, ", ") catch return null;
+            label.appendSlice(a, pp) catch return null;
+        }
+        label.append(a, ')') catch return null;
+        return .{ .label = label.toOwnedSlice(a) catch return null, .params = b.params, .doc = builtinDoc(name) };
+    }
+    return null;
+}
+
 /// The identifier surrounding `offset` (the cursor may sit just past its end),
 /// or null if there's no identifier there.
 fn identAt(text: []const u8, offset: usize) ?[]const u8 {
@@ -283,6 +441,48 @@ const KEYWORDS = [_][]const u8{
 };
 
 const TYPES = [_][]const u8{ "int", "float", "str", "bool", "void", "any", "list", "map" };
+
+/// Parameter names for the stdlib builtins, for signature help.
+const BuiltinSig = struct { n: []const u8, params: []const []const u8 };
+const BUILTIN_SIGS = [_]BuiltinSig{
+    .{ .n = "print", .params = &.{"values…"} },
+    .{ .n = "echo", .params = &.{"values…"} },
+    .{ .n = "len", .params = &.{"x"} },
+    .{ .n = "range", .params = &.{"n"} },
+    .{ .n = "str", .params = &.{"x"} },
+    .{ .n = "int", .params = &.{"x"} },
+    .{ .n = "float", .params = &.{"x"} },
+    .{ .n = "push", .params = &.{ "list", "x" } },
+    .{ .n = "pop", .params = &.{"list"} },
+    .{ .n = "keys", .params = &.{"map"} },
+    .{ .n = "values", .params = &.{"map"} },
+    .{ .n = "has", .params = &.{ "map", "key" } },
+    .{ .n = "connect", .params = &.{ "signal", "handler" } },
+    .{ .n = "emit", .params = &.{ "signal", "args…" } },
+    .{ .n = "abs", .params = &.{"x"} },
+    .{ .n = "min", .params = &.{ "a", "b" } },
+    .{ .n = "max", .params = &.{ "a", "b" } },
+    .{ .n = "upper", .params = &.{"s"} },
+    .{ .n = "lower", .params = &.{"s"} },
+    .{ .n = "split", .params = &.{ "s", "sep" } },
+    .{ .n = "join", .params = &.{ "list", "sep" } },
+    .{ .n = "contains", .params = &.{ "haystack", "needle" } },
+    .{ .n = "sort", .params = &.{"list"} },
+    .{ .n = "reverse", .params = &.{"list"} },
+    .{ .n = "trim", .params = &.{"s"} },
+    .{ .n = "starts_with", .params = &.{ "s", "prefix" } },
+    .{ .n = "ends_with", .params = &.{ "s", "suffix" } },
+    .{ .n = "find", .params = &.{ "haystack", "needle" } },
+    .{ .n = "replace", .params = &.{ "s", "from", "to" } },
+    .{ .n = "map", .params = &.{ "list", "f" } },
+    .{ .n = "filter", .params = &.{ "list", "pred" } },
+    .{ .n = "reduce", .params = &.{ "list", "f", "init" } },
+    .{ .n = "sqrt", .params = &.{"x"} },
+    .{ .n = "pow", .params = &.{ "base", "exp" } },
+    .{ .n = "floor", .params = &.{"x"} },
+    .{ .n = "ceil", .params = &.{"x"} },
+    .{ .n = "round", .params = &.{"x"} },
+};
 
 fn builtinDoc(name: []const u8) ?[]const u8 {
     for (BUILTINS) |e| {
@@ -445,6 +645,8 @@ const Server = struct {
                 try self.onDocumentSymbol(id.?, params);
             } else if (std.mem.eql(u8, method, "textDocument/completion")) {
                 try self.onCompletion(id.?, params);
+            } else if (std.mem.eql(u8, method, "textDocument/signatureHelp")) {
+                try self.onSignatureHelp(id.?, params);
             } else if (id) |rid| {
                 // Any other request: reply with null so the client isn't left waiting.
                 try self.respond(rid, @as(?u8, null));
@@ -491,6 +693,7 @@ const Server = struct {
             definitionProvider: bool,
             documentSymbolProvider: bool,
             completionProvider: struct { triggerCharacters: []const []const u8 },
+            signatureHelpProvider: struct { triggerCharacters: []const []const u8 },
         },
         serverInfo: struct { name: []const u8, version: []const u8 },
     } {
@@ -501,6 +704,7 @@ const Server = struct {
                 .definitionProvider = true,
                 .documentSymbolProvider = true,
                 .completionProvider = .{ .triggerCharacters = &.{"."} },
+                .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
             },
             .serverInfo = .{ .name = "rosegold-lsp", .version = "0.1.0" },
         };
@@ -789,6 +993,51 @@ const Server = struct {
         return null;
     }
 
+    /// Signature help for the call the cursor is inside: the callee's parameters
+    /// with the active one marked. Resolves stdlib builtins, this document's
+    /// functions/methods, and `mod.func` against the imported module.
+    fn onSignatureHelp(self: *Server, id: std.json.Value, params: ?std.json.Value) !void {
+        const p = params orelse return self.respond(id, @as(?u8, null));
+        const uri = self.uriOf(params) orelse return self.respond(id, @as(?u8, null));
+        const text = self.docs.get(uri) orelse return self.respond(id, @as(?u8, null));
+        const pos = objGet(p, "position") orelse return self.respond(id, @as(?u8, null));
+        const line = intField(pos, "line") orelse return self.respond(id, @as(?u8, null));
+        const character = intField(pos, "character") orelse return self.respond(id, @as(?u8, null));
+        const off = offsetAt(text, @intCast(line), @intCast(character)) orelse return self.respond(id, @as(?u8, null));
+
+        const ctx = callContext(text, off) orelse return self.respond(id, @as(?u8, null));
+
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+
+        var sig: ?Signature = null;
+        if (ctx.receiver) |receiver| {
+            // `mod.func(…)`: the imported module's exported function.
+            if (importRelPath(a, text, receiver)) |rel| {
+                if (self.readModuleSource(a, uri, rel)) |src| {
+                    sig = findPubDocSignature(a, src, ctx.callee);
+                }
+            }
+            // Fallback (e.g. a method call on a value): any func named that here.
+            if (sig == null) sig = findDocSignature(a, text, ctx.callee);
+        } else {
+            sig = builtinSignature(a, ctx.callee) orelse findDocSignature(a, text, ctx.callee);
+        }
+        const s = sig orelse return self.respond(id, @as(?u8, null));
+
+        const sparams = a.alloc(SigParam, s.params.len) catch return self.respond(id, @as(?u8, null));
+        for (s.params, 0..) |pl, idx| sparams[idx] = .{ .label = pl };
+        var active = ctx.active;
+        if (s.params.len > 0 and active >= s.params.len) active = @intCast(s.params.len - 1);
+
+        const result = SignatureHelpResult{
+            .signatures = &.{.{ .label = s.label, .parameters = sparams, .documentation = s.doc }},
+            .activeParameter = active,
+        };
+        try self.respond(id, result);
+    }
+
     // --- request helpers ---
 
     fn uriOf(self: *Server, params: ?std.json.Value) ?[]const u8 {
@@ -974,6 +1223,45 @@ test "uriToPath strips file:// and percent-decodes" {
     try testing.expectEqualStrings("/a/My Code/app.rg", p2);
 
     try testing.expect(uriToPath(gpa, "untitled:Untitled-1") == null);
+}
+
+test "callContext finds the enclosing call and active argument" {
+    const src = "    r = add(1, x)";
+    const at_x = std.mem.indexOfScalar(u8, src, 'x').?;
+    const c = callContext(src, at_x).?;
+    try testing.expectEqualStrings("add", c.callee);
+    try testing.expect(c.receiver == null);
+    try testing.expectEqual(@as(u32, 1), c.active);
+
+    const at_1 = std.mem.indexOfScalar(u8, src, '1').?;
+    try testing.expectEqual(@as(u32, 0), callContext(src, at_1 + 1).?.active);
+
+    const c2 = callContext("mod.f(a", 7).?;
+    try testing.expectEqualStrings("f", c2.callee);
+    try testing.expectEqualStrings("mod", c2.receiver.?);
+
+    try testing.expect(callContext("hello", 5) == null); // not in a call
+}
+
+test "signatureFromSource reads types and defaults from the header" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const text = "func add(a: int, b: int = 5) -> int:\n    return a";
+    const off = std.mem.indexOf(u8, text, "add").?;
+    const s = signatureFromSource(arena.allocator(), text, off, null).?;
+    try testing.expectEqualStrings("add(a: int, b: int = 5)", s.label);
+    try testing.expectEqual(@as(usize, 2), s.params.len);
+    try testing.expectEqualStrings("a: int", s.params[0]);
+    try testing.expectEqualStrings("b: int = 5", s.params[1]);
+}
+
+test "builtinSignature builds a label from the parameter table" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const s = builtinSignature(arena.allocator(), "reduce").?;
+    try testing.expectEqualStrings("reduce(list, f, init)", s.label);
+    try testing.expectEqual(@as(usize, 3), s.params.len);
+    try testing.expect(builtinSignature(arena.allocator(), "nope") == null);
 }
 
 test "receiverBeforeCursor detects member-access context" {
