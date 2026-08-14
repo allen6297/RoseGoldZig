@@ -24,7 +24,7 @@ zig build run -- run --disasm FILE.rg  # print the compiled VM bytecode (don't r
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (298 as of writing)
+zig build test                  # run every test (300 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -200,8 +200,12 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   (its own ancestors/fields already computed) and splices it into the subclass; an
   inherited method runs in *its base's* module (methods carry their owning type, so
   a base method still resolves its own module's names). The analyzer folds the base's
-  member scope in for checking. (One level deep; base *field defaults* referencing the
-  base's module-level names aren't resolved cross-module — keep them literal.)
+  member scope in for checking. **The `--vm` backend does this too**: the compiler keeps
+  each already-compiled module's type table (`module_types`), so `mod.Base` resolves to
+  its `TypeDef` and splices in — an inherited method's compiled `Function` carries its
+  own module, giving virtual dispatch across the boundary. (One level deep; base *field
+  defaults* referencing the base's module-level names aren't resolved cross-module — keep
+  them literal.)
 - **Limits (v1):** imports resolve relative to the importer's dir (no search path);
   a runtime error is attributed to the entry file.
 
@@ -225,7 +229,7 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `Chunk` of stack-machine opcodes + constants, and a `VM` runs it over a value stack
   with a call-frame stack. It has its **own** small `Value` type (no coupling to the
   interpreter) and produces byte-identical output to the tree-walker. It now covers the
-  **entire language except cross-module inheritance** — a genuine drop-in backend.
+  **entire language** — a genuine drop-in backend.
   `run --disasm FILE` prints a human-readable listing of every compiled function's
   bytecode (`Vm.disassemble`) instead of running it — handy for inspecting codegen.
   A `pushFrame` guard bounds recursion (`max_call_depth`) so runaway recursion reports a
@@ -271,16 +275,20 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   module even when called across the boundary (like the interpreter's home-module closures).
   `import mod` binds `mod` to a `module` value; `mod.name` reads it via `get_member`; each
   module's script runs in dependency order to populate its globals, and only the entry
-  runs `main`. Cross-module funcs/consts/types/enums/signals all work.
+  runs `main`. Cross-module funcs/consts/types/enums/signals all work, as does
+  **inheritance from an imported base** (`extends`/`uses mod.Base`): the compiler keeps
+  each already-compiled module's type table (`module_types`), so `mod.Base` resolves to
+  its `TypeDef` and its fields/methods splice in like a local base — an inherited method
+  runs in *its* module (its compiled `Function` carries that module), giving virtual
+  dispatch to a subclass override across the boundary.
 - **Signals** compile too: a top-level `signal` is a single shared value bound in the
   module globals; a class signal is created fresh per instance in `new_instance` (stored
   alongside fields, inherited base-first via `RtType.signal_names`) and reachable by bare
   name inside a method (`isMember` includes signals). `connect` appends a handler; `emit`
   fires them in order through the re-entrant callback path.
-- **Not yet compiled** (reported as a clear "the --vm backend does not support …"
-  diagnostic, so the tree-walker stays the full-featured default): only **cross-module
-  inheritance** (`extends`/`uses mod.Base` — the base's field layout / method table isn't
-  resolved across modules at compile time).
+- **Fully covered.** The remaining `--vm` rejections are for constructs the analyzer also
+  wouldn't run meaningfully (e.g. a nested type declaration inside a class), reported as a
+  clear "the --vm backend does not support …" diagnostic.
 
 ### Known gaps / future work
 - A subclass's own **static method** now sees an inherited static by bare name (both
@@ -294,7 +302,7 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   mutation, but matches the lenient design). The element-aware builtins are
   special-cased by name at their call sites rather than being first-class generic
   signatures, so calling one indirectly (`var f = push`) falls back to `any`.
-- Module resolution has no **search path / package roots** (see **Modules → Limits**);
-  cross-module inheritance is one level deep on the interpreter, and unsupported on the
-  `--vm` backend (an imported base's field layout / method table isn't resolved across
-  modules at compile time — reported as a clear diagnostic).
+- Module resolution has no **search path / package roots** (see **Modules → Limits**).
+  Cross-module inheritance works on both backends but is effectively one level deep: an
+  imported base's *field defaults* referencing that base's module-level names aren't
+  resolved (the subclass constructor evaluates them in its own module) — keep them literal.

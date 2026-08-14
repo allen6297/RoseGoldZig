@@ -4,11 +4,11 @@
 //! globals, lists/maps/ranges, lambdas with by-reference closures (upvalues),
 //! string interpolation, `match`, enums, classes/structs (construction, fields,
 //! methods, single/`uses` inheritance with virtual dispatch, statics), signals
-//! (`connect`/`emit`), modules (per-module globals; cross-module funcs/consts/
-//! types), and the common builtins (including the higher-order `map`/`filter`/
-//! `reduce`). The one construct it does not compile — cross-module inheritance —
-//! is reported as unsupported, so the tree-walker remains the full-featured
-//! default.
+//! (`connect`/`emit`), and modules (per-module globals; cross-module funcs/
+//! consts/types/enums/signals, and inheritance from an imported base), plus the
+//! common builtins (including the higher-order `map`/`filter`/`reduce`). It now
+//! covers the whole language — a genuine drop-in backend. `run --disasm` prints
+//! the compiled bytecode instead of running it.
 //!
 //! Design: each function compiles to a `Chunk` of opcodes + constants; the VM
 //! runs a `Chunk` over a value stack with a frame stack for calls.
@@ -287,15 +287,14 @@ pub fn run(gpa: std.mem.Allocator, module: Module) Error!Result {
     return runProgram(gpa, &.{.{ .module = module }});
 }
 
-/// Compile and run a set of modules in dependency order (entry last). Each
-/// module gets its own globals; a function resolves globals in its home module.
-pub fn runProgram(gpa: std.mem.Allocator, modules: []const ProgramModule) Error!Result {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    errdefer arena.deinit();
-    const alloc = arena.allocator();
+const Compiled = struct { programs: []const Program, all_functions: []const *const Function };
 
-    var diagnostics: std.ArrayList(lexer.Diagnostic) = .empty;
-
+/// Compile every module in dependency order into per-module `Program`s. Modules
+/// share nothing but their imports: each keeps its own type/enum tables, and an
+/// already-compiled module's types stay reachable (via `module_types`) so
+/// `extends mod.Base` resolves across the boundary. Propagates `error.Compile`
+/// after appending the diagnostic.
+fn compileAll(alloc: std.mem.Allocator, diagnostics: *std.ArrayList(lexer.Diagnostic), modules: []const ProgramModule) Error!Compiled {
     // Create every module's runtime namespace up front so imports (which point
     // at earlier modules) can bind to them.
     const rtmods = try alloc.alloc(*RtModule, modules.len);
@@ -304,8 +303,10 @@ pub fn runProgram(gpa: std.mem.Allocator, modules: []const ProgramModule) Error!
         rt.* = .{ .name = pm.name };
         rtmods[i] = rt;
     }
+    const module_types = try alloc.alloc(std.StringHashMapUnmanaged(*TypeDef), modules.len);
+    for (module_types) |*mt| mt.* = .{};
 
-    var c = Compiler{ .alloc = alloc, .diagnostics = &diagnostics };
+    var c = Compiler{ .alloc = alloc, .diagnostics = diagnostics, .module_types = module_types };
     const programs = try alloc.alloc(Program, modules.len);
     for (modules, 0..) |pm, i| {
         c.current_module = rtmods[i];
@@ -313,18 +314,29 @@ pub fn runProgram(gpa: std.mem.Allocator, modules: []const ProgramModule) Error!
         c.enums = .{};
         c.current_type = null;
         c.current_static_type = null;
-        programs[i] = c.compileModule(pm.module, pm.imports, rtmods, i == modules.len - 1) catch |e| switch (e) {
-            error.Compile => return .{ .arena = arena, .output = "", .runtime_error = null, .diagnostics = try diagnostics.toOwnedSlice(alloc) },
-            else => return e,
-        };
+        c.current_imports = pm.imports;
+        programs[i] = try c.compileModule(pm.module, pm.imports, rtmods, i == modules.len - 1);
+        module_types[i] = c.types; // reachable by later modules that import this one
     }
-    if (diagnostics.items.len > 0) {
-        return .{ .arena = arena, .output = "", .runtime_error = null, .diagnostics = try diagnostics.toOwnedSlice(alloc) };
-    }
+    return .{ .programs = programs, .all_functions = c.all_functions.items };
+}
+
+/// Compile and run a set of modules in dependency order (entry last). Each
+/// module gets its own globals; a function resolves globals in its home module.
+pub fn runProgram(gpa: std.mem.Allocator, modules: []const ProgramModule) Error!Result {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+
+    var diagnostics: std.ArrayList(lexer.Diagnostic) = .empty;
+    const compiled = compileAll(alloc, &diagnostics, modules) catch |e| switch (e) {
+        error.Compile => return .{ .arena = arena, .output = "", .runtime_error = null, .diagnostics = try diagnostics.toOwnedSlice(alloc) },
+        else => return e,
+    };
 
     var output: std.ArrayList(u8) = .empty;
     var vm = VM{ .alloc = alloc, .output = &output };
-    vm.run(programs) catch |e| switch (e) {
+    vm.run(compiled.programs) catch |e| switch (e) {
         error.Runtime => return .{ .arena = arena, .output = try output.toOwnedSlice(alloc), .runtime_error = vm.runtime_error, .diagnostics = &.{} },
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -368,6 +380,9 @@ const TypeDef = struct {
     span: Span,
     members: []const Decl,
     super_names: []const []const u8,
+    /// Supertypes imported from another module (`extends`/`uses mod.Base`),
+    /// already fully resolved (their module was compiled first).
+    imported_supers: std.ArrayList(*TypeDef) = .empty,
     /// Transitive supertypes, most-derived first (for method/field resolution).
     ancestors: []const *TypeDef = &.{},
     /// All fields, base-first, deduped (construction + print order).
@@ -419,6 +434,11 @@ const Compiler = struct {
     cur: *FnState = undefined,
     types: std.StringHashMapUnmanaged(*TypeDef) = .{},
     enums: std.StringHashMapUnmanaged(*RtEnum) = .{},
+    /// Every already-compiled module's type table, indexed by module index, so
+    /// `extends mod.Base` can resolve an imported base at compile time.
+    module_types: []const std.StringHashMapUnmanaged(*TypeDef) = &.{},
+    /// The imports of the module being compiled (name → module index).
+    current_imports: []const ModuleImport = &.{},
     /// The module currently being compiled; stamped onto every `Function` so its
     /// body resolves globals in its own module at runtime.
     current_module: *RtModule = undefined,
@@ -586,21 +606,16 @@ const Compiler = struct {
         uses: []const parser.TypeRef,
     ) Error!void {
         var supers: std.ArrayList([]const u8) = .empty;
-        if (extends) |e| {
-            if (e.module != null) return self.fail(span, "the --vm backend does not support inheriting an imported type", .{});
-            try supers.append(self.alloc, e.name);
-        }
-        for (uses) |u| {
-            if (u.module != null) return self.fail(span, "the --vm backend does not support imported traits", .{});
-            try supers.append(self.alloc, u.name);
-        }
+        var imported: std.ArrayList(*TypeDef) = .empty;
+        if (extends) |e| try self.addSuper(e, span, &supers, &imported);
+        for (uses) |u| try self.addSuper(u, span, &supers, &imported);
         // Reject members the VM can't compile yet, with a clear message.
         for (members) |m| switch (m) {
             .var_decl, .func, .signal => {},
             else => return self.fail(declSpan(m), "the --vm backend does not support this class member", .{}),
         };
         const t = try self.alloc.create(TypeDef);
-        t.* = .{ .name = name, .span = span, .members = members, .super_names = try supers.toOwnedSlice(self.alloc) };
+        t.* = .{ .name = name, .span = span, .members = members, .super_names = try supers.toOwnedSlice(self.alloc), .imported_supers = imported };
         // Collect this type's own static members.
         for (members, 0..) |m, i| switch (m) {
             .var_decl => |v| if (v.is_static) {
@@ -667,6 +682,32 @@ const Compiler = struct {
         };
     }
 
+    /// Record one supertype: a `mod.Base` resolves to its `TypeDef` in the
+    /// already-compiled imported module; a bare `Base` is kept as a name.
+    fn addSuper(
+        self: *Compiler,
+        tref: parser.TypeRef,
+        span: Span,
+        supers: *std.ArrayList([]const u8),
+        imported: *std.ArrayList(*TypeDef),
+    ) Error!void {
+        _ = span;
+        if (tref.module) |mod_name| {
+            for (self.current_imports) |imp| {
+                if (!std.mem.eql(u8, imp.name, mod_name)) continue;
+                if (imp.module_index < self.module_types.len) {
+                    if (self.module_types[imp.module_index].get(tref.name)) |base| {
+                        try imported.append(self.alloc, base);
+                        return;
+                    }
+                }
+            }
+            // Unresolved (the analyzer already reported it); ignore.
+        } else {
+            try supers.append(self.alloc, tref.name);
+        }
+    }
+
     fn collectAncestors(
         self: *Compiler,
         t: *TypeDef,
@@ -678,6 +719,14 @@ const Compiler = struct {
             if ((try seen.getOrPut(self.alloc, sn)).found_existing) continue;
             try out.append(self.alloc, sup);
             try self.collectAncestors(sup, out, seen);
+        }
+        // Imported supers already have their ancestors computed (their module was
+        // compiled first); splice them in, deduped by name.
+        for (t.imported_supers.items) |sup| {
+            if (!(try seen.getOrPut(self.alloc, sup.name)).found_existing) try out.append(self.alloc, sup);
+            for (sup.ancestors) |a| {
+                if (!(try seen.getOrPut(self.alloc, a.name)).found_existing) try out.append(self.alloc, a);
+            }
         }
     }
 
@@ -2275,30 +2324,13 @@ pub fn disassemble(gpa: std.mem.Allocator, modules: []const ProgramModule) Error
     const alloc = arena.allocator();
 
     var diagnostics: std.ArrayList(lexer.Diagnostic) = .empty;
-    const rtmods = try alloc.alloc(*RtModule, modules.len);
-    for (modules, 0..) |pm, i| {
-        const rt = try alloc.create(RtModule);
-        rt.* = .{ .name = pm.name };
-        rtmods[i] = rt;
-    }
-    var c = Compiler{ .alloc = alloc, .diagnostics = &diagnostics };
-    for (modules, 0..) |pm, i| {
-        c.current_module = rtmods[i];
-        c.types = .{};
-        c.enums = .{};
-        c.current_type = null;
-        c.current_static_type = null;
-        _ = c.compileModule(pm.module, pm.imports, rtmods, i == modules.len - 1) catch |e| switch (e) {
-            error.Compile => return .{ .arena = arena, .text = "", .diagnostics = try diagnostics.toOwnedSlice(alloc) },
-            else => return e,
-        };
-    }
-    if (diagnostics.items.len > 0) {
-        return .{ .arena = arena, .text = "", .diagnostics = try diagnostics.toOwnedSlice(alloc) };
-    }
+    const compiled = compileAll(alloc, &diagnostics, modules) catch |e| switch (e) {
+        error.Compile => return .{ .arena = arena, .text = "", .diagnostics = try diagnostics.toOwnedSlice(alloc) },
+        else => return e,
+    };
 
     var out: std.ArrayList(u8) = .empty;
-    for (c.all_functions.items) |f| try disasmChunk(alloc, &out, &f.chunk, f.name);
+    for (compiled.all_functions) |f| try disasmChunk(alloc, &out, &f.chunk, f.name);
     return .{ .arena = arena, .text = try out.toOwnedSlice(alloc), .diagnostics = &.{} };
 }
 
@@ -2432,6 +2464,26 @@ test "vm: an imported type constructs and its methods run in its module" {
         "pub struct Point:\n    var x: int = 0\n    var y: int = 0\n\n    func sum() -> int:\n        return x + y",
         "import shapes\n\nfunc main():\n    var p = shapes.Point()\n    p.x = 3\n    p.y = 4\n    print(p.sum())",
         "7\n",
+    );
+}
+
+test "vm: a class inherits from an imported base" {
+    // The inherited `label()` runs in its base's module, so it resolves `KIND`
+    // there (not in the subclass's module) and reads the inherited `name` field.
+    try expectModuleOutput(
+        "shapes",
+        "pub const KIND: str = \"shape\"\n\npub class Shape:\n    var name: str = \"?\"\n\n    func label() -> str:\n        return name + \" (\" + KIND + \")\"",
+        "import shapes\n\nclass Circle extends shapes.Shape:\n    var radius: int = 0\n\nfunc main():\n    var c = Circle()\n    c.name = \"circle\"\n    print(c.label(), c.radius)",
+        "circle (shape) 0\n",
+    );
+}
+
+test "vm: a class uses an imported trait's fields and methods" {
+    try expectModuleOutput(
+        "traits",
+        "pub class Damageable:\n    var hp: int = 100\n\n    func hurt(amount: int):\n        hp = hp - amount",
+        "import traits\n\nclass Player uses traits.Damageable:\n    var tag: str = \"hero\"\n\nfunc main():\n    var p = Player()\n    p.hurt(30)\n    print(p.hp, p.tag)",
+        "70 hero\n",
     );
 }
 
@@ -2965,18 +3017,8 @@ test "vm: a lambda works as a signal handler capturing a local" {
 }
 
 test "vm: reports unsupported constructs" {
-    // Cross-module inheritance (`extends mod.Base`) is not compilable by the VM.
-    const gpa = testing.allocator;
-    var dep = try parser.parse(gpa, "pub class Base:\n    var x: int = 0");
-    defer dep.deinit();
-    var entry = try parser.parse(gpa, "import base\n\nclass Sub extends base.Base:\n    var y: int = 0\n\nfunc main():\n    pass");
-    defer entry.deinit();
-    const imports = [_]ModuleImport{.{ .name = "base", .module_index = 0 }};
-    const modules = [_]ProgramModule{
-        .{ .module = dep.module, .imports = &.{}, .name = "base" },
-        .{ .module = entry.module, .imports = &imports, .name = "main" },
-    };
-    var result = try runProgram(gpa, &modules);
+    // A nested type declaration inside a class isn't compilable by the VM.
+    var result = try runSource(testing.allocator, "class C:\n    enum E { A }\n\nfunc main():\n    pass");
     defer result.deinit();
     try testing.expect(result.diagnostics.len > 0);
     try testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, "does not support") != null);
