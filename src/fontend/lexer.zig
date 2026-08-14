@@ -377,13 +377,29 @@ pub const Lexer = struct {
     fn lexNumber(self: *Lexer) !void {
         const start = self.pos;
         const start_col = self.col();
-        while (std.ascii.isDigit(self.peek())) self.pos += 1;
+
+        // Hex (`0xFF`) and binary (`0b1010`) literals, with `_` separators.
+        if (self.peek() == '0' and (self.peekAt(1) == 'x' or self.peekAt(1) == 'X')) {
+            self.pos += 2;
+            while (std.ascii.isHex(self.peek()) or self.peek() == '_') self.pos += 1;
+            try self.emit(.int_literal, start, start_col);
+            return;
+        }
+        if (self.peek() == '0' and (self.peekAt(1) == 'b' or self.peekAt(1) == 'B')) {
+            self.pos += 2;
+            while (self.peek() == '0' or self.peek() == '1' or self.peek() == '_') self.pos += 1;
+            try self.emit(.int_literal, start, start_col);
+            return;
+        }
+
+        // Decimal, with `_` digit separators (e.g. `1_000_000`).
+        while (std.ascii.isDigit(self.peek()) or self.peek() == '_') self.pos += 1;
 
         // A '.' is only part of the number if a digit follows, so `1.foo`
         // still lexes as int, dot, identifier.
         if (self.peek() == '.' and std.ascii.isDigit(self.peekAt(1))) {
             self.pos += 1;
-            while (std.ascii.isDigit(self.peek())) self.pos += 1;
+            while (std.ascii.isDigit(self.peek()) or self.peek() == '_') self.pos += 1;
             try self.emit(.float_literal, start, start_col);
             return;
         }

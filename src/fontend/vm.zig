@@ -1074,7 +1074,7 @@ const Compiler = struct {
     fn patternConst(self: *Compiler, p: parser.Pattern) Error!void {
         switch (p) {
             .int_literal => |lit| {
-                const n = std.fmt.parseInt(i64, lit.text, 10) catch return self.fail(lit.span, "invalid integer '{s}'", .{lit.text});
+                const n = std.fmt.parseInt(i64, lit.text, 0) catch return self.fail(lit.span, "invalid integer '{s}'", .{lit.text});
                 try self.emitConst(.{ .int = n }, lit.span);
             },
             .float_literal => |lit| {
@@ -1365,7 +1365,7 @@ const Compiler = struct {
     fn exprInner(self: *Compiler, e: Expr) Error!void {
         switch (e) {
             .int_literal => |lit| {
-                const n = std.fmt.parseInt(i64, lit.text, 10) catch return self.fail(lit.span, "invalid integer '{s}'", .{lit.text});
+                const n = std.fmt.parseInt(i64, lit.text, 0) catch return self.fail(lit.span, "invalid integer '{s}'", .{lit.text});
                 try self.emitConst(.{ .int = n }, lit.span);
             },
             .float_literal => |lit| {
@@ -3102,6 +3102,18 @@ test "vm: list and string slicing with clamping" {
         \\    print(s[6:])
     ;
     try expectVMOutput(src, "[20, 30]\n[10, 20]\n[40, 50]\n[30, 40, 50]\n[]\nhello\nworld\n");
+}
+
+test "vm: hex, binary, and underscore number literals" {
+    const src =
+        \\func main():
+        \\    print(0xFF)
+        \\    print(0b1010)
+        \\    print(1_000_000)
+        \\    print(0xff & 0x0f)
+        \\    print(3.14_15)
+    ;
+    try expectVMOutput(src, "255\n10\n1000000\n15\n3.1415\n");
 }
 
 test "vm: bitwise operators and precedence" {

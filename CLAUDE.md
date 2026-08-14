@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (360 as of writing)
+zig build test                  # run every test (363 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -123,7 +123,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `try: ... catch e: ...` (see **Error handling**), expression statements. All statement
   blocks are colon-blocks (indentation); braces `{ }` are only for `enum`/`match`
   bodies.
-- **Expressions:** literals (incl. `nil`), string interpolation `"a ${expr} b"`
+- **Expressions:** literals (incl. `nil`; int literals may be hex `0xFF`, binary `0b1010`,
+  or use `_` digit separators like `1_000_000` — parsed with `parseInt(…, 0)`, kept verbatim
+  by the formatter), string interpolation `"a ${expr} b"`
   (the parser splits the literal and sub-parses each hole; `\$` escapes; no string
   literals inside a hole), identifiers, `and`/`or`/`not`,
   arithmetic/comparison with precedence, **bitwise** `& | ^ ~ << >>` (int-only, tier

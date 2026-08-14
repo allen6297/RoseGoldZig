@@ -1580,7 +1580,7 @@ const Interpreter = struct {
 
     fn eval(self: *Interpreter, e: Expr) Error!Value {
         return switch (e) {
-            .int_literal => |lit| .{ .int = std.fmt.parseInt(i64, lit.text, 10) catch return self.fail(lit.span, "invalid integer '{s}'", .{lit.text}) },
+            .int_literal => |lit| .{ .int = std.fmt.parseInt(i64, lit.text, 0) catch return self.fail(lit.span, "invalid integer '{s}'", .{lit.text}) },
             .float_literal => |lit| .{ .float = std.fmt.parseFloat(f64, lit.text) catch return self.fail(lit.span, "invalid float '{s}'", .{lit.text}) },
             .string_literal => |lit| .{ .str = try self.unquote(lit.text) },
             .bool_literal => |b| .{ .bool = b.value },
@@ -2014,7 +2014,7 @@ const Interpreter = struct {
 
     fn patternValue(self: *Interpreter, p: parser.Pattern) Error!Value {
         return switch (p) {
-            .int_literal => |lit| .{ .int = std.fmt.parseInt(i64, lit.text, 10) catch return self.fail(lit.span, "invalid integer '{s}'", .{lit.text}) },
+            .int_literal => |lit| .{ .int = std.fmt.parseInt(i64, lit.text, 0) catch return self.fail(lit.span, "invalid integer '{s}'", .{lit.text}) },
             .float_literal => |lit| .{ .float = std.fmt.parseFloat(f64, lit.text) catch return self.fail(lit.span, "invalid float '{s}'", .{lit.text}) },
             .string_literal => |lit| .{ .str = try self.unquote(lit.text) },
             .bool_literal => |b| .{ .bool = b.value },
@@ -2224,6 +2224,19 @@ test "list and string slicing with clamping" {
         \\    print(s[6:])
     ;
     try expectOutput(src, "[20, 30]\n[10, 20]\n[40, 50]\n[30, 40, 50]\n[]\nhello\nworld\n");
+}
+
+test "hex, binary, and underscore number literals" {
+    const src =
+        \\func main():
+        \\    print(0xFF)
+        \\    print(0b1010)
+        \\    print(1_000_000)
+        \\    print(0xFF_FF)
+        \\    print(0xff & 0x0f)
+        \\    print(3.14_15)
+    ;
+    try expectOutput(src, "255\n10\n1000000\n65535\n15\n3.1415\n");
 }
 
 test "bitwise operators and precedence" {

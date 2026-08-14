@@ -671,6 +671,13 @@ test "formats slices in all four forms" {
     try testing.expectEqualStrings("func main():\n    print(xs[1:3])\n    print(xs[:n])\n    print(xs[k:])\n    print(xs[:])\n", out);
 }
 
+test "preserves hex/binary/underscore number literals verbatim" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "func main():\n    print(0xFF_FF | 0b1010)\n    print(1_000_000)");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("func main():\n    print(0xFF_FF | 0b1010)\n    print(1_000_000)\n", out);
+}
+
 test "formats bitwise operators without redundant parens" {
     const gpa = testing.allocator;
     const out = try fmt(gpa, "func main():\n    var x=1<<3|6&3^~0");
