@@ -20,10 +20,11 @@ uniform. See `examples/demo.rg` (single file) and `examples/app.rg` (imports
 zig build                       # build the CLI (exe: zig-out/bin/RoseGold_Zig)
 zig build run -- run FILE.rg    # parse, analyze, and execute FILE (tree-walker)
 zig build run -- run --vm FILE.rg  # execute on the bytecode VM instead
+zig build run -- run --disasm FILE.rg  # print the compiled VM bytecode (don't run)
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (295 as of writing)
+zig build test                  # run every test (298 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -225,6 +226,10 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   with a call-frame stack. It has its **own** small `Value` type (no coupling to the
   interpreter) and produces byte-identical output to the tree-walker. It now covers the
   **entire language except cross-module inheritance** — a genuine drop-in backend.
+  `run --disasm FILE` prints a human-readable listing of every compiled function's
+  bytecode (`Vm.disassemble`) instead of running it — handy for inspecting codegen.
+  A `pushFrame` guard bounds recursion (`max_call_depth`) so runaway recursion reports a
+  clean "call stack overflow" rather than exhausting memory.
 - **Classes/structs** compile too: construction (`Name(...)` binds the type name to a
   synthetic constructor closure that creates the instance via a `new_instance` opcode,
   runs field defaults with the instance as receiver, then calls `init`), field get/set

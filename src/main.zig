@@ -20,7 +20,8 @@ const usage =
     \\Usage: rosegold [run|check|repl|fmt] [<file.rg>]
     \\
     \\  run     parse, analyze, and execute the program (the default; `--vm`
-    \\          runs it on the bytecode VM instead of the tree-walker)
+    \\          runs it on the bytecode VM instead of the tree-walker, and
+    \\          `--disasm` prints the compiled bytecode instead of running)
     \\  check   parse and analyze only, then report any problems
     \\  repl    start an interactive session (also the default with no file)
     \\  fmt     re-format the file in canonical style (stdout; `-w` rewrites it)
@@ -89,9 +90,16 @@ fn handle(
         mode = .check;
         arg_index = 2;
     }
+    // `--vm` and `--disasm` may appear in either order after the subcommand.
     var use_vm = false;
-    if (arg_index < args.len and std.mem.eql(u8, args[arg_index], "--vm")) {
-        use_vm = true;
+    var disasm = false;
+    while (arg_index < args.len and std.mem.startsWith(u8, args[arg_index], "--")) {
+        if (std.mem.eql(u8, args[arg_index], "--vm")) {
+            use_vm = true;
+        } else if (std.mem.eql(u8, args[arg_index], "--disasm")) {
+            use_vm = true; // disassembly is a VM-backend view
+            disasm = true;
+        } else break;
         arg_index += 1;
     }
     if (arg_index >= args.len) {
@@ -148,6 +156,20 @@ fn handle(
             }
             vm_modules[i] = .{ .module = unit.module, .imports = imps, .name = unit.path };
         }
+
+        // `--disasm`: print the compiled bytecode instead of running it.
+        if (disasm) {
+            const dis = try Vm.disassemble(arena, vm_modules);
+            if (dis.diagnostics.len > 0) {
+                for (dis.diagnostics) |d| {
+                    try render(err, "error", entry.path, entry.src, d.message, d.line, d.col);
+                }
+                return 1;
+            }
+            try out.writeAll(dis.text);
+            return 0;
+        }
+
         const vm_result = try Vm.runProgram(arena, vm_modules);
         if (vm_result.diagnostics.len > 0) {
             // Compile diagnostics carry a line/col but not their module; attribute

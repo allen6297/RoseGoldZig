@@ -422,6 +422,9 @@ const Compiler = struct {
     /// The module currently being compiled; stamped onto every `Function` so its
     /// body resolves globals in its own module at runtime.
     current_module: *RtModule = undefined,
+    /// Every compiled function (scripts, funcs, methods, constructors, lambdas),
+    /// in creation order — used by the disassembler.
+    all_functions: std.ArrayList(*Function) = .empty,
     /// The type whose method/constructor/field-default is being compiled, so a
     /// bare name can resolve to a field or method of the receiver.
     current_type: ?*TypeDef = null,
@@ -431,6 +434,14 @@ const Compiler = struct {
 
     fn chunk(self: *Compiler) *Chunk {
         return &self.cur.func.chunk;
+    }
+
+    /// Allocate a `Function`, stamp its home module, and record it for disasm.
+    fn makeFunction(self: *Compiler, name: []const u8, arity: usize) Error!*Function {
+        const f = try self.alloc.create(Function);
+        f.* = .{ .name = name, .arity = arity, .module = self.current_module };
+        try self.all_functions.append(self.alloc, f);
+        return f;
     }
 
     fn fail(self: *Compiler, span: Span, comptime fmt: []const u8, args: anytype) Error {
@@ -461,8 +472,7 @@ const Compiler = struct {
         while (type_it.next()) |t| try self.resolveInheritance(t.*);
 
         // The script runs as a function with no enclosing scope.
-        const script = try self.alloc.create(Function);
-        script.* = .{ .name = "<script>", .arity = 0, .module = self.current_module };
+        const script = try self.makeFunction("<script>", 0);
         var script_fs = FnState{ .func = script, .enclosing = null };
         self.cur = &script_fs;
 
@@ -684,8 +694,7 @@ const Compiler = struct {
 
     fn compileMethod(self: *Compiler, t: *TypeDef, f: Decl.Func) Error!*Function {
         _ = t;
-        const func = try self.alloc.create(Function);
-        func.* = .{ .name = f.name, .arity = f.params.len, .module = self.current_module };
+        const func = try self.makeFunction(f.name, f.params.len);
         var fs = FnState{ .func = func, .enclosing = null };
         const saved = self.cur;
         self.cur = &fs;
@@ -732,8 +741,7 @@ const Compiler = struct {
     }
 
     fn compileStaticMethod(self: *Compiler, t: *TypeDef, f: Decl.Func) Error!*Function {
-        const func = try self.alloc.create(Function);
-        func.* = .{ .name = f.name, .arity = f.params.len, .module = self.current_module };
+        const func = try self.makeFunction(f.name, f.params.len);
         var fs = FnState{ .func = func, .enclosing = null };
         const saved = self.cur;
         self.cur = &fs;
@@ -753,8 +761,7 @@ const Compiler = struct {
     /// Compile the synthetic constructor `<T>`: create the instance, evaluate
     /// field defaults with it as the receiver, run `init` (if any), return it.
     fn compileConstructor(self: *Compiler, t: *TypeDef) Error!void {
-        const func = try self.alloc.create(Function);
-        func.* = .{ .name = t.name, .arity = t.init_arity, .module = self.current_module };
+        const func = try self.makeFunction(t.name, t.init_arity);
         var fs = FnState{ .func = func, .enclosing = null };
         const saved = self.cur;
         self.cur = &fs;
@@ -822,8 +829,7 @@ const Compiler = struct {
     }
 
     fn compileFunction(self: *Compiler, f: Decl.Func, enclosing: ?*FnState) Error!*Function {
-        const func = try self.alloc.create(Function);
-        func.* = .{ .name = f.name, .arity = f.params.len, .module = self.current_module };
+        const func = try self.makeFunction(f.name, f.params.len);
 
         var fs = FnState{ .func = func, .enclosing = enclosing };
         const saved = self.cur;
@@ -841,8 +847,7 @@ const Compiler = struct {
     /// Compile a lambda expression: compile its body to a Function, then emit a
     /// `closure` op that captures its upvalues from the current frame.
     fn compileLambda(self: *Compiler, lam: *const Expr.Lambda) Error!void {
-        const func = try self.alloc.create(Function);
-        func.* = .{ .name = "<lambda>", .arity = lam.params.len, .module = self.current_module };
+        const func = try self.makeFunction("<lambda>", lam.params.len);
         var fs = FnState{ .func = func, .enclosing = self.cur };
         const saved = self.cur;
         self.cur = &fs;
@@ -2249,6 +2254,121 @@ const VM = struct {
     }
 };
 
+// --- disassembler ------------------------------------------------------------
+
+pub const DisasmResult = struct {
+    arena: std.heap.ArenaAllocator,
+    text: []const u8,
+    diagnostics: []const lexer.Diagnostic,
+
+    pub fn deinit(self: *DisasmResult) void {
+        self.arena.deinit();
+    }
+};
+
+/// Compile the modules and return a human-readable listing of every function's
+/// bytecode (rather than running them). `diagnostics` is non-empty on a compile
+/// error; otherwise `text` holds the disassembly.
+pub fn disassemble(gpa: std.mem.Allocator, modules: []const ProgramModule) Error!DisasmResult {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+
+    var diagnostics: std.ArrayList(lexer.Diagnostic) = .empty;
+    const rtmods = try alloc.alloc(*RtModule, modules.len);
+    for (modules, 0..) |pm, i| {
+        const rt = try alloc.create(RtModule);
+        rt.* = .{ .name = pm.name };
+        rtmods[i] = rt;
+    }
+    var c = Compiler{ .alloc = alloc, .diagnostics = &diagnostics };
+    for (modules, 0..) |pm, i| {
+        c.current_module = rtmods[i];
+        c.types = .{};
+        c.enums = .{};
+        c.current_type = null;
+        c.current_static_type = null;
+        _ = c.compileModule(pm.module, pm.imports, rtmods, i == modules.len - 1) catch |e| switch (e) {
+            error.Compile => return .{ .arena = arena, .text = "", .diagnostics = try diagnostics.toOwnedSlice(alloc) },
+            else => return e,
+        };
+    }
+    if (diagnostics.items.len > 0) {
+        return .{ .arena = arena, .text = "", .diagnostics = try diagnostics.toOwnedSlice(alloc) };
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    for (c.all_functions.items) |f| try disasmChunk(alloc, &out, &f.chunk, f.name);
+    return .{ .arena = arena, .text = try out.toOwnedSlice(alloc), .diagnostics = &.{} };
+}
+
+fn disasmChunk(alloc: std.mem.Allocator, out: *std.ArrayList(u8), ch: *const Chunk, name: []const u8) Error!void {
+    try out.print(alloc, "== {s} ==\n", .{name});
+    var offset: usize = 0;
+    while (offset < ch.code.items.len) offset = try disasmInstr(alloc, out, ch, offset);
+    try out.append(alloc, '\n');
+}
+
+fn readU16At(code: []const u8, i: usize) usize {
+    return (@as(usize, code[i]) << 8) | code[i + 1];
+}
+
+fn disasmInstr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), ch: *const Chunk, offset: usize) Error!usize {
+    const code = ch.code.items;
+    const op: Op = @enumFromInt(code[offset]);
+    try out.print(alloc, "{d:0>4}  {s}", .{ offset, @tagName(op) });
+    const next = switch (op) {
+        .get_local, .set_local, .get_upvalue, .set_upvalue, .call => blk: {
+            try out.print(alloc, " {d}", .{code[offset + 1]});
+            break :blk offset + 2;
+        },
+        .get_global, .set_global, .define_global, .get_member, .set_field => blk: {
+            try out.print(alloc, " {s}", .{ch.constants.items[readU16At(code, offset + 1)].str});
+            break :blk offset + 3;
+        },
+        .constant => blk: {
+            try out.append(alloc, ' ');
+            try writeConst(alloc, out, ch.constants.items[readU16At(code, offset + 1)]);
+            break :blk offset + 3;
+        },
+        .closure => blk: {
+            try out.print(alloc, " fn:{s}", .{ch.functions.items[readU16At(code, offset + 1)].name});
+            break :blk offset + 3;
+        },
+        .new_instance => blk: {
+            try out.print(alloc, " {s}", .{ch.rttypes.items[readU16At(code, offset + 1)].name});
+            break :blk offset + 3;
+        },
+        .jump, .jump_if_false => blk: {
+            try out.print(alloc, " -> {d}", .{readU16At(code, offset + 1)});
+            break :blk offset + 3;
+        },
+        .build_list, .build_map, .interp => blk: {
+            try out.print(alloc, " {d}", .{readU16At(code, offset + 1)});
+            break :blk offset + 3;
+        },
+        else => offset + 1, // no operand
+    };
+    try out.append(alloc, '\n');
+    return next;
+}
+
+fn writeConst(alloc: std.mem.Allocator, out: *std.ArrayList(u8), v: Value) Error!void {
+    switch (v) {
+        .int => |n| try out.print(alloc, "{d}", .{n}),
+        .float => |f| try out.print(alloc, "{d}", .{f}),
+        .str => |s| try out.print(alloc, "\"{s}\"", .{s}),
+        .bool => |b| try out.appendSlice(alloc, if (b) "true" else "false"),
+        .nil => try out.appendSlice(alloc, "nil"),
+        .type => |t| try out.print(alloc, "type {s}", .{t.name}),
+        .enum_type => |e| try out.print(alloc, "enum {s}", .{e.name}),
+        .enum_value => |e| try out.print(alloc, "{s}.{s}", .{ e.enum_name, e.member }),
+        .signal => |s| try out.print(alloc, "signal {s}", .{s.name}),
+        .module => |m| try out.print(alloc, "module {s}", .{m.name}),
+        else => try out.appendSlice(alloc, @tagName(v)),
+    }
+}
+
 // --- tests -------------------------------------------------------------------
 
 const testing = std.testing;
@@ -2880,6 +3000,22 @@ test "vm: legitimately deep recursion still runs" {
         \\    print(down(700))
     ;
     try expectVMOutput(src, "700\n");
+}
+
+test "vm: disassembler lists instructions with decoded operands" {
+    const gpa = testing.allocator;
+    var tree = try parser.parse(gpa, "func inc(n: int) -> int:\n    return n + 1\n\nfunc main():\n    print(inc(41))");
+    defer tree.deinit();
+    const modules = [_]ProgramModule{.{ .module = tree.module }};
+    var dis = try disassemble(gpa, &modules);
+    defer dis.deinit();
+    try testing.expectEqual(@as(usize, 0), dis.diagnostics.len);
+    // The listing names each function and decodes operands (globals, locals, ...).
+    try testing.expect(std.mem.indexOf(u8, dis.text, "== inc ==") != null);
+    try testing.expect(std.mem.indexOf(u8, dis.text, "get_local 0") != null);
+    try testing.expect(std.mem.indexOf(u8, dis.text, "get_global print") != null);
+    try testing.expect(std.mem.indexOf(u8, dis.text, "closure fn:main") != null);
+    try testing.expect(std.mem.indexOf(u8, dis.text, "constant 1") != null);
 }
 
 test "vm: runtime error surfaces" {
