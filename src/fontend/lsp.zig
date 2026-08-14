@@ -47,6 +47,10 @@ const Decl = struct {
     /// 0-based line and byte-column of the declared name.
     line: u32,
     character: u32,
+    /// Leading-whitespace width of the header line (0 ⇒ top-level).
+    indent: u32 = 0,
+    /// Whether the declaration is `pub` (part of the module's export surface).
+    is_pub: bool = false,
 
     /// The LSP SymbolKind number for this declaration.
     fn symbolKind(self: Decl) u32 {
@@ -60,6 +64,25 @@ const Decl = struct {
             .var_ => 13, // Variable
         };
     }
+
+    /// The LSP CompletionItemKind number for this declaration.
+    fn completionKind(self: Decl) u32 {
+        return switch (self.kind) {
+            .func => 3, // Function
+            .class => 7, // Class
+            .struct_ => 22, // Struct
+            .enum_ => 13, // Enum
+            .signal => 23, // Event
+            .const_ => 21, // Constant
+            .var_ => 6, // Variable
+        };
+    }
+};
+
+const CompletionItem = struct {
+    label: []const u8,
+    kind: u32,
+    detail: ?[]const u8 = null,
 };
 
 fn isIdentChar(c: u8) bool {
@@ -103,11 +126,14 @@ fn scanDecls(alloc: std.mem.Allocator, text: []const u8) ![]Decl {
         const l = std.mem.trimEnd(u8, raw, "\r");
         var i: usize = 0;
         while (i < l.len and (l[i] == ' ' or l[i] == '\t')) i += 1;
+        const indent = i;
         var rest = l[i..];
         var col = i;
-        // Skip optional visibility and `static` modifiers.
+        // Skip optional visibility and `static` modifiers, noting `pub`.
+        var is_pub = false;
         inline for (.{ "pub ", "private ", "static " }) |kw| {
             if (std.mem.startsWith(u8, rest, kw)) {
+                if (kw[0] == 'p' and kw[1] == 'u') is_pub = true;
                 rest = rest[kw.len..];
                 col += kw.len;
             }
@@ -123,6 +149,8 @@ fn scanDecls(alloc: std.mem.Allocator, text: []const u8) ![]Decl {
             .name = after[0..n],
             .line = line,
             .character = @intCast(col),
+            .indent = @intCast(indent),
+            .is_pub = is_pub,
         });
     }
     return out.toOwnedSlice(alloc);
@@ -151,6 +179,43 @@ fn offsetAt(text: []const u8, line: u32, character: u32) ?usize {
     return @min(off, end);
 }
 
+/// If the cursor is completing a member access — `receiver.partial` — return the
+/// `receiver` identifier; otherwise null. `partial` may be empty (just after `.`).
+fn receiverBeforeCursor(text: []const u8, offset: usize) ?[]const u8 {
+    var o = offset;
+    while (o > 0 and isIdentChar(text[o - 1])) o -= 1; // over the partial being typed
+    if (o == 0 or text[o - 1] != '.') return null;
+    const dot = o - 1;
+    var s = dot;
+    while (s > 0 and isIdentChar(text[s - 1])) s -= 1;
+    if (s == dot) return null; // a '.' with no identifier before it
+    return text[s..dot];
+}
+
+/// If `text` imports a module bound to the leaf name `leaf`, return its file path
+/// relative to the importer (`a.b.c` → `a/b/c.rg`), else null.
+fn importRelPath(a: std.mem.Allocator, text: []const u8, leaf: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const l = std.mem.trimStart(u8, std.mem.trimEnd(u8, raw, "\r"), " \t");
+        const kw = "import ";
+        if (!std.mem.startsWith(u8, l, kw)) continue;
+        const rest = std.mem.trimStart(u8, l[kw.len..], " \t");
+        var n: usize = 0;
+        while (n < rest.len and (isIdentChar(rest[n]) or rest[n] == '.')) n += 1;
+        const dotted = rest[0..n];
+        if (dotted.len == 0) continue;
+        const last_dot = std.mem.lastIndexOfScalar(u8, dotted, '.');
+        const this_leaf = if (last_dot) |ld| dotted[ld + 1 ..] else dotted;
+        if (!std.mem.eql(u8, this_leaf, leaf)) continue;
+        var buf: std.ArrayList(u8) = .empty;
+        for (dotted) |c| buf.append(a, if (c == '.') '/' else c) catch return null;
+        buf.appendSlice(a, ".rg") catch return null;
+        return buf.toOwnedSlice(a) catch null;
+    }
+    return null;
+}
+
 /// The identifier surrounding `offset` (the cursor may sit just past its end),
 /// or null if there's no identifier there.
 fn identAt(text: []const u8, offset: usize) ?[]const u8 {
@@ -166,9 +231,10 @@ fn identAt(text: []const u8, offset: usize) ?[]const u8 {
 
 // --- builtin documentation ---------------------------------------------------
 
-fn builtinDoc(name: []const u8) ?[]const u8 {
-    const docs = [_]struct { n: []const u8, d: []const u8 }{
-        .{ .n = "print", .d = "print(values…) — write the values, space-separated, and a newline." },
+const BuiltinDoc = struct { n: []const u8, d: []const u8 };
+
+const BUILTINS = [_]BuiltinDoc{
+    .{ .n = "print", .d = "print(values…) — write the values, space-separated, and a newline." },
         .{ .n = "echo", .d = "echo(values…) — alias of print." },
         .{ .n = "len", .d = "len(x) → int — length of a list, map, or string." },
         .{ .n = "range", .d = "range(n) → list<int> — the ints 0 … n-1." },
@@ -205,8 +271,21 @@ fn builtinDoc(name: []const u8) ?[]const u8 {
         .{ .n = "floor", .d = "floor(x) → int." },
         .{ .n = "ceil", .d = "ceil(x) → int." },
         .{ .n = "round", .d = "round(x) → int." },
-    };
-    for (docs) |e| {
+};
+
+/// Keywords offered by completion (declarations, control flow, modifiers, literals).
+const KEYWORDS = [_][]const u8{
+    "func",   "class",  "struct", "enum",     "signal", "const", "var",   "import",
+    "pub",    "private", "static", "extends", "uses",   "if",    "elif",  "else",
+    "while",  "for",    "in",     "break",    "continue", "return", "pass", "match",
+    "raise",  "try",    "catch",  "and",      "or",     "not",   "true",  "false",
+    "nil",
+};
+
+const TYPES = [_][]const u8{ "int", "float", "str", "bool", "void", "any", "list", "map" };
+
+fn builtinDoc(name: []const u8) ?[]const u8 {
+    for (BUILTINS) |e| {
         if (std.mem.eql(u8, e.n, name)) return e.d;
     }
     return null;
@@ -364,6 +443,8 @@ const Server = struct {
                 try self.onDefinition(id.?, params);
             } else if (std.mem.eql(u8, method, "textDocument/documentSymbol")) {
                 try self.onDocumentSymbol(id.?, params);
+            } else if (std.mem.eql(u8, method, "textDocument/completion")) {
+                try self.onCompletion(id.?, params);
             } else if (id) |rid| {
                 // Any other request: reply with null so the client isn't left waiting.
                 try self.respond(rid, @as(?u8, null));
@@ -409,6 +490,7 @@ const Server = struct {
             hoverProvider: bool,
             definitionProvider: bool,
             documentSymbolProvider: bool,
+            completionProvider: struct { triggerCharacters: []const []const u8 },
         },
         serverInfo: struct { name: []const u8, version: []const u8 },
     } {
@@ -418,6 +500,7 @@ const Server = struct {
                 .hoverProvider = true,
                 .definitionProvider = true,
                 .documentSymbolProvider = true,
+                .completionProvider = .{ .triggerCharacters = &.{"."} },
             },
             .serverInfo = .{ .name = "rosegold-lsp", .version = "0.1.0" },
         };
@@ -627,6 +710,85 @@ const Server = struct {
         try self.respond(id, syms.items);
     }
 
+    /// Offer completions: after `receiver.` the exported members of the imported
+    /// module `receiver`; otherwise keywords, built-in types, stdlib builtins, and
+    /// the document's own declarations. The client filters the list by the prefix
+    /// already typed. Everything is built in a scratch arena and serialized before
+    /// it's freed.
+    fn onCompletion(self: *Server, id: std.json.Value, params: ?std.json.Value) !void {
+        const p = params orelse return self.respond(id, &[_]CompletionItem{});
+        const uri = self.uriOf(params) orelse return self.respond(id, &[_]CompletionItem{});
+        const text = self.docs.get(uri) orelse return self.respond(id, &[_]CompletionItem{});
+        const pos = objGet(p, "position") orelse return self.respond(id, &[_]CompletionItem{});
+        const line = intField(pos, "line") orelse return self.respond(id, &[_]CompletionItem{});
+        const character = intField(pos, "character") orelse return self.respond(id, &[_]CompletionItem{});
+        const off = offsetAt(text, @intCast(line), @intCast(character)) orelse return self.respond(id, &[_]CompletionItem{});
+
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+
+        var items: std.ArrayList(CompletionItem) = .empty;
+        if (receiverBeforeCursor(text, off)) |receiver| {
+            try self.moduleMemberCompletions(a, uri, text, receiver, &items);
+        } else {
+            try plainCompletions(a, text, &items);
+        }
+        try self.respond(id, items.items);
+    }
+
+    /// Keywords, built-in types, stdlib builtins, and this document's declarations.
+    fn plainCompletions(a: std.mem.Allocator, text: []const u8, items: *std.ArrayList(CompletionItem)) !void {
+        for (KEYWORDS) |kw| try items.append(a, .{ .label = kw, .kind = 14 }); // Keyword
+        for (TYPES) |t| try items.append(a, .{ .label = t, .kind = 25 }); // TypeParameter
+        for (BUILTINS) |b| try items.append(a, .{ .label = b.n, .kind = 3, .detail = b.d }); // Function
+        const decls = try scanDecls(a, text);
+        for (decls) |d| {
+            try items.append(a, .{ .label = d.name, .kind = d.completionKind(), .detail = declKindWord(d.kind) });
+        }
+    }
+
+    /// The `pub` top-level declarations of the module imported under the leaf name
+    /// `receiver`, read from an open buffer or disk (empty if it can't be resolved).
+    fn moduleMemberCompletions(self: *Server, a: std.mem.Allocator, uri: []const u8, text: []const u8, receiver: []const u8, items: *std.ArrayList(CompletionItem)) !void {
+        const rel = importRelPath(a, text, receiver) orelse return;
+        const src = self.readModuleSource(a, uri, rel) orelse return;
+        const decls = try scanDecls(a, src);
+        for (decls) |d| {
+            if (d.indent == 0 and d.is_pub) {
+                try items.append(a, .{ .label = d.name, .kind = d.completionKind(), .detail = declKindWord(d.kind) });
+            }
+        }
+    }
+
+    /// Read the source of a module at `rel` (a `a/b.rg` relative path), looked up
+    /// against the document's directory then the search roots, preferring an open
+    /// buffer over disk.
+    fn readModuleSource(self: *Server, a: std.mem.Allocator, uri: []const u8, rel: []const u8) ?[]const u8 {
+        const doc_path = uriToPath(a, uri) orelse return null;
+        const doc_dir = std.fs.path.dirname(doc_path) orelse ".";
+
+        // Candidate directories: the document's own dir, then each search root.
+        var dirs: std.ArrayList([]const u8) = .empty;
+        dirs.append(a, doc_dir) catch return null;
+        for (self.roots.items) |r| dirs.append(a, r) catch return null;
+
+        for (dirs.items) |dir| {
+            const cand = std.fs.path.join(a, &.{ dir, rel }) catch continue;
+            // Prefer an open buffer at this path.
+            var it = self.docs.iterator();
+            while (it.next()) |e| {
+                const p = uriToPath(a, e.key_ptr.*) orelse continue;
+                if (std.mem.eql(u8, p, cand)) return e.value_ptr.*;
+            }
+            // Otherwise read from disk.
+            if (Io.Dir.cwd().readFileAlloc(self.io, cand, a, .limited(16 << 20))) |src| {
+                return src;
+            } else |_| {}
+        }
+        return null;
+    }
+
     // --- request helpers ---
 
     fn uriOf(self: *Server, params: ?std.json.Value) ?[]const u8 {
@@ -812,6 +974,39 @@ test "uriToPath strips file:// and percent-decodes" {
     try testing.expectEqualStrings("/a/My Code/app.rg", p2);
 
     try testing.expect(uriToPath(gpa, "untitled:Untitled-1") == null);
+}
+
+test "receiverBeforeCursor detects member-access context" {
+    const src = "    mathlib.sq";
+    try testing.expectEqualStrings("mathlib", receiverBeforeCursor(src, src.len).?);
+    const dot = std.mem.indexOfScalar(u8, src, '.').? + 1; // right after '.'
+    try testing.expectEqualStrings("mathlib", receiverBeforeCursor(src, dot).?);
+    try testing.expect(receiverBeforeCursor("hello", 5) == null); // no dot
+}
+
+test "importRelPath maps an import's leaf name to a file path" {
+    const a = testing.allocator;
+    const text = "import util.strutil\n\nfunc main():\n    pass";
+    const rel = importRelPath(a, text, "strutil").?;
+    defer a.free(rel);
+    try testing.expectEqualStrings("util/strutil.rg", rel);
+    try testing.expect(importRelPath(a, text, "nope") == null);
+}
+
+test "plainCompletions offers keywords, builtins, and declarations" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var items: std.ArrayList(CompletionItem) = .empty;
+    try Server.plainCompletions(arena.allocator(), "func helper():\n    pass", &items);
+    var has_kw = false;
+    var has_builtin = false;
+    var has_decl = false;
+    for (items.items) |it| {
+        if (std.mem.eql(u8, it.label, "func")) has_kw = true;
+        if (std.mem.eql(u8, it.label, "print")) has_builtin = true;
+        if (std.mem.eql(u8, it.label, "helper")) has_decl = true;
+    }
+    try testing.expect(has_kw and has_builtin and has_decl);
 }
 
 test "addRoot dedups and addRootUri decodes file URIs" {

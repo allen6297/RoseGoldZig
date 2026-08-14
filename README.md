@@ -313,8 +313,9 @@ See [`CLAUDE.md`](CLAUDE.md) for a deeper implementation reference, and
 
 The compiler ships a **Language Server** — `RoseGold_Zig lsp` speaks LSP over
 stdio, reusing the parser + analyzer for live diagnostics (matching `check`),
-plus hover, go-to-definition, and a document-symbol outline. Any LSP-capable
-editor can drive it.
+plus hover, go-to-definition, a document-symbol outline, and completion
+(keywords, builtins, your declarations, and a module's exports after `mod.`).
+Any LSP-capable editor can drive it.
 
 - [`vscode-extension/`](vscode-extension/) — a VS Code client for the language
   server, with a TextMate grammar for highlighting and a "run" command.
