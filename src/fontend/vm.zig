@@ -1854,7 +1854,15 @@ const max_call_depth = 900;
 /// One call frame. `func` is the running prototype and `upvalues` the captured
 /// cells (empty for plain functions, methods, and the script); a lambda supplies
 /// its closure's upvalues. `base` is the stack index of slot 0.
-const Frame = struct { func: *const Function, upvalues: []*UpvalueObj, ip: usize, base: usize };
+const Frame = struct {
+    func: *const Function,
+    upvalues: []*UpvalueObj,
+    ip: usize,
+    base: usize,
+    /// The function's bytecode slice, cached to skip `func.chunk.code.items`
+    /// dereferences on every instruction fetch.
+    code: []const u8,
+};
 
 /// An active `try`: where to resume (`catch_ip`) and the frame/stack heights to
 /// unwind back to when an error is raised inside its body.
@@ -1910,7 +1918,7 @@ const VM = struct {
             inline for (builtin_names, 0..) |name, i| {
                 try mod.globals.put(self.alloc, name, .{ .builtin = @enumFromInt(i) });
             }
-            try self.frames.append(self.alloc, .{ .func = program.script, .upvalues = &.{}, .ip = 0, .base = 0 });
+            try self.frames.append(self.alloc, .{ .func = program.script, .upvalues = &.{}, .ip = 0, .base = 0, .code = program.script.chunk.code.items });
             try self.exec();
         }
     }
@@ -1972,7 +1980,7 @@ const VM = struct {
         var frame = &self.frames.items[self.frames.items.len - 1];
         while (true) {
             const chunk = &frame.func.chunk;
-            const op: Op = @enumFromInt(chunk.code.items[frame.ip]);
+            const op: Op = @enumFromInt(frame.code[frame.ip]);
             frame.ip += 1;
             switch (op) {
                 .constant => try self.push(chunk.constants.items[self.readU16(frame)]),
@@ -2263,15 +2271,17 @@ const VM = struct {
 
     fn readByte(self: *VM, frame: *Frame) u8 {
         _ = self;
-        const b = frame.func.chunk.code.items[frame.ip];
+        const b = frame.code[frame.ip];
         frame.ip += 1;
         return b;
     }
 
     fn readU16(self: *VM, frame: *Frame) usize {
-        const hi = self.readByte(frame);
-        const lo = self.readByte(frame);
-        return (@as(usize, hi) << 8) | lo;
+        _ = self;
+        const hi: usize = frame.code[frame.ip];
+        const lo: usize = frame.code[frame.ip + 1];
+        frame.ip += 2;
+        return (hi << 8) | lo;
     }
 
     fn arith(self: *VM, op: Op) VMError!void {
@@ -2385,7 +2395,7 @@ const VM = struct {
     /// error instead of growing the frame/value stacks until it exhausts memory.
     fn pushFrame(self: *VM, f: *const Function, upvalues: []*UpvalueObj, base: usize) VMError!void {
         if (self.frames.items.len >= max_call_depth) return self.fail("call stack overflow (too much recursion)", .{});
-        try self.frames.append(self.alloc, .{ .func = f, .upvalues = upvalues, .ip = 0, .base = base });
+        try self.frames.append(self.alloc, .{ .func = f, .upvalues = upvalues, .ip = 0, .base = base, .code = f.chunk.code.items });
     }
 
     /// Reconcile a call's argument count with the callee's parameters. When
@@ -2465,14 +2475,15 @@ const VM = struct {
         switch (callee) {
             .closure => |cl| {
                 const f = cl.func;
-                const n = try self.fillDefaults(f, argc);
+                // Fast path: exact arg count, no defaults to fill (the common case).
+                const n = if (argc == f.arity) argc else try self.fillDefaults(f, argc);
                 // The callee sits just below the arguments; use it as slot 0 base.
                 const base = self.stack.items.len - n;
                 try self.pushFrame(f, cl.upvalues, base);
             },
             .bound_method => |bm| {
                 const f = bm.func;
-                const n = try self.fillDefaults(f, argc);
+                const n = if (argc == f.arity) argc else try self.fillDefaults(f, argc);
                 // A method takes the receiver as slot 0: splice it in below the
                 // arguments, so slot 0 is the receiver and slots 1.. are the args.
                 const base = self.stack.items.len - n;
@@ -2482,7 +2493,7 @@ const VM = struct {
             .type => |rt| {
                 // Calling a type constructs an instance: run its constructor.
                 const f = rt.constructor;
-                const n = try self.fillDefaults(f, argc);
+                const n = if (argc == f.arity) argc else try self.fillDefaults(f, argc);
                 const base = self.stack.items.len - n;
                 try self.pushFrame(f, &.{}, base);
             },
