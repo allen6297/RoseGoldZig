@@ -93,6 +93,7 @@ pub const Expr = union(enum) {
     binary: Binary,
     call: Call,
     index: Index,
+    slice: Slice,
     member: MemberAccess,
     array: Array,
     map: Map,
@@ -112,6 +113,9 @@ pub const Expr = union(enum) {
     pub const Binary = struct { op: BinaryOp, lhs: *Expr, rhs: *Expr, span: Span };
     pub const Call = struct { callee: *Expr, args: []const *Expr, span: Span };
     pub const Index = struct { object: *Expr, index: *Expr, span: Span };
+    /// `object[start:end]` — a sub-range of a list or string; `start`/`end` are
+    /// optional (default 0 / length).
+    pub const Slice = struct { object: *Expr, start: ?*Expr, end: ?*Expr, span: Span };
     pub const MemberAccess = struct { object: *Expr, name: []const u8, span: Span };
     pub const Array = struct { elements: []const *Expr, span: Span };
     pub const Map = struct { entries: []const MapEntry, span: Span };
@@ -284,6 +288,7 @@ pub fn exprSpan(e: Expr) Span {
         .binary => |b| b.span,
         .call => |c| c.span,
         .index => |i| i.span,
+        .slice => |s| s.span,
         .member => |m| m.span,
         .array => |a| a.span,
         .map => |m| m.span,
@@ -1173,13 +1178,27 @@ const Parser = struct {
                 },
                 .l_bracket => {
                     _ = self.advance();
-                    const idx = try self.parseExpr();
-                    const rbracket = try self.expect(.r_bracket, "expected ']' to close the index");
-                    expr = try self.mkExpr(.{ .index = .{
-                        .object = expr,
-                        .index = idx,
-                        .span = joinSpan(exprSpan(expr.*), rbracket.span),
-                    } });
+                    // `[expr]` is an index; `[a:b]` / `[a:]` / `[:b]` / `[:]` a slice.
+                    var start: ?*Expr = null;
+                    if (!self.at(.colon)) start = try self.parseExpr();
+                    if (self.eat(.colon)) {
+                        var end: ?*Expr = null;
+                        if (!self.at(.r_bracket)) end = try self.parseExpr();
+                        const rbracket = try self.expect(.r_bracket, "expected ']' to close the slice");
+                        expr = try self.mkExpr(.{ .slice = .{
+                            .object = expr,
+                            .start = start,
+                            .end = end,
+                            .span = joinSpan(exprSpan(expr.*), rbracket.span),
+                        } });
+                    } else {
+                        const rbracket = try self.expect(.r_bracket, "expected ']' to close the index");
+                        expr = try self.mkExpr(.{ .index = .{
+                            .object = expr,
+                            .index = start.?,
+                            .span = joinSpan(exprSpan(expr.*), rbracket.span),
+                        } });
+                    }
                 },
                 else => break,
             }

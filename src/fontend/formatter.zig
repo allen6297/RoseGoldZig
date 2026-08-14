@@ -471,6 +471,14 @@ const Formatter = struct {
                 try self.expr(idx.index.*);
                 try self.w("]");
             },
+            .slice => |s| {
+                try self.callee(s.object.*);
+                try self.w("[");
+                if (s.start) |st| try self.expr(st.*);
+                try self.w(":");
+                if (s.end) |en| try self.expr(en.*);
+                try self.w("]");
+            },
             .member => |m| {
                 try self.callee(m.object.*);
                 try self.w(".");
@@ -619,6 +627,13 @@ test "formats default parameter values" {
     const out = try fmt(gpa, "func f(a,b=1+1,c=\"x\"):\n    return a");
     defer gpa.free(out);
     try testing.expectEqualStrings("func f(a, b = 1 + 1, c = \"x\"):\n    return a\n", out);
+}
+
+test "formats slices in all four forms" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "func main():\n    print(xs[ 1 : 3 ])\n    print(xs[:n])\n    print(xs[k:])\n    print(xs[:])");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("func main():\n    print(xs[1:3])\n    print(xs[:n])\n    print(xs[k:])\n    print(xs[:])\n", out);
 }
 
 test "formats bitwise operators without redundant parens" {

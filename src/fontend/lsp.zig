@@ -346,6 +346,11 @@ fn findLambdasInExpr(a: std.mem.Allocator, e: *const parser.Expr, scopes: *std.A
             try findLambdasInExpr(a, ix.object, scopes);
             try findLambdasInExpr(a, ix.index, scopes);
         },
+        .slice => |s| {
+            try findLambdasInExpr(a, s.object, scopes);
+            if (s.start) |st| try findLambdasInExpr(a, st, scopes);
+            if (s.end) |en| try findLambdasInExpr(a, en, scopes);
+        },
         .member => |m| try findLambdasInExpr(a, m.object, scopes),
         .array => |arr| for (arr.elements) |el| try findLambdasInExpr(a, el, scopes),
         .map => |mp| for (mp.entries) |en| {

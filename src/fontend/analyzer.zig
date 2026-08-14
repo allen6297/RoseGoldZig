@@ -1413,6 +1413,7 @@ const Analyzer = struct {
             .binary => |b| try self.typeBinary(b),
             .call => |c| try self.typeCall(c),
             .index => |i| try self.typeIndex(i),
+            .slice => |s| try self.typeSlice(s),
             .member => |m| blk: {
                 const ot = try self.typeOf(m.object.*);
                 break :blk try self.memberType(ot, m.name, m.span);
@@ -1770,6 +1771,28 @@ const Analyzer = struct {
                 return .unknown;
             },
         }
+    }
+
+    fn checkIntBound(self: *Analyzer, e: *const Expr) Error!void {
+        const t = try self.typeOf(e.*);
+        if (!isAnyish(t) and tagOf(t) != .int) {
+            try self.report(parser.exprSpan(e.*), "slice bound must be an int, got {s}", .{typeName(t)});
+        }
+    }
+
+    fn typeSlice(self: *Analyzer, s: Expr.Slice) Error!Type {
+        const ot = try self.typeOf(s.object.*);
+        if (s.start) |st| try self.checkIntBound(st);
+        if (s.end) |en| try self.checkIntBound(en);
+        return switch (ot) {
+            .list => ot, // list<T> -> list<T>
+            .str => .str,
+            .any, .unknown => .unknown,
+            else => blk: {
+                try self.report(s.span, "{s} cannot be sliced", .{typeName(ot)});
+                break :blk .unknown;
+            },
+        };
     }
 
     fn typeMatch(self: *Analyzer, m: Expr.Match) Error!Type {
@@ -2553,6 +2576,20 @@ test "arithmetic on non-numbers is reported" {
     var analysis = try analyzeSource(testing.allocator, "const x: int = true + 1");
     defer analysis.deinit();
     try expectMessageContains(analysis, "'+'");
+}
+
+test "slicing keeps the element type; non-lists and non-int bounds are rejected" {
+    var ok = try analyzeSource(testing.allocator, "func f(xs: list<int>) -> int:\n    var ys: list<int> = xs[0:2]\n    return ys[0]");
+    defer ok.deinit();
+    try testing.expectEqual(@as(usize, 0), ok.diagnostics.len);
+
+    var bad = try analyzeSource(testing.allocator, "func f(m: map<int, int>):\n    var z = m[0:1]");
+    defer bad.deinit();
+    try expectMessageContains(bad, "cannot be sliced");
+
+    var bound = try analyzeSource(testing.allocator, "func f(xs: list<int>):\n    var z = xs[\"a\":1]");
+    defer bound.deinit();
+    try expectMessageContains(bound, "slice bound must be an int");
 }
 
 test "bitwise operators require int operands" {

@@ -1565,6 +1565,7 @@ const Interpreter = struct {
             .binary => |b| try self.evalBinary(b),
             .call => |c| try self.evalCall(c),
             .index => |idx| try self.evalIndex(idx),
+            .slice => |s| try self.evalSlice(s),
             .array => |a| try self.evalArray(a),
             .map => |m| try self.evalMap(m),
             .match => |m| try self.evalMatch(m),
@@ -1794,6 +1795,44 @@ const Interpreter = struct {
         return .{ .list = l };
     }
 
+    /// Evaluate and clamp a slice's `[start:end]` bounds against a length.
+    fn sliceBounds(self: *Interpreter, s: Expr.Slice, len: usize, span: Span) Error!struct { start: usize, end: usize } {
+        const n: i64 = @intCast(len);
+        var start: i64 = 0;
+        var end: i64 = n;
+        if (s.start) |st| {
+            const v = try self.eval(st.*);
+            if (v != .int) return self.fail(span, "slice bound must be an int", .{});
+            start = v.int;
+        }
+        if (s.end) |en| {
+            const v = try self.eval(en.*);
+            if (v != .int) return self.fail(span, "slice bound must be an int", .{});
+            end = v.int;
+        }
+        start = std.math.clamp(start, 0, n);
+        end = std.math.clamp(end, start, n);
+        return .{ .start = @intCast(start), .end = @intCast(end) };
+    }
+
+    fn evalSlice(self: *Interpreter, s: Expr.Slice) Error!Value {
+        const container = try self.eval(s.object.*);
+        switch (container) {
+            .list => |l| {
+                const b = try self.sliceBounds(s, l.items.len, s.span);
+                const out = try self.arena.create(List);
+                out.* = .empty;
+                try out.appendSlice(self.arena, l.items[b.start..b.end]);
+                return .{ .list = out };
+            },
+            .str => |str| {
+                const b = try self.sliceBounds(s, str.len, s.span);
+                return .{ .str = str[b.start..b.end] };
+            },
+            else => return self.fail(s.span, "cannot slice {s}", .{@tagName(container)}),
+        }
+    }
+
     fn evalMap(self: *Interpreter, m: Expr.Map) Error!Value {
         const map = try self.arena.create(Map);
         map.* = .{};
@@ -1994,6 +2033,22 @@ test "recursion" {
         \\    print(fact(5))
     ;
     try expectOutput(src, "120\n");
+}
+
+test "list and string slicing with clamping" {
+    const src =
+        \\func main():
+        \\    var xs = [10, 20, 30, 40, 50]
+        \\    print(xs[1:3])
+        \\    print(xs[:2])
+        \\    print(xs[3:])
+        \\    print(xs[2:100])
+        \\    print(xs[3:1])
+        \\    var s = "hello world"
+        \\    print(s[0:5])
+        \\    print(s[6:])
+    ;
+    try expectOutput(src, "[20, 30]\n[10, 20]\n[40, 50]\n[30, 40, 50]\n[]\nhello\nworld\n");
 }
 
 test "bitwise operators and precedence" {

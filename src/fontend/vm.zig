@@ -297,6 +297,7 @@ const Op = enum(u8) {
     make_range, // pop end, start -> list [start, end)
     index_get,
     index_set,
+    slice, // pops end, start, object (nil bounds default to 0 / length)
     // Iteration protocol (works over list/map/str), used to compile `for`:
     iter_len, // pop iterable -> int length
     iter_single, // (iterable, i) -> the single-binding value (list/str elem, map key)
@@ -1405,6 +1406,12 @@ const Compiler = struct {
                 try self.expr(idx.index.*);
                 try self.emit(.index_get, idx.span);
             },
+            .slice => |s| {
+                try self.expr(s.object.*);
+                if (s.start) |st| try self.expr(st.*) else try self.emit(.nil, s.span);
+                if (s.end) |en| try self.expr(en.*) else try self.emit(.nil, s.span);
+                try self.emit(.slice, s.span);
+            },
             .member => |mem| {
                 try self.expr(mem.object.*);
                 try self.emitGlobal(.get_member, mem.name, mem.span);
@@ -2036,6 +2043,12 @@ const VM = struct {
                     const container = self.pop();
                     try self.push(try self.indexGet(container, key));
                 },
+                .slice => {
+                    const end_v = self.pop();
+                    const start_v = self.pop();
+                    const obj = self.pop();
+                    try self.push(try self.sliceValue(obj, start_v, end_v));
+                },
                 .index_set => {
                     const value = self.pop();
                     const key = self.pop();
@@ -2495,6 +2508,39 @@ const VM = struct {
         }
     }
 
+    fn sliceBoundVal(self: *VM, v: Value, default: i64) VMError!i64 {
+        return switch (v) {
+            .nil => default,
+            .int => |n| n,
+            else => self.fail("slice bound must be an int", .{}),
+        };
+    }
+
+    fn sliceValue(self: *VM, obj: Value, start_v: Value, end_v: Value) VMError!Value {
+        switch (obj) {
+            .list => |l| {
+                const n: i64 = @intCast(l.items.len);
+                var start = try self.sliceBoundVal(start_v, 0);
+                var end = try self.sliceBoundVal(end_v, n);
+                start = std.math.clamp(start, 0, n);
+                end = std.math.clamp(end, start, n);
+                const out = try self.alloc.create(List);
+                out.* = .empty;
+                try out.appendSlice(self.alloc, l.items[@intCast(start)..@intCast(end)]);
+                return .{ .list = out };
+            },
+            .str => |s| {
+                const n: i64 = @intCast(s.len);
+                var start = try self.sliceBoundVal(start_v, 0);
+                var end = try self.sliceBoundVal(end_v, n);
+                start = std.math.clamp(start, 0, n);
+                end = std.math.clamp(end, start, n);
+                return .{ .str = s[@intCast(start)..@intCast(end)] };
+            },
+            else => return self.fail("cannot slice {s}", .{@tagName(obj)}),
+        }
+    }
+
     fn indexGet(self: *VM, container: Value, key: Value) VMError!Value {
         switch (container) {
             .list => |l| {
@@ -2845,6 +2891,22 @@ test "vm: reaching an undefined module member is a runtime error" {
 
 test "vm: arithmetic and precedence" {
     try expectVMOutput("func main():\n    print(1 + 2 * 3 - 4)", "3\n");
+}
+
+test "vm: list and string slicing with clamping" {
+    const src =
+        \\func main():
+        \\    var xs = [10, 20, 30, 40, 50]
+        \\    print(xs[1:3])
+        \\    print(xs[:2])
+        \\    print(xs[3:])
+        \\    print(xs[2:100])
+        \\    print(xs[3:1])
+        \\    var s = "hello world"
+        \\    print(s[0:5])
+        \\    print(s[6:])
+    ;
+    try expectVMOutput(src, "[20, 30]\n[10, 20]\n[40, 50]\n[30, 40, 50]\n[]\nhello\nworld\n");
 }
 
 test "vm: bitwise operators and precedence" {
