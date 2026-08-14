@@ -3,12 +3,14 @@
 //! (imports before the modules that import them) so later passes can process a
 //! module knowing its dependencies are already done.
 //!
-//! A dotted import `import a.b` resolves to the file `a/b.rg` relative to the
-//! directory of the importing file. Paths are normalized lexically so the same
-//! file reached two ways loads once. Circular imports and missing files are
-//! reported against the import that triggered them; a program with any such
-//! error still returns a graph (with the parts that loaded), so the caller can
-//! report every problem at once.
+//! A dotted import `import a.b` resolves to the file `a/b.rg`, looked up first
+//! relative to the directory of the importing file and then, if not found there,
+//! against each caller-supplied search root in order (so shared libraries can
+//! live in a common directory). Paths are normalized lexically so the same file
+//! reached two ways loads once. Circular imports and missing files are reported
+//! against the import that triggered them; a program with any such error still
+//! returns a graph (with the parts that loaded), so the caller can report every
+//! problem at once.
 
 const std = @import("std");
 const Io = std.Io;
@@ -52,11 +54,21 @@ pub const Graph = struct {
 };
 
 pub fn load(gpa: std.mem.Allocator, io: Io, entry_path: []const u8) Error!Graph {
+    return loadWithPaths(gpa, io, entry_path, &.{});
+}
+
+/// Like `load`, but imports not found relative to the importer are then looked
+/// up against each directory in `roots`, in order. Roots are normalized
+/// lexically; the importer-relative lookup always takes precedence.
+pub fn loadWithPaths(gpa: std.mem.Allocator, io: Io, entry_path: []const u8, roots: []const []const u8) Error!Graph {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const alloc = arena.allocator();
 
-    var loader = Loader{ .gpa = gpa, .arena = alloc, .io = io };
+    const clean_roots = try alloc.alloc([]const u8, roots.len);
+    for (roots, 0..) |r, i| clean_roots[i] = try cleanPath(alloc, r);
+
+    var loader = Loader{ .gpa = gpa, .arena = alloc, .io = io, .roots = clean_roots };
     const entry = try cleanPath(alloc, entry_path);
     switch (try loader.visit(entry)) {
         .missing => {
@@ -83,6 +95,7 @@ const Loader = struct {
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     io: Io,
+    roots: []const []const u8 = &.{},
     states: std.StringHashMapUnmanaged(State) = .{},
     units: std.ArrayList(Unit) = .empty,
     trees: std.ArrayList(*parser.Tree) = .empty,
@@ -114,15 +127,14 @@ const Loader = struct {
             try self.diags.append(self.arena, .{ .path = path, .src = src, .diag = d });
         }
 
-        // Resolve imports relative to this file's directory.
+        // Resolve imports relative to this file's directory, then search roots.
         var imports: std.ArrayList(Import) = .empty;
         const base_dir = std.fs.path.dirname(path) orelse ".";
         for (tree.module.decls) |decl| {
             if (decl != .import) continue;
             const imp = decl.import;
             const rel = try importRelPath(self.arena, imp.path);
-            const target = try cleanJoin(self.arena, base_dir, rel);
-            switch (try self.visit(target)) {
+            switch (try self.resolveImport(base_dir, rel)) {
                 .index => |idx| try imports.append(self.arena, .{ .name = imp.name, .module_index = idx }),
                 .missing => try self.reportImport(path, src, imp, "cannot find module"),
                 .cycle => try self.reportImport(path, src, imp, "circular import of module"),
@@ -138,6 +150,27 @@ const Loader = struct {
         });
         try self.states.put(self.arena, path, .{ .done = idx });
         return .{ .index = idx };
+    }
+
+    /// Resolve an import's relative path against the importer's directory first,
+    /// then each search root in order. The importer-relative lookup wins when
+    /// present; only a `.missing` result falls through to the next candidate (a
+    /// cycle is a real resolution and stops the search). Returns `.missing` if no
+    /// candidate exists.
+    fn resolveImport(self: *Loader, base_dir: []const u8, rel: []const u8) Error!Visited {
+        const first = try cleanJoin(self.arena, base_dir, rel);
+        switch (try self.visit(first)) {
+            .missing => {},
+            else => |v| return v,
+        }
+        for (self.roots) |root| {
+            const cand = try cleanJoin(self.arena, root, rel);
+            switch (try self.visit(cand)) {
+                .missing => {},
+                else => |v| return v,
+            }
+        }
+        return .missing;
     }
 
     fn reportImport(self: *Loader, path: []const u8, src: []const u8, imp: parser.Decl.Import, comptime what: []const u8) Error!void {
@@ -244,4 +277,50 @@ test "cleanJoin resolves a dotted import against a base dir" {
     const dotted = try joinDots(a, &.{ "lib", "math" });
     defer a.free(dotted);
     try testing.expectEqualStrings("lib.math", dotted);
+}
+
+test "loadWithPaths resolves an import from a search root" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A library under lib/, and an app importing it by leaf name — the library
+    // is NOT next to the app, so it's only reachable via a search root.
+    try tmp.dir.createDirPath(io, "lib");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/greet.rg", .data =
+        \\pub func hi() -> str:
+        \\    return "hi"
+        \\
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "app.rg", .data =
+        \\import greet
+        \\
+        \\func main():
+        \\    print(greet.hi())
+        \\
+    });
+
+    const app_path = try tmp.dir.realPathFileAlloc(io, "app.rg", gpa);
+    defer gpa.free(app_path);
+    const lib_root = try tmp.dir.realPathFileAlloc(io, "lib", gpa);
+    defer gpa.free(lib_root);
+
+    // Without the root, the bare `import greet` can't be resolved.
+    {
+        var g = try loadWithPaths(gpa, io, app_path, &.{});
+        defer g.deinit();
+        try testing.expectEqual(@as(usize, 1), g.diagnostics.len);
+    }
+    // With the root, it resolves: two modules, no diagnostics, `greet` bound.
+    {
+        var g = try loadWithPaths(gpa, io, app_path, &.{lib_root});
+        defer g.deinit();
+        try testing.expectEqual(@as(usize, 0), g.diagnostics.len);
+        try testing.expectEqual(@as(usize, 2), g.units.len);
+        const app = g.units[g.units.len - 1]; // the entry is last
+        try testing.expectEqual(@as(usize, 1), app.imports.len);
+        try testing.expectEqualStrings("greet", app.imports[0].name);
+    }
 }

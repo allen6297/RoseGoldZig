@@ -26,6 +26,9 @@ const usage =
     \\  repl    start an interactive session (also the default with no file)
     \\  fmt     re-format the file in canonical style (stdout; `-w` rewrites it)
     \\
+    \\  --path DIR (or -I DIR)   add a module search root for imports not found
+    \\                           relative to the importing file (repeatable)
+    \\
 ;
 
 const Mode = enum { run, check };
@@ -90,15 +93,29 @@ fn handle(
         mode = .check;
         arg_index = 2;
     }
-    // `--vm` and `--disasm` may appear in either order after the subcommand.
+    // `--vm`, `--disasm`, and `--path DIR` / `-I DIR` (repeatable module search
+    // roots) may appear in any order after the subcommand.
     var use_vm = false;
     var disasm = false;
-    while (arg_index < args.len and std.mem.startsWith(u8, args[arg_index], "--")) {
-        if (std.mem.eql(u8, args[arg_index], "--vm")) {
+    var roots: std.ArrayList([]const u8) = .empty;
+    while (arg_index < args.len) {
+        const a = args[arg_index];
+        if (std.mem.eql(u8, a, "--vm")) {
             use_vm = true;
-        } else if (std.mem.eql(u8, args[arg_index], "--disasm")) {
+        } else if (std.mem.eql(u8, a, "--disasm")) {
             use_vm = true; // disassembly is a VM-backend view
             disasm = true;
+        } else if (std.mem.eql(u8, a, "--path") or std.mem.eql(u8, a, "-I")) {
+            arg_index += 1;
+            if (arg_index >= args.len) {
+                try err.writeAll(usage);
+                return 1;
+            }
+            try roots.append(arena, args[arg_index]);
+        } else if (std.mem.startsWith(u8, a, "--path=")) {
+            try roots.append(arena, a["--path=".len..]);
+        } else if (std.mem.startsWith(u8, a, "-I") and a.len > 2) {
+            try roots.append(arena, a[2..]);
         } else break;
         arg_index += 1;
     }
@@ -110,7 +127,7 @@ fn handle(
 
     // Load the entry file and everything it imports (lex + parse each), in
     // dependency order. Missing files, cycles, and parse errors surface here.
-    const graph = try Loader.load(arena, io, path);
+    const graph = try Loader.loadWithPaths(arena, io, path, roots.items);
     if (graph.diagnostics.len > 0) {
         for (graph.diagnostics) |ld| {
             try render(err, "error", ld.path, ld.src, ld.diag.message, ld.diag.line, ld.diag.col);

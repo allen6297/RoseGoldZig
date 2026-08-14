@@ -24,7 +24,7 @@ zig build run -- run --disasm FILE.rg  # print the compiled VM bytecode (don't r
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (311 as of writing)
+zig build test                  # run every test (312 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -197,9 +197,12 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   callback correctly propagates out through the builtin to an outer `try`.
 
 ### Modules
-- **A module is a `.rg` file.** `import a.b` loads `a/b.rg` **relative to the importing
-  file's directory** and binds the leaf name (`b`) as a namespace value. Reach its
-  exports with `b.name`.
+- **A module is a `.rg` file.** `import a.b` loads `a/b.rg`, resolved **first relative to
+  the importing file's directory**, then — if not found there — against each **module
+  search root** passed on the CLI (`--path DIR` / `-I DIR`, repeatable; also `--path=DIR`
+  and `-Idir`), in order. The import binds the leaf name (`b`) as a namespace value; reach
+  its exports with `b.name`. See `examples/pathdemo.rg` + `examples/libs/strutil.rg`
+  (`run --path examples/libs examples/pathdemo.rg`, both backends).
 - **`pub` is the export boundary.** Only `pub` top-level declarations are visible to
   importers; anything else is module-private (so top-level visibility is now enforced —
   cross-module, by what a module exports). Class/struct *member* visibility is unchanged.
@@ -207,7 +210,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   imports, normalizes paths lexically (so a file reached two ways loads once), detects
   **circular imports**, and returns the modules in **dependency order**. `main.zig` then
   analyzes each in that order (handing every module the exports of the ones it imports)
-  and runs them (dependencies first; the entry's `main()` last).
+  and runs them (dependencies first; the entry's `main()` last). `load` resolves imports
+  importer-relative only; `loadWithPaths(…, roots)` adds the search roots (a `.missing`
+  candidate falls through to the next root, a cycle stops the search).
 - **Closures over the home module.** A function/method value carries the globals of the
   module that defined it (`FuncValue.module`, `TypeInfo.module`), so when it's called
   from another module its body still resolves names in *its own* module — it can use its
@@ -230,8 +235,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   own module, giving virtual dispatch across the boundary. (One level deep; base *field
   defaults* referencing the base's module-level names aren't resolved cross-module — keep
   them literal.)
-- **Limits (v1):** imports resolve relative to the importer's dir (no search path);
-  a runtime error is attributed to the entry file.
+- **Limits (v1):** imports resolve relative to the importer's dir, then the supplied
+  search roots (no implicit/global package registry); a runtime error is attributed to
+  the entry file.
 
 ### REPL
 - `repl` (or no file) starts a persistent interpreter session (`interpreter.Repl`
@@ -331,7 +337,8 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   mutation, but matches the lenient design). The element-aware builtins are
   special-cased by name at their call sites rather than being first-class generic
   signatures, so calling one indirectly (`var f = push`) falls back to `any`.
-- Module resolution has no **search path / package roots** (see **Modules → Limits**).
+- Module resolution supports **explicit search roots** (`--path`/`-I`) but no implicit
+  or global **package registry** (see **Modules → Limits**).
   Cross-module inheritance works on both backends but is effectively one level deep: an
   imported base's *field defaults* referencing that base's module-level names aren't
   resolved (the subclass constructor evaluates them in its own module) — keep them literal.

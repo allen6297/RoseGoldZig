@@ -28,6 +28,11 @@ public final class RoseGoldFormattingProcessor implements ExternalFormatProcesso
     }
 
     @Override
+    public @Nullable TextRange format(@NotNull PsiFile psiFile, @NotNull TextRange textRange, boolean b, boolean b1, boolean b2, int i) {
+        return null;
+    }
+
+    @Override
     public @Nullable TextRange format(@NotNull PsiFile source,
                                       @NotNull TextRange range,
                                       boolean canChangeWhiteSpaceOnly,
