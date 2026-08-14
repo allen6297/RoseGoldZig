@@ -55,6 +55,9 @@ const Error = std.mem.Allocator.Error;
 const FuncSig = struct {
     params: []const Type,
     ret: Type,
+    /// Minimum arguments (parameters without a default); defaults are trailing,
+    /// so `required <= params.len`. Equal to `params.len` when none default.
+    required: usize = 0,
 };
 
 /// An optional type `?T`, carrying the wrapped type and a pre-formatted name
@@ -119,6 +122,15 @@ const Type = union(enum) {
 
 fn tagOf(t: Type) std.meta.Tag(Type) {
     return std.meta.activeTag(t);
+}
+
+/// The count of leading parameters with no default value (defaults are trailing),
+/// i.e. the minimum number of arguments a call must supply.
+fn requiredParamCount(params: []const parser.Param) usize {
+    for (params, 0..) |p, i| {
+        if (p.default != null) return i;
+    }
+    return params.len;
 }
 
 fn isAnyish(t: Type) bool {
@@ -589,12 +601,24 @@ const Analyzer = struct {
         return .unknown;
     }
 
+    /// Type-check a parameter's default value (if any) against its declared
+    /// type. Resolved in whatever scope is current (the enclosing one — defaults
+    /// see the module, not the sibling parameters), matching the runtime, which
+    /// evaluates defaults in the function's home module.
+    fn checkDefault(self: *Analyzer, p: parser.Param, pty: Type) Error!void {
+        const d = p.default orelse return;
+        const dt = try self.typeOf(d.*);
+        if (!self.assignable(dt, pty)) {
+            try self.report(parser.exprSpan(d.*), "default value: cannot use {s} where {s} is expected", .{ typeName(dt), typeName(pty) });
+        }
+    }
+
     fn funcSig(self: *Analyzer, f: Decl.Func) Error!*const FuncSig {
         const params = try self.arena.alloc(Type, f.params.len);
         for (f.params, 0..) |p, i| params[i] = if (p.type) |ann| try self.annotationType(ann) else .any;
         const ret: Type = if (f.return_type) |rt| try self.annotationType(rt) else .any;
         const sig = try self.arena.create(FuncSig);
-        sig.* = .{ .params = params, .ret = ret };
+        sig.* = .{ .params = params, .ret = ret, .required = requiredParamCount(f.params) };
         return sig;
     }
 
@@ -933,6 +957,9 @@ const Analyzer = struct {
         var seen: std.StringHashMapUnmanaged(void) = .{};
         for (s.params) |p| {
             if (p.type) |ann| try self.checkType(ann);
+            if (p.default != null) {
+                try self.report(p.span, "signal parameters cannot have default values", .{});
+            }
             const gop = try seen.getOrPut(self.arena, p.name);
             if (gop.found_existing) {
                 try self.report(p.span, "'{s}' is already declared", .{p.name});
@@ -969,6 +996,7 @@ const Analyzer = struct {
                 try self.checkType(ann);
                 break :blk try self.annotationType(ann);
             } else .any;
+            try self.checkDefault(p, pty); // resolved in the enclosing scope
             try self.declareIn(fn_scope, p.name, .parameter, pty, p.span);
         }
         if (f.return_type) |rt| try self.checkType(rt);
@@ -1425,6 +1453,7 @@ const Analyzer = struct {
                 break :blk try self.annotationType(ann);
             } else .any;
             param_types[i] = pty;
+            try self.checkDefault(p, pty); // resolved in the enclosing scope
             try self.declareIn(fn_scope, p.name, .parameter, pty, p.span);
         }
         const saved = self.current;
@@ -1443,7 +1472,7 @@ const Analyzer = struct {
             try self.analyzeStmts(lam.body);
         }
         const sig = try self.arena.create(FuncSig);
-        sig.* = .{ .params = param_types, .ret = ret };
+        sig.* = .{ .params = param_types, .ret = ret, .required = requiredParamCount(lam.params) };
         return .{ .func = sig };
     }
 
@@ -1511,10 +1540,15 @@ const Analyzer = struct {
         try self.report(span, "operator '{s}' cannot be applied to {s} and {s}", .{ opSymbol(op), typeName(lt), typeName(rt) });
     }
 
-    /// Check a call's argument count and types against a parameter list.
-    fn checkArgs(self: *Analyzer, c: Expr.Call, params: []const Type) Error!void {
-        if (c.args.len != params.len) {
-            try self.report(c.span, "expected {d} argument(s), got {d}", .{ params.len, c.args.len });
+    /// Check a call's argument count and types against a parameter list. With
+    /// default parameters the count is a range `required..params.len`.
+    fn checkArgs(self: *Analyzer, c: Expr.Call, params: []const Type, required: usize) Error!void {
+        if (c.args.len < required or c.args.len > params.len) {
+            if (required == params.len) {
+                try self.report(c.span, "expected {d} argument(s), got {d}", .{ params.len, c.args.len });
+            } else {
+                try self.report(c.span, "expected {d} to {d} argument(s), got {d}", .{ required, params.len, c.args.len });
+            }
         }
         for (c.args, 0..) |arg, i| {
             const at = try self.typeOf(arg.*);
@@ -1536,7 +1570,7 @@ const Analyzer = struct {
         const ct = try self.typeOf(c.callee.*);
         switch (ct) {
             .func => |sig| {
-                try self.checkArgs(c, sig.params);
+                try self.checkArgs(c, sig.params, sig.required);
                 return sig.ret;
             },
             .any, .unknown => {
@@ -1550,7 +1584,7 @@ const Analyzer = struct {
                 const init_sym: ?Symbol = if (scope) |s| s.symbols.get("init") else null;
                 if (init_sym) |sym| {
                     if (tagOf(sym.ty) == .func) {
-                        try self.checkArgs(c, sym.ty.func.params);
+                        try self.checkArgs(c, sym.ty.func.params, sym.ty.func.required);
                     } else {
                         for (c.args) |arg| _ = try self.typeOf(arg.*);
                     }
@@ -2981,6 +3015,49 @@ test "construction checks argument count against init" {
     var analysis = try analyzeSource(testing.allocator, src);
     defer analysis.deinit();
     try expectMessageContains(analysis, "expected 1 argument(s), got 0");
+}
+
+test "a call with defaults reports an argument range" {
+    const src =
+        \\func f(a: int, b: int = 1, c: int = 2) -> int:
+        \\    return a + b + c
+        \\
+        \\func main():
+        \\    print(f())
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "expected 1 to 3 argument(s), got 0");
+}
+
+test "supplying only the required argument of a defaulted function is fine" {
+    const src =
+        \\func f(a: int, b: int = 1) -> int:
+        \\    return a + b
+        \\
+        \\func main():
+        \\    print(f(5))
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a parameter default's type is checked against its annotation" {
+    const src =
+        \\func f(n: int = "oops") -> int:
+        \\    return n
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "default value: cannot use str where int is expected");
+}
+
+test "a signal parameter cannot have a default" {
+    const src = "signal fired(x: int = 3)";
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "signal parameters cannot have default values");
 }
 
 test "construction checks argument types against init" {

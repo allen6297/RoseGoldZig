@@ -64,6 +64,13 @@ const Function = struct {
     /// its own module even when called from another (like the interpreter's
     /// home-module closures).
     module: *RtModule = undefined,
+    /// Minimum arguments (parameters without a default). Defaults are trailing,
+    /// so `required <= arity`.
+    required: usize = 0,
+    /// A zero-arg thunk (`.closure`) per parameter index that fills its default,
+    /// or `null` for a required parameter. Empty when the function has no
+    /// defaults. Each thunk evaluates its default in the home module's scope.
+    defaults: []const ?Value = &.{},
 };
 
 /// A module's runtime namespace: its own top-level bindings (functions, types,
@@ -150,6 +157,15 @@ const Value = union(enum) {
     /// A tuple `(a, b, ...)` — a fixed, ordered group; compared elementwise.
     tuple: *List,
 };
+
+/// The count of leading parameters with no default value (defaults are
+/// trailing), i.e. the minimum number of arguments a call must supply.
+fn requiredParamCount(params: []const parser.Param) usize {
+    for (params, 0..) |p, i| {
+        if (p.default != null) return i;
+    }
+    return params.len;
+}
 
 fn isTruthy(v: Value) bool {
     return switch (v) {
@@ -488,6 +504,38 @@ const Compiler = struct {
         return f;
     }
 
+    /// Record a function's minimum arity and compile a default-filling thunk per
+    /// parameter that has one. Call it while `self.cur` is the *enclosing* state
+    /// (before switching into the function's own `FnState`): each thunk compiles
+    /// in isolation, in the current module's scope.
+    fn attachDefaults(self: *Compiler, func: *Function, params: []const parser.Param) Error!void {
+        func.required = requiredParamCount(params);
+        if (func.required == params.len) return; // no defaults
+        const defs = try self.alloc.alloc(?Value, params.len);
+        for (params, 0..) |p, i| {
+            defs[i] = if (p.default) |d| try self.compileDefaultThunk(d, p.span) else null;
+        }
+        func.defaults = defs;
+    }
+
+    /// Compile a parameter default into a zero-arg thunk that returns its value
+    /// (module scope only — no locals, receiver, or statics), wrapped as a
+    /// callable closure value.
+    fn compileDefaultThunk(self: *Compiler, d: *const Expr, span: Span) Error!Value {
+        const func = try self.makeFunction("<default>", 0);
+        var fs = FnState{ .func = func, .enclosing = null };
+        const saved = self.cur;
+        self.cur = &fs;
+        defer self.cur = saved;
+        self.cur.stack_top = 0;
+        try self.expr(d.*);
+        try self.emit(.ret, span);
+        func.upvalues = try fs.upvalues.toOwnedSlice(self.alloc);
+        const cl = try self.alloc.create(Closure);
+        cl.* = .{ .func = func, .upvalues = &.{} };
+        return .{ .closure = cl };
+    }
+
     fn fail(self: *Compiler, span: Span, comptime fmt: []const u8, args: anytype) Error {
         const msg = try std.fmt.allocPrint(self.alloc, fmt, args);
         try self.diagnostics.append(self.alloc, .{ .message = msg, .line = span.line, .col = span.col });
@@ -772,6 +820,7 @@ const Compiler = struct {
     fn compileMethod(self: *Compiler, t: *TypeDef, f: Decl.Func) Error!*Function {
         _ = t;
         const func = try self.makeFunction(f.name, f.params.len);
+        try self.attachDefaults(func, f.params);
         var fs = FnState{ .func = func, .enclosing = null };
         const saved = self.cur;
         self.cur = &fs;
@@ -819,6 +868,7 @@ const Compiler = struct {
 
     fn compileStaticMethod(self: *Compiler, t: *TypeDef, f: Decl.Func) Error!*Function {
         const func = try self.makeFunction(f.name, f.params.len);
+        try self.attachDefaults(func, f.params);
         var fs = FnState{ .func = func, .enclosing = null };
         const saved = self.cur;
         self.cur = &fs;
@@ -839,6 +889,7 @@ const Compiler = struct {
     /// field defaults with it as the receiver, run `init` (if any), return it.
     fn compileConstructor(self: *Compiler, t: *TypeDef) Error!void {
         const func = try self.makeFunction(t.name, t.init_arity);
+        if (t.methods.get("init")) |me| try self.attachDefaults(func, me.decl.params);
         var fs = FnState{ .func = func, .enclosing = null };
         const saved = self.cur;
         self.cur = &fs;
@@ -907,6 +958,7 @@ const Compiler = struct {
 
     fn compileFunction(self: *Compiler, f: Decl.Func, enclosing: ?*FnState) Error!*Function {
         const func = try self.makeFunction(f.name, f.params.len);
+        try self.attachDefaults(func, f.params);
 
         var fs = FnState{ .func = func, .enclosing = enclosing };
         const saved = self.cur;
@@ -925,6 +977,7 @@ const Compiler = struct {
     /// `closure` op that captures its upvalues from the current frame.
     fn compileLambda(self: *Compiler, lam: *const Expr.Lambda) Error!void {
         const func = try self.makeFunction("<lambda>", lam.params.len);
+        try self.attachDefaults(func, lam.params);
         var fs = FnState{ .func = func, .enclosing = self.cur };
         const saved = self.cur;
         self.cur = &fs;
@@ -2085,30 +2138,50 @@ const VM = struct {
         try self.frames.append(self.alloc, .{ .func = f, .upvalues = upvalues, .ip = 0, .base = base });
     }
 
+    /// Reconcile a call's argument count with the callee's parameters. When
+    /// fewer arguments than parameters are given, evaluate the missing trailing
+    /// defaults (each a zero-arg thunk) and push them, so the frame sees a full
+    /// parameter list; returns the resulting argument count. Reports an arity
+    /// error if the count is outside `required..arity`.
+    fn fillDefaults(self: *VM, f: *const Function, argc: usize) VMError!usize {
+        if (argc == f.arity) return argc;
+        if (argc > f.arity or argc < f.required) {
+            if (f.required == f.arity)
+                return self.fail("{s} expects {d} argument(s), got {d}", .{ f.name, f.arity, argc });
+            return self.fail("{s} expects {d} to {d} argument(s), got {d}", .{ f.name, f.required, f.arity, argc });
+        }
+        var j = argc;
+        while (j < f.arity) : (j += 1) {
+            const v = try self.callValueSync(f.defaults[j].?, &.{});
+            try self.push(v);
+        }
+        return f.arity;
+    }
+
     fn call(self: *VM, argc: usize) VMError!void {
         const callee = self.peek(argc);
         switch (callee) {
             .closure => |cl| {
                 const f = cl.func;
-                if (argc != f.arity) return self.fail("{s} expects {d} argument(s), got {d}", .{ f.name, f.arity, argc });
+                const n = try self.fillDefaults(f, argc);
                 // The callee sits just below the arguments; use it as slot 0 base.
-                const base = self.stack.items.len - argc;
+                const base = self.stack.items.len - n;
                 try self.pushFrame(f, cl.upvalues, base);
             },
             .bound_method => |bm| {
                 const f = bm.func;
-                if (argc != f.arity) return self.fail("{s} expects {d} argument(s), got {d}", .{ f.name, f.arity, argc });
+                const n = try self.fillDefaults(f, argc);
                 // A method takes the receiver as slot 0: splice it in below the
                 // arguments, so slot 0 is the receiver and slots 1.. are the args.
-                const base = self.stack.items.len - argc;
+                const base = self.stack.items.len - n;
                 try self.stack.insert(self.alloc, base, .{ .instance = bm.recv });
                 try self.pushFrame(f, &.{}, base);
             },
             .type => |rt| {
                 // Calling a type constructs an instance: run its constructor.
                 const f = rt.constructor;
-                if (argc != f.arity) return self.fail("{s} expects {d} argument(s), got {d}", .{ rt.name, f.arity, argc });
-                const base = self.stack.items.len - argc;
+                const n = try self.fillDefaults(f, argc);
+                const base = self.stack.items.len - n;
                 try self.pushFrame(f, &.{}, base);
             },
             .builtin => |bi| {
@@ -2727,6 +2800,39 @@ test "vm: reaching an undefined module member is a runtime error" {
 
 test "vm: arithmetic and precedence" {
     try expectVMOutput("func main():\n    print(1 + 2 * 3 - 4)", "3\n");
+}
+
+test "vm: default parameters fill omitted trailing arguments" {
+    const src =
+        \\const BASE = 100
+        \\
+        \\func add(x: int, y: int = 10, z: int = BASE) -> int:
+        \\    return x + y + z
+        \\
+        \\func main():
+        \\    print(add(1))
+        \\    print(add(1, 2))
+        \\    print(add(1, 2, 3))
+    ;
+    try expectVMOutput(src, "111\n103\n6\n");
+}
+
+test "vm: default parameters work on methods, constructors, and lambdas" {
+    const src =
+        \\class Box:
+        \\    var w: int = 0
+        \\    func init(width: int = 2):
+        \\        w = width
+        \\    func scaled(k: int = 3) -> int:
+        \\        return w * k
+        \\
+        \\func main():
+        \\    print(Box().scaled())
+        \\    print(Box(5).scaled(2))
+        \\    var f = func(n, k = 4): n * k
+        \\    print(f(3))
+    ;
+    try expectVMOutput(src, "6\n10\n12\n");
 }
 
 test "vm: recursion" {

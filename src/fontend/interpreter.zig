@@ -184,6 +184,15 @@ pub const Value = union(enum) {
     module: *Env,
 };
 
+/// The count of leading parameters with no default value (defaults are
+/// trailing), i.e. the minimum number of arguments a call must supply.
+fn requiredParamCount(params: []const parser.Param) usize {
+    for (params, 0..) |p, i| {
+        if (p.default != null) return i;
+    }
+    return params.len;
+}
+
 fn isTruthy(v: Value) bool {
     return switch (v) {
         .nil => false,
@@ -1116,14 +1125,49 @@ const Interpreter = struct {
 
     // --- calls ---------------------------------------------------------------
 
+    /// Bind `args` to `params` in `call_env`, then fill any missing trailing
+    /// parameters from their defaults, evaluated in `module`'s global scope (no
+    /// receiver or statics in view) — matching the VM's default thunks. Reports
+    /// an arity error against `span`.
+    fn bindArgs(self: *Interpreter, call_env: *Env, module: *Env, params: []const parser.Param, args: []const Value, name: []const u8, span: Span) Error!void {
+        const required = requiredParamCount(params);
+        if (args.len < required or args.len > params.len) {
+            if (required == params.len)
+                return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ name, params.len, args.len });
+            return self.fail(span, "{s} expects {d} to {d} argument(s), got {d}", .{ name, required, params.len, args.len });
+        }
+        for (params[0..args.len], args) |p, arg| try self.define(call_env, p.name, arg);
+        if (args.len == params.len) return;
+
+        // Evaluate the remaining defaults in the home module's scope.
+        const saved_env = self.env;
+        const saved_globals = self.globals;
+        const saved_recv = self.current_receiver;
+        const saved_statics = self.current_statics;
+        const saved_static_ti = self.current_static_ti;
+        self.globals = module;
+        self.env = try self.newEnv(module);
+        self.current_receiver = null;
+        self.current_statics = null;
+        self.current_static_ti = null;
+        defer {
+            self.env = saved_env;
+            self.globals = saved_globals;
+            self.current_receiver = saved_recv;
+            self.current_statics = saved_statics;
+            self.current_static_ti = saved_static_ti;
+        }
+        for (params[args.len..]) |p| {
+            const v = try self.eval(p.default.?.*);
+            try self.define(call_env, p.name, v);
+        }
+    }
+
     fn callFunction(self: *Interpreter, fv: *const FuncValue, args: []const Value, span: Span) Error!Value {
         self.call_depth += 1;
         defer self.call_depth -= 1;
         if (self.call_depth > max_call_depth) return self.fail(span, "call stack overflow (too much recursion)", .{});
         const func = fv.decl;
-        if (args.len != func.params.len) {
-            return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
-        }
         // Run in the function's home module, so its body sees that module's
         // globals rather than the caller's. A plain function has no receiver or
         // statics in scope.
@@ -1136,7 +1180,7 @@ const Interpreter = struct {
         self.current_statics = null;
         self.current_static_ti = null;
         const call_env = try self.newEnv(self.globals);
-        for (func.params, args) |p, arg| try self.define(call_env, p.name, arg);
+        try self.bindArgs(call_env, fv.module, func.params, args, func.name, span);
 
         const saved_env = self.env;
         const saved_ret = self.ret_value;
@@ -1162,9 +1206,6 @@ const Interpreter = struct {
         defer self.call_depth -= 1;
         if (self.call_depth > max_call_depth) return self.fail(span, "call stack overflow (too much recursion)", .{});
         const params = cl.lambda.params;
-        if (args.len != params.len) {
-            return self.fail(span, "lambda expects {d} argument(s), got {d}", .{ params.len, args.len });
-        }
         const saved_globals = self.globals;
         const saved_recv = self.current_receiver;
         const saved_statics = self.current_statics;
@@ -1174,7 +1215,7 @@ const Interpreter = struct {
         self.current_statics = cl.statics;
         self.current_static_ti = null;
         const call_env = try self.newEnv(cl.env);
-        for (params, args) |p, arg| try self.define(call_env, p.name, arg);
+        try self.bindArgs(call_env, cl.module, params, args, "lambda", span);
 
         const saved_env = self.env;
         const saved_ret = self.ret_value;
@@ -1196,15 +1237,12 @@ const Interpreter = struct {
         self.call_depth += 1;
         defer self.call_depth -= 1;
         if (self.call_depth > max_call_depth) return self.fail(span, "call stack overflow (too much recursion)", .{});
-        if (args.len != func.params.len) {
-            return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
-        }
         // The method runs in the module of the type that DEFINES it (which may be
         // an imported base), with the receiver in scope and no statics.
         const saved_globals = self.globals;
         self.globals = owner.module;
         const call_env = try self.newEnv(self.globals);
-        for (func.params, args) |p, arg| try self.define(call_env, p.name, arg);
+        try self.bindArgs(call_env, owner.module, func.params, args, func.name, span);
 
         const saved_env = self.env;
         const saved_ret = self.ret_value;
@@ -1235,9 +1273,6 @@ const Interpreter = struct {
         defer self.call_depth -= 1;
         if (self.call_depth > max_call_depth) return self.fail(span, "call stack overflow (too much recursion)", .{});
         const func = sm.func;
-        if (args.len != func.params.len) {
-            return self.fail(span, "{s} expects {d} argument(s), got {d}", .{ func.name, func.params.len, args.len });
-        }
         const saved_globals = self.globals;
         const saved_recv = self.current_receiver;
         const saved_statics = self.current_statics;
@@ -1247,7 +1282,7 @@ const Interpreter = struct {
         self.current_statics = sm.ti.statics;
         self.current_static_ti = sm.ti;
         const call_env = try self.newEnv(self.globals);
-        for (func.params, args) |p, arg| try self.define(call_env, p.name, arg);
+        try self.bindArgs(call_env, sm.ti.module, func.params, args, func.name, span);
 
         const saved_env = self.env;
         const saved_ret = self.ret_value;
@@ -1933,6 +1968,39 @@ test "recursion" {
         \\    print(fact(5))
     ;
     try expectOutput(src, "120\n");
+}
+
+test "default parameters fill omitted trailing arguments" {
+    const src =
+        \\const BASE = 100
+        \\
+        \\func add(x: int, y: int = 10, z: int = BASE) -> int:
+        \\    return x + y + z
+        \\
+        \\func main():
+        \\    print(add(1))
+        \\    print(add(1, 2))
+        \\    print(add(1, 2, 3))
+    ;
+    try expectOutput(src, "111\n103\n6\n");
+}
+
+test "default parameters work on methods, constructors, and lambdas" {
+    const src =
+        \\class Box:
+        \\    var w: int = 0
+        \\    func init(width: int = 2):
+        \\        w = width
+        \\    func scaled(k: int = 3) -> int:
+        \\        return w * k
+        \\
+        \\func main():
+        \\    print(Box().scaled())
+        \\    print(Box(5).scaled(2))
+        \\    var f = func(n, k = 4): n * k
+        \\    print(f(3))
+    ;
+    try expectOutput(src, "6\n10\n12\n");
 }
 
 test "while loop accumulates" {

@@ -53,6 +53,9 @@ pub const TypeRef = struct {
 pub const Param = struct {
     name: []const u8,
     type: ?TypeRef,
+    /// An optional default value (`p = expr`); when present the argument may be
+    /// omitted at the call site. Defaults must be trailing.
+    default: ?*const Expr = null,
     span: Span,
 };
 
@@ -623,13 +626,22 @@ const Parser = struct {
         _ = try self.expect(.l_paren, "expected '('");
         var params: std.ArrayList(Param) = .empty;
         if (!self.at(.r_paren)) {
+            var seen_default = false;
             while (true) {
                 const pname = try self.expect(.identifier, "expected a parameter name");
                 var ptype: ?TypeRef = null;
                 if (self.eat(.colon)) ptype = try self.parseType();
+                var default: ?*const Expr = null;
+                if (self.eat(.assign)) {
+                    default = try self.parseExpr();
+                    seen_default = true;
+                } else if (seen_default) {
+                    try self.err("a parameter without a default cannot follow one with a default");
+                }
                 try params.append(self.alloc, .{
                     .name = pname.text,
                     .type = ptype,
+                    .default = default,
                     .span = spanFrom(pname, self.prev()),
                 });
                 if (!self.eat(.comma)) break;
@@ -1483,6 +1495,22 @@ test "deeply nested expressions are rejected instead of overflowing" {
     defer tree.deinit();
     try testing.expect(tree.diagnostics.len > 0);
     try testing.expect(std.mem.indexOf(u8, tree.diagnostics[0].message, "nested too deeply") != null);
+}
+
+test "a required parameter cannot follow one with a default" {
+    var tree = try parse(testing.allocator, "func f(a = 1, b):\n    return a");
+    defer tree.deinit();
+    try testing.expect(tree.diagnostics.len > 0);
+    try testing.expect(std.mem.indexOf(u8, tree.diagnostics[0].message, "cannot follow one with a default") != null);
+}
+
+test "a parameter default is parsed as an expression" {
+    var tree = try parse(testing.allocator, "func f(a, b = 1 + 2):\n    return a");
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const params = tree.module.decls[0].func.params;
+    try testing.expect(params[0].default == null);
+    try testing.expect(params[1].default != null);
 }
 
 test "parses an interpolated string into literal and expression parts" {

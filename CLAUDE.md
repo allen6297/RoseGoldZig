@@ -24,7 +24,7 @@ zig build run -- run --disasm FILE.rg  # print the compiled VM bytecode (don't r
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (312 as of writing)
+zig build test                  # run every test (323 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -57,7 +57,7 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/fontend/tests.zig` | Test aggregator; the `zig build test` frontend target roots here. |
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
 | `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. |
-| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, and `mathdemo.rg` (run on both backends). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
+| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, and `defaults.rg` (run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
 
 Each layer imports the ones below it (`interpreter`/`analyzer` → `parser` → `lexer`,
 and `loader`/`formatter` → `parser`); there are no upward dependencies. `main.zig`
@@ -106,7 +106,8 @@ drives the loader, then the analyzer and interpreter over the loaded module set
 
 - **Declarations:** `import a.b.c` (dotted; loads `a/b/c.rg` and binds the leaf name
   `c` as a module namespace — see **Modules** below), `const`/`var`
-  (optional `: type`), `func name(p: T, q) -> R:` (params may be untyped → `any`),
+  (optional `: type`), `func name(p: T, q, r = expr) -> R:` (params may be untyped →
+  `any`, and may carry a trailing **default value** `= expr`; see **Default parameters**),
   `class` (with `extends` / `uses`), `struct` (no inheritance), `enum { A, B = 2 }`,
   `signal name(params)`. `pub`/`private` visibility; `static` on a class/struct
   member makes it belong to the type (shared storage / no receiver), reached via
@@ -238,6 +239,24 @@ drives the loader, then the analyzer and interpreter over the loaded module set
 - **Limits (v1):** imports resolve relative to the importer's dir, then the supplied
   search roots (no implicit/global package registry); a runtime error is attributed to
   the entry file.
+
+### Default parameters
+- A parameter may declare a **default value** (`func f(a, b = 10, c = BASE):`). Defaults
+  must be **trailing** (a required parameter can't follow a defaulted one — a parser
+  error); works on functions, methods, static methods, constructors (`init`), and
+  lambdas. Signals reject defaults (an analyzer error).
+- **Call-site arity is a range** `required..params.len`; the analyzer reports
+  "expected N to M argument(s), got K" and the runtime backstop "NAME expects N to M
+  argument(s), got K" (both backends' text aligned, so a caught arity error matches).
+  `funcSig.required` (analyzer) / `Function.required` (VM) carry the minimum.
+- **Defaults evaluate at call time in the function's home module scope** — they see
+  module-level consts/functions but **not** the other parameters or the receiver. This
+  keeps both backends identical and simple: the interpreter fills omitted trailing params
+  via `bindArgs` (a fresh env over the module, receiver/statics nulled); the VM compiles
+  each default into a **zero-arg thunk** (`Function.defaults[i]`, a `.closure`) and
+  `fillDefaults` runs the missing ones through `callValueSync` in `call`, padding the
+  frame to full arity. The default's type is checked against the parameter's annotation.
+  See `examples/defaults.rg` (runs on both backends).
 
 ### REPL
 - `repl` (or no file) starts a persistent interpreter session (`interpreter.Repl`

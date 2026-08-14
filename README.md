@@ -58,8 +58,13 @@ var count = 0                    ## inferred as int
 func area(r: int) -> float:      ## params may be untyped (→ any); return type optional
     return PI * r * r
 
+func scale(x: int, by: int = 2) -> int:   ## trailing params may have default values
+    return x * by
+
 func main():
     print(area(2))               ## 12.56636
+    print(scale(5))              ## 10 (by defaults to 2)
+    print(scale(5, 3))           ## 15
 ```
 
 Types: `int`, `float` (`int` widens to `float`), `str`, `bool`, `void`, `any`,

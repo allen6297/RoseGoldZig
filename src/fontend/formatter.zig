@@ -256,6 +256,10 @@ const Formatter = struct {
                 try self.w(": ");
                 try self.typeRef(t);
             }
+            if (p.default) |d| {
+                try self.w(" = ");
+                try self.expr(d.*);
+            }
         }
         try self.w(")");
     }
@@ -598,6 +602,13 @@ test "formats a function canonically" {
     const out = try fmt(gpa, "func  add(a:int,b:int)->int:\n        return a+b*2");
     defer gpa.free(out);
     try testing.expectEqualStrings("func add(a: int, b: int) -> int:\n    return a + b * 2\n", out);
+}
+
+test "formats default parameter values" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "func f(a,b=1+1,c=\"x\"):\n    return a");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("func f(a, b = 1 + 1, c = \"x\"):\n    return a\n", out);
 }
 
 test "re-adds precedence-required parentheses" {
