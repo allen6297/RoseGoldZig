@@ -19,13 +19,11 @@ IDEs. Written in Java against the IntelliJ Platform.
 
 ## Build & install
 
-You need a JetBrains IDE (which bundles Gradle) or a standalone Gradle 8.2+.
+Uses the **IntelliJ Platform Gradle Plugin 2.x**, which supports Gradle 8.5+
+(including Gradle 9). You need a JetBrains IDE (which bundles Gradle) or a
+standalone Gradle 8.5+.
 
-**From the IDE:** open the `intellij-plugin/` folder in IntelliJ IDEA as a Gradle
-project, then run the **`runIde`** Gradle task to launch a sandbox IDE with the
-plugin, or **`buildPlugin`** to produce `build/distributions/rosegold-intellij-*.zip`.
-
-**From the command line** (with Gradle on PATH):
+**From the command line** (with `gradle` on PATH):
 
 ```bash
 cd intellij-plugin
@@ -35,9 +33,13 @@ gradle runIde               # launch a sandbox IDE to try it
 
 Then install the zip via *Settings | Plugins | ⚙ | Install Plugin from Disk…*.
 
-> This project has no committed Gradle wrapper (`gradlew`) binary. Either run
-> `gradle wrapper` once to generate it, or just open the project in IntelliJ,
-> which supplies its own Gradle.
+**From the IDE:** open the `intellij-plugin/` folder in IntelliJ IDEA as a Gradle
+project and run the **`runIde`** or **`buildPlugin`** Gradle task.
+
+> First run downloads the target IntelliJ IDEA Community distribution
+> (`2023.3.8`, a few hundred MB) — expect it to take a while.
+> No Gradle wrapper (`gradlew`) is committed; use your installed Gradle, or run
+> `gradle wrapper` once to generate one.
 
 ## Pointing it at the compiler
 

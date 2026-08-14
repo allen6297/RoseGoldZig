@@ -1,22 +1,25 @@
 plugins {
     id 'java'
-    // The classic Gradle IntelliJ Plugin (1.x) — battle-tested for Java plugins.
-    id 'org.jetbrains.intellij' version '1.17.4'
+    // IntelliJ Platform Gradle Plugin 2.x — rewritten for modern Gradle (8.5+,
+    // incl. Gradle 9). The classic 1.x plugin does NOT work on Gradle 9.
+    id 'org.jetbrains.intellij.platform' version '2.6.0'
 }
 
-group 'org.rosegold'
-version '0.1.0'
+group = 'org.rosegold'
+version = '0.1.0'
 
 repositories {
     mavenCentral()
+    intellijPlatform {
+        defaultRepositories()
+    }
 }
 
-// Target the IntelliJ Platform. IC = IDEA Community; any JetBrains IDE on this
-// build works. JDK 17 is the toolchain for 2023.3+ (build with JDK 17 or newer).
-intellij {
-    version = '2023.3.8'
-    type = 'IC'
-    plugins = []
+dependencies {
+    intellijPlatform {
+        // The target IDE to build/run against. IC = IDEA Community.
+        intellijIdeaCommunity '2023.3.8'
+    }
 }
 
 java {
@@ -24,12 +27,12 @@ java {
     targetCompatibility = JavaVersion.VERSION_17
 }
 
-patchPluginXml {
-    sinceBuild = '233'
-    untilBuild = '243.*'
-}
-
-// Speeds up local builds; drop if you publish and want searchable settings.
-buildSearchableOptions {
-    enabled = false
+intellijPlatform {
+    buildSearchableOptions = false
+    pluginConfiguration {
+        ideaVersion {
+            sinceBuild = '233'
+            untilBuild = '243.*'
+        }
+    }
 }
