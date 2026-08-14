@@ -1456,6 +1456,11 @@ fn declSpan(d: Decl) Span {
 
 const VMError = std.mem.Allocator.Error || error{Runtime};
 
+/// Frame-stack bound: runaway recursion reports a clean error rather than
+/// exhausting memory. The `exec` loop is iterative, so this caps heap growth
+/// (and the native-stack depth of re-entrant builtin callbacks).
+const max_call_depth = 900;
+
 /// One call frame. `func` is the running prototype and `upvalues` the captured
 /// cells (empty for plain functions, methods, and the script); a lambda supplies
 /// its closure's upvalues. `base` is the stack index of slot 0.
@@ -1852,6 +1857,13 @@ const VM = struct {
         }
     }
 
+    /// Push a call frame, bounding recursion so a runaway program reports a clean
+    /// error instead of growing the frame/value stacks until it exhausts memory.
+    fn pushFrame(self: *VM, f: *const Function, upvalues: []*UpvalueObj, base: usize) VMError!void {
+        if (self.frames.items.len >= max_call_depth) return self.fail("call stack overflow (too much recursion)", .{});
+        try self.frames.append(self.alloc, .{ .func = f, .upvalues = upvalues, .ip = 0, .base = base });
+    }
+
     fn call(self: *VM, argc: usize) VMError!void {
         const callee = self.peek(argc);
         switch (callee) {
@@ -1860,7 +1872,7 @@ const VM = struct {
                 if (argc != f.arity) return self.fail("{s} expects {d} argument(s), got {d}", .{ f.name, f.arity, argc });
                 // The callee sits just below the arguments; use it as slot 0 base.
                 const base = self.stack.items.len - argc;
-                try self.frames.append(self.alloc, .{ .func = f, .upvalues = cl.upvalues, .ip = 0, .base = base });
+                try self.pushFrame(f, cl.upvalues, base);
             },
             .bound_method => |bm| {
                 const f = bm.func;
@@ -1869,14 +1881,14 @@ const VM = struct {
                 // arguments, so slot 0 is the receiver and slots 1.. are the args.
                 const base = self.stack.items.len - argc;
                 try self.stack.insert(self.alloc, base, .{ .instance = bm.recv });
-                try self.frames.append(self.alloc, .{ .func = f, .upvalues = &.{}, .ip = 0, .base = base });
+                try self.pushFrame(f, &.{}, base);
             },
             .type => |rt| {
                 // Calling a type constructs an instance: run its constructor.
                 const f = rt.constructor;
                 if (argc != f.arity) return self.fail("{s} expects {d} argument(s), got {d}", .{ rt.name, f.arity, argc });
                 const base = self.stack.items.len - argc;
-                try self.frames.append(self.alloc, .{ .func = f, .upvalues = &.{}, .ip = 0, .base = base });
+                try self.pushFrame(f, &.{}, base);
             },
             .builtin => |bi| {
                 const base = self.stack.items.len - argc;
@@ -2848,6 +2860,26 @@ test "vm: reports unsupported constructs" {
     defer result.deinit();
     try testing.expect(result.diagnostics.len > 0);
     try testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, "does not support") != null);
+}
+
+test "vm: runaway recursion is a runtime error, not a crash" {
+    var result = try runSource(testing.allocator, "func f(n):\n    return f(n) + 1\n\nfunc main():\n    print(f(0))");
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "call stack overflow") != null);
+}
+
+test "vm: legitimately deep recursion still runs" {
+    const src =
+        \\func down(n: int) -> int:
+        \\    if n == 0:
+        \\        return 0
+        \\    return down(n - 1) + 1
+        \\
+        \\func main():
+        \\    print(down(700))
+    ;
+    try expectVMOutput(src, "700\n");
 }
 
 test "vm: runtime error surfaces" {
