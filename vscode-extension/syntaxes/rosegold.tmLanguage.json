@@ -59,7 +59,7 @@
       "patterns": [
         {
           "name": "keyword.control.rosegold",
-          "match": "\\b(if|elif|else|while|for|in|break|continue|return|pass|match|raise|try|catch)\\b"
+          "match": "\\b(if|elif|else|while|for|in|break|continue|return|pass|match|raise|try|catch|await)\\b"
         },
         {
           "name": "keyword.operator.logical.rosegold",
@@ -71,7 +71,7 @@
         },
         {
           "name": "storage.modifier.rosegold",
-          "match": "\\b(pub|private|static|extends|uses)\\b"
+          "match": "\\b(pub|private|static|extends|uses|async)\\b"
         }
       ]
     },
@@ -87,7 +87,7 @@
       "patterns": [
         {
           "name": "support.type.rosegold",
-          "match": "\\b(int|float|str|bool|void|any|list|map)\\b"
+          "match": "\\b(int|float|str|bool|void|any|list|map|task)\\b"
         }
       ]
     },

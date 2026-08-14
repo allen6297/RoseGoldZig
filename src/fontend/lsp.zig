@@ -681,6 +681,7 @@ const BUILTINS = [_]BuiltinDoc{
         .{ .n = "floor", .d = "floor(x) → int." },
         .{ .n = "ceil", .d = "ceil(x) → int." },
         .{ .n = "round", .d = "round(x) → int." },
+        .{ .n = "gather", .d = "gather(list<task<T>>) → list<T> — await every task, in order." },
 };
 
 /// Keywords offered by completion (declarations, control flow, modifiers, literals).
@@ -689,10 +690,10 @@ const KEYWORDS = [_][]const u8{
     "pub",    "private", "static", "extends", "uses",   "if",    "elif",  "else",
     "while",  "for",    "in",     "break",    "continue", "return", "pass", "match",
     "raise",  "try",    "catch",  "and",      "or",     "not",   "true",  "false",
-    "nil",
+    "nil",    "async",  "await",
 };
 
-const TYPES = [_][]const u8{ "int", "float", "str", "bool", "void", "any", "list", "map" };
+const TYPES = [_][]const u8{ "int", "float", "str", "bool", "void", "any", "list", "map", "task" };
 
 /// Parameter names for the stdlib builtins, for signature help.
 const BuiltinSig = struct { n: []const u8, params: []const []const u8 };

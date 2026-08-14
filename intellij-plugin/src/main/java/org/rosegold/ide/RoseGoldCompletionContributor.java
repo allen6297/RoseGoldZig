@@ -15,8 +15,9 @@ public final class RoseGoldCompletionContributor extends CompletionContributor {
             "import", "class", "struct", "extends", "uses", "func", "var", "const",
             "enum", "if", "elif", "else", "match", "for", "in", "while", "break",
             "continue", "return", "pass", "nil", "pub", "private", "static", "true",
-            "false", "and", "or", "not", "signal", "try", "catch", "raise",
-            "int", "float", "str", "bool", "void", "any", "list", "map",
+            "false", "and", "or", "not", "signal", "try", "catch", "raise", "async",
+            "await",
+            "int", "float", "str", "bool", "void", "any", "list", "map", "task",
     };
 
     private static final String[] BUILTINS = {
@@ -24,7 +25,7 @@ public final class RoseGoldCompletionContributor extends CompletionContributor {
             "keys", "values", "has", "connect", "emit", "abs", "min", "max", "upper",
             "lower", "split", "join", "contains", "sort", "reverse", "trim",
             "starts_with", "ends_with", "find", "replace", "map", "filter", "reduce",
-            "sqrt", "pow", "floor", "ceil", "round",
+            "sqrt", "pow", "floor", "ceil", "round", "gather",
     };
 
     public RoseGoldCompletionContributor() {

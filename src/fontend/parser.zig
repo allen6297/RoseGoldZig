@@ -105,6 +105,7 @@ pub const Expr = union(enum) {
     comprehension: *const Comprehension,
     map_comprehension: *const MapComprehension,
     conditional: *const Conditional,
+    await_expr: *const Await,
 
     pub const Literal = struct { text: []const u8, span: Span };
     /// `[output for binding[, value_binding] in iter [if cond]]` — builds a list.
@@ -131,6 +132,8 @@ pub const Expr = union(enum) {
     pub const Range = struct { start: *Expr, end: *Expr, span: Span };
     /// `then_val if cond else else_val` — a conditional (ternary) expression.
     pub const Conditional = struct { cond: *Expr, then_val: *Expr, else_val: *Expr, span: Span };
+    /// `await expr` — resolve a `Task` to its value (a no-op on a non-task).
+    pub const Await = struct { operand: *Expr, span: Span };
     pub const Bool = struct { value: bool, span: Span };
     pub const Ident = struct { name: []const u8, span: Span };
     pub const Unary = struct { op: UnaryOp, operand: *Expr, span: Span };
@@ -261,6 +264,8 @@ pub const Decl = union(enum) {
     pub const Func = struct {
         visibility: Visibility,
         is_static: bool,
+        /// `async func`: calling it yields a `Task` that runs when awaited.
+        is_async: bool = false,
         name: []const u8,
         params: []const Param,
         return_type: ?TypeRef,
@@ -326,6 +331,7 @@ pub fn exprSpan(e: Expr) Span {
         .comprehension => |c| c.span,
         .map_comprehension => |c| c.span,
         .conditional => |c| c.span,
+        .await_expr => |a| a.span,
     };
 }
 
@@ -549,10 +555,15 @@ const Parser = struct {
     fn parseDecl(self: *Parser) Error!Decl {
         const visibility = self.parseVisibility();
         const is_static = self.eat(.kw_static);
+        const is_async = self.eat(.kw_async);
+        if (is_async and !self.at(.kw_func)) {
+            try self.err("'async' can only be applied to a function");
+            return error.ParseError;
+        }
         switch (self.peekKind()) {
             .kw_import => return .{ .import = try self.parseImport() },
             .kw_const, .kw_var => return .{ .var_decl = try self.parseVarDecl(visibility, is_static) },
-            .kw_func => return .{ .func = try self.parseFunc(visibility, is_static) },
+            .kw_func => return .{ .func = try self.parseFunc(visibility, is_static, is_async) },
             .kw_class => return .{ .class = try self.parseClass(visibility) },
             .kw_struct => return .{ .struct_decl = try self.parseStruct(visibility) },
             .kw_enum => return .{ .enum_decl = try self.parseEnum(visibility) },
@@ -702,7 +713,7 @@ const Parser = struct {
         return params.toOwnedSlice(self.alloc);
     }
 
-    fn parseFunc(self: *Parser, visibility: Visibility, is_static: bool) Error!Decl.Func {
+    fn parseFunc(self: *Parser, visibility: Visibility, is_static: bool, is_async: bool) Error!Decl.Func {
         const kw = try self.expect(.kw_func, "expected 'func'");
         const name = try self.expect(.identifier, "expected a function name");
         const params = try self.parseParamList();
@@ -712,6 +723,7 @@ const Parser = struct {
         return .{
             .visibility = visibility,
             .is_static = is_static,
+            .is_async = is_async,
             .name = name.text,
             .params = params,
             .return_type = return_type,
@@ -1189,6 +1201,14 @@ const Parser = struct {
     }
 
     fn parseUnary(self: *Parser) Error!*Expr {
+        // `await expr` binds like a prefix operator (tighter than binary ops).
+        if (self.at(.kw_await)) {
+            const op = self.advance();
+            const operand = try self.parseUnary();
+            const a = try self.alloc.create(Expr.Await);
+            a.* = .{ .operand = operand, .span = joinSpan(op.span, exprSpan(operand.*)) };
+            return self.mkExpr(.{ .await_expr = a });
+        }
         if (self.at(.minus) or self.at(.tilde)) {
             const op = self.advance();
             const operand = try self.parseUnary();

@@ -47,7 +47,8 @@ public final class RoseGoldDocumentationProvider extends AbstractDocumentationPr
             Map.entry("pow", "pow(base, exp) → float — base raised to exp."),
             Map.entry("floor", "floor(x) → int — round toward -∞."),
             Map.entry("ceil", "ceil(x) → int — round toward +∞."),
-            Map.entry("round", "round(x) → int — round half away from zero."));
+            Map.entry("round", "round(x) → int — round half away from zero."),
+            Map.entry("gather", "gather(list<task<T>>) → list<T> — await every task, in order."));
 
     @Override
     public @Nullable PsiElement getCustomDocumentationElement(@Nullable Editor editor,

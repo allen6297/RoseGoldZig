@@ -195,6 +195,7 @@ const Formatter = struct {
         try self.pad();
         try self.w(visPrefix(f.visibility));
         if (f.is_static) try self.w("static ");
+        if (f.is_async) try self.w("async ");
         try self.w("func ");
         try self.w(f.name);
         try self.params(f.params);
@@ -511,6 +512,10 @@ const Formatter = struct {
                 try self.w(" else ");
                 try self.expr(c.else_val.*);
             },
+            .await_expr => |aw| {
+                try self.w("await ");
+                try self.operand(aw.operand.*);
+            },
             .comprehension => |c| {
                 try self.w("[");
                 try self.expr(c.output.*);
@@ -696,6 +701,13 @@ test "formats named call arguments" {
     const out = try fmt(gpa, "func main():\n    print(f(1, y : 2, z:3))");
     defer gpa.free(out);
     try testing.expectEqualStrings("func main():\n    print(f(1, y: 2, z: 3))\n", out);
+}
+
+test "formats async functions and await expressions" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "async  func  work(n:int)->int:\n    return n\nfunc main():\n    print( await   work(1) )");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("async func work(n: int) -> int:\n    return n\n\nfunc main():\n    print(await work(1))\n", out);
 }
 
 test "formats slices in all four forms" {

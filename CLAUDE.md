@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (371 as of writing)
+zig build test                  # run every test (386 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -59,7 +59,7 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/fontend/tests.zig` | Test aggregator; the `zig build test` frontend target roots here. |
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
 | `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. |
-| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, `defaults.rg`, and `features.rg` (bitwise/slicing/named-args/comprehensions — run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
+| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, `defaults.rg`, `features.rg` (bitwise/slicing/named-args/comprehensions), and `async.rg` (async/await/gather — all run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
 
 Each layer imports the ones below it (`interpreter`/`analyzer` → `parser` → `lexer`,
 and `loader`/`formatter` → `parser`); there are no upward dependencies. `main.zig`
@@ -110,6 +110,7 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `c` as a module namespace — see **Modules** below), `const`/`var`
   (optional `: type`), `func name(p: T, q, r = expr) -> R:` (params may be untyped →
   `any`, and may carry a trailing **default value** `= expr`; see **Default parameters**),
+  `async func` (returns a `task<R>` instead of `R`; see **Async/await**),
   `class` (with `extends` / `uses`), `struct` (no inheritance), `enum { A, B = 2 }`,
   `signal name(params)`. `pub`/`private` visibility; `static` on a class/struct
   member makes it belong to the type (shared storage / no receiver), reached via
@@ -146,15 +147,18 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `(a, b, ...)` (two or more
   elements; a single `(e)` is just grouping), anonymous functions `func(params): expr`
   (single expression, implicitly returned; or `func(params):` + an indented block)
-  that close over the surrounding scope, and `match subj { pattern: body, ... }`
+  that close over the surrounding scope, `await expr` (a unary prefix binding tighter
+  than binary ops; resolves a `task<T>` to its `T` — see **Async/await**), and
+  `match subj { pattern: body, ... }`
   (patterns: literals, `_`, a binding name, or an enum case `Enum.CASE` — covering
   every case is exhaustive without a `_`).
 - **Types:** `int`, `float`, `str`, `bool`, `void`, `any`, `list`/`map` (optionally
   with element types — `list<T>`, `map<K, V>`, nestable; a bare `list`/`map` is
   `list<any>`/`map<any, any>`), tuples `(A, B, ...)` (fixed, ordered, compared
   elementwise; used for multiple return values), plus user classes/structs/enums, an
-  imported type named `mod.T`, and optionals `?T` (hold `T` or `nil`). `int` widens to
-  `float`.
+  imported type named `mod.T`, optionals `?T` (hold `T` or `nil`), and `task<T>` (the
+  result of an `async func` call, unwrapped to `T` by `await` — see **Async/await**).
+  `int` widens to `float`.
   A subclass is assignable to its bases (via `extends`/`uses`, transitively). `nil` and a
   value both fit `?T`; a `?T` must be unwrapped (e.g. narrowed via `if v != nil:`) before
   it's usable as `T`. `?T`-returning functions may fall off the end (yielding `nil`).
@@ -196,7 +200,28 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   (index of substring/element, `-1` if absent), `replace`, the math builtins
   `sqrt`/`pow` (→ `float`) and `floor`/`ceil`/`round` (→ `int`), and the
   higher-order list builtins `map(list, f)`, `filter(list, pred)`,
-  `reduce(list, f, init)` (each invokes a callback — any callable).
+  `reduce(list, f, init)` (each invokes a callback — any callable), and `gather(list)`
+  (awaits every `task` in a list, returning their results in order — see **Async/await**).
+
+### Async/await
+- **Deterministic tasks, not real concurrency.** An `async func` call doesn't run the
+  body — it returns a `task<T>`. `await task` runs that body **once** (to completion,
+  synchronously) and **memoizes** the result, so awaiting the same task again is free.
+  This is a cooperative, fully-deterministic model (no real parallelism, no mid-stack
+  suspension), which is what lets it be **byte-identical on both backends** — Zig 0.16
+  has no language-level async, so the tree-walker can't suspend mid-expression anyway.
+- `gather([t1, t2, …])` awaits each task in order and returns a `list` of their results
+  (non-task elements pass through unchanged). Errors `raise`d inside an async body
+  propagate out through the `await` (or `gather`) that forces it, so a `try/catch` around
+  the await catches them — same as any call.
+- **Interpreter:** `callValue` sees an async callee (`FuncValue`/`bound_method`/
+  `static_method` with `is_async`) and returns a `Value.task` capturing callee+args;
+  `forceTask` runs it (bypassing the async check) and memoizes into the `Task`.
+- **VM:** async funcs carry `Function.is_async`; `call`/`callKw` build a `Value.task`
+  via `spawnTask` instead of pushing a frame, unless a `forcing` flag is set. The
+  `await_task` opcode pops a value and — if it's a task — runs `forceTask` (which sets
+  `forcing`, consumed by the awaited call so *nested* async calls still defer) and pushes
+  the memoized result; a non-task passes through. `gather` mirrors the interpreter.
 
 ### Error handling
 - `raise expr` throws a value; `try: body catch e: handler` runs `body` and, on a raised
@@ -413,7 +438,10 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   builtins `connect`/`emit`, whose callbacks/handlers run via a **re-entrant**
   `execFrames(stop_at)` (a builtin pushes the callback frame and runs just that call to
   completion). Optionals
-  (`?T`/`nil`) need no special runtime support and already work. `match` on
+  (`?T`/`nil`) need no special runtime support and already work. **Async/await**
+  compiles too (see **Async/await**): an `async func` builds a `Value.task` on call
+  instead of running, an `await_task` opcode forces + memoizes it, and `gather` awaits a
+  list — deterministic, so byte-identical to the tree-walker. `match` on
   literal/`_`/binding patterns compiles too (the subject lives in a slot found via a
   compile-time stack pointer, `FnState.stack_top`). Enums compile too: the enum name
   binds to an `enum_type` value, `Enum.CASE` reads a case via `get_member`, cases compare

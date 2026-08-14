@@ -63,6 +63,7 @@ const Builtin = enum {
     trim,    starts_with, ends_with, find, replace,
     map,     filter, reduce,
     sqrt,    pow,    floor,  ceil,  round,
+    gather,
 };
 
 /// The names bound to each builtin. Shared with the analyzer (see analyzer.zig)
@@ -75,6 +76,7 @@ pub const builtin_names = [_][]const u8{
     "trim",     "starts_with", "ends_with", "find", "replace",
     "map",      "filter", "reduce",
     "sqrt",     "pow",  "floor",   "ceil",   "round",
+    "gather",
 };
 
 /// A field declared on a class/struct, with its default-value expression.
@@ -182,7 +184,29 @@ pub const Value = union(enum) {
     tuple: *List,
     /// An imported module, reached by its bound name; members are its globals.
     module: *Env,
+    /// A pending `async` call: awaiting it runs the body (once) and memoizes.
+    task: *Task,
 };
+
+/// The deferred result of an `async` call. Holds the callee value and the
+/// already-evaluated arguments; `await` runs the body (once) and caches it.
+const Task = struct {
+    callee: Value,
+    args: []const Value,
+    done: bool = false,
+    result: Value = .nil,
+};
+
+/// Whether calling this value should defer into a `Task` (an `async` function,
+/// method, or static method).
+fn isAsyncCallee(callee: Value) bool {
+    return switch (callee) {
+        .func => |f| f.decl.is_async,
+        .bound_method => |bm| bm.func.is_async,
+        .static_method => |sm| sm.func.is_async,
+        else => false,
+    };
+}
 
 /// The parameter list of a callable value (for named-argument reordering), or
 /// null for a builtin / non-callable (which take positional args only).
@@ -274,6 +298,7 @@ fn valuesEqual(a: Value, b: Value) bool {
             break :blk true;
         },
         .module => |x| b == .module and x == b.module,
+        .task => |x| b == .task and x == b.task,
     };
 }
 
@@ -1573,6 +1598,15 @@ const Interpreter = struct {
                 const x = toFloat(args[0]) orelse return self.fail(span, "round expects a number", .{});
                 return .{ .int = @intFromFloat(@round(x)) };
             },
+            .gather => {
+                if (args.len != 1 or args[0] != .list) return self.fail(span, "gather expects a list of tasks", .{});
+                const out = try self.arena.create(List);
+                out.* = .empty;
+                for (args[0].list.items) |item| {
+                    try out.append(self.arena, if (item == .task) try self.forceTask(item.task, span) else item);
+                }
+                return .{ .list = out };
+            },
         }
     }
 
@@ -1593,6 +1627,13 @@ const Interpreter = struct {
             .slice => |s| try self.evalSlice(s),
             .comprehension => |c| try self.evalComprehension(c),
             .map_comprehension => |c| try self.evalMapComprehension(c),
+            .await_expr => |aw| blk: {
+                const v = try self.eval(aw.operand.*);
+                break :blk switch (v) {
+                    .task => |t| try self.forceTask(t, aw.span),
+                    else => v, // awaiting a non-task is a no-op
+                };
+            },
             .conditional => |c| if (isTruthy(try self.eval(c.cond.*)))
                 try self.eval(c.then_val.*)
             else
@@ -1720,6 +1761,25 @@ const Interpreter = struct {
         };
     }
 
+    /// Resolve a task: run its body once (bypassing the async deferral) and cache
+    /// the result. Re-awaiting returns the cached value.
+    fn forceTask(self: *Interpreter, t: *Task, span: Span) Error!Value {
+        if (t.done) return t.result;
+        const v = try self.callTaskBody(t, span);
+        t.result = v;
+        t.done = true;
+        return v;
+    }
+
+    fn callTaskBody(self: *Interpreter, t: *Task, span: Span) Error!Value {
+        return switch (t.callee) {
+            .func => |f| self.callFunction(f, t.args, span),
+            .bound_method => |bm| self.callMethod(bm.func, bm.owner, bm.receiver, t.args, span),
+            .static_method => |sm| self.callStaticMethod(sm, t.args, span),
+            else => self.fail(span, "cannot resolve this task", .{}),
+        };
+    }
+
     fn evalOrder(self: *Interpreter, op: BinaryOp, l: Value, r: Value, span: Span) Error!Value {
         if (l == .str and r == .str) {
             const c = std.mem.order(u8, l.str, r.str);
@@ -1826,6 +1886,13 @@ const Interpreter = struct {
     /// Call any callable value with already-evaluated arguments. Shared by
     /// `evalCall` and signal emission.
     fn callValue(self: *Interpreter, callee: Value, args: []const Value, span: Span) Error!Value {
+        // Calling an `async` function doesn't run it — it yields a Task that runs
+        // (once) when awaited. `forceTask` bypasses this by calling the body directly.
+        if (isAsyncCallee(callee)) {
+            const t = try self.arena.create(Task);
+            t.* = .{ .callee = callee, .args = try self.arena.dupe(Value, args) };
+            return .{ .task = t };
+        }
         return switch (callee) {
             .func => |f| try self.callFunction(f, args, span),
             .builtin => |b| try self.callBuiltin(b, args, span),
@@ -2146,6 +2213,7 @@ const Interpreter = struct {
             },
             .func, .builtin, .bound_method, .static_method, .closure => try buf.appendSlice(self.arena, "<function>"),
             .module => try buf.appendSlice(self.arena, "<module>"),
+            .task => try buf.appendSlice(self.arena, "<task>"),
             .signal => |s| {
                 try buf.appendSlice(self.arena, "<signal ");
                 try buf.appendSlice(self.arena, s.name);
@@ -3343,6 +3411,35 @@ test "a class inherits from an imported base" {
         "pub const KIND: str = \"shape\"\n\npub class Shape:\n    var name: str = \"?\"\n\n    func label() -> str:\n        return name + \" (\" + KIND + \")\"",
         "import shapes\n\nclass Circle extends shapes.Shape:\n    var radius: int = 0\n\nfunc main():\n    var c: Circle = Circle()\n    c.name = \"circle\"\n    print(c.label())",
         "circle (shape)\n",
+    );
+}
+
+test "an async function returns a task that await resolves" {
+    try expectOutput(
+        "async func double(n: int) -> int:\n    return n * 2\nfunc main():\n    var t = double(21)\n    print(await t)",
+        "42\n",
+    );
+}
+
+test "awaiting a task twice returns the memoized result" {
+    // The body runs once; a print inside proves it isn't re-run on the 2nd await.
+    try expectOutput(
+        "var runs = 0\nasync func step() -> int:\n    runs = runs + 1\n    return runs\nfunc main():\n    var t = step()\n    print(await t)\n    print(await t)\n    print(runs)",
+        "1\n1\n1\n",
+    );
+}
+
+test "gather awaits a list of tasks in order" {
+    try expectOutput(
+        "async func double(n: int) -> int:\n    return n * 2\nfunc main():\n    print(gather([double(1), double(2), double(3)]))",
+        "[2, 4, 6]\n",
+    );
+}
+
+test "an error raised in an async body propagates through await" {
+    try expectOutput(
+        "async func boom() -> int:\n    raise \"kaboom\"\n    return 0\nfunc main():\n    try:\n        print(await boom())\n    catch e:\n        print(\"caught: \" + e)",
+        "caught: kaboom\n",
     );
 }
 

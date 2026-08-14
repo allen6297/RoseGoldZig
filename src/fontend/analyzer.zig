@@ -60,11 +60,19 @@ const FuncSig = struct {
     required: usize = 0,
     /// Parameter names, parallel to `params` (for named-argument calls).
     param_names: []const []const u8 = &.{},
+    /// An `async` function: a call yields `task<ret>` rather than `ret`.
+    is_async: bool = false,
 };
 
 /// An optional type `?T`, carrying the wrapped type and a pre-formatted name
 /// (so `typeName` stays allocation-free).
 const Optional = struct {
+    inner: Type,
+    name: []const u8,
+};
+
+/// A `task<T>` — the deferred result of an `async` call, resolved by `await`.
+const TaskType = struct {
     inner: Type,
     name: []const u8,
 };
@@ -118,6 +126,8 @@ const Type = union(enum) {
     nil,
     /// An optional type `?T`.
     optional: *const Optional,
+    /// A `task<T>`: the result of an `async` call, unwrapped by `await`.
+    task: *const TaskType,
     /// An imported module; its exported members are looked up by `.`.
     module: *const ModuleExports,
 };
@@ -178,6 +188,7 @@ fn typeName(t: Type) []const u8 {
         .type_ref => |n| n,
         .nil => "nil",
         .optional => |o| o.name,
+        .task => |tk| tk.name,
         .module => "module",
     };
 }
@@ -210,7 +221,7 @@ fn opSymbol(op: BinaryOp) []const u8 {
     };
 }
 
-const builtin_types = [_][]const u8{ "int", "float", "str", "bool", "void", "any", "list", "map" };
+const builtin_types = [_][]const u8{ "int", "float", "str", "bool", "void", "any", "list", "map", "task" };
 
 fn isBuiltinType(name: []const u8) bool {
     for (builtin_types) |t| {
@@ -551,11 +562,13 @@ const Analyzer = struct {
             }
             return;
         }
-        // Type arguments only apply to `list`/`map`; validate arity and recurse.
+        // Type arguments only apply to `list`/`map`/`task`; validate arity + recurse.
         if (std.mem.eql(u8, t.name, "list")) {
             if (t.args.len > 1) try self.report(t.span, "list takes at most one type argument", .{});
         } else if (std.mem.eql(u8, t.name, "map")) {
             if (t.args.len != 0 and t.args.len != 2) try self.report(t.span, "map takes two type arguments (map<K, V>)", .{});
+        } else if (std.mem.eql(u8, t.name, "task")) {
+            if (t.args.len > 1) try self.report(t.span, "task takes at most one type argument", .{});
         } else if (t.args.len > 0) {
             try self.report(t.span, "'{s}' does not take type arguments", .{t.name});
         }
@@ -602,6 +615,10 @@ const Analyzer = struct {
             const value: Type = if (t.args.len >= 2) try self.annotationType(t.args[1]) else .any;
             return self.makeMap(key, value);
         }
+        if (std.mem.eql(u8, n, "task")) {
+            const inner: Type = if (t.args.len >= 1) try self.annotationType(t.args[0]) else .any;
+            return self.makeTask(inner);
+        }
         if (self.module_scope.symbols.get(n)) |sym| {
             if (isUserType(sym.kind)) return .{ .named = n };
         }
@@ -629,7 +646,7 @@ const Analyzer = struct {
         }
         const ret: Type = if (f.return_type) |rt| try self.annotationType(rt) else .any;
         const sig = try self.arena.create(FuncSig);
-        sig.* = .{ .params = params, .ret = ret, .required = requiredParamCount(f.params), .param_names = names };
+        sig.* = .{ .params = params, .ret = ret, .required = requiredParamCount(f.params), .param_names = names, .is_async = f.is_async };
         return sig;
     }
 
@@ -694,6 +711,7 @@ const Analyzer = struct {
             },
             .func => tagOf(to) == .func,
             .named => |n| tagOf(to) == .named and self.isSubtype(n, to.named),
+            .task => |tk| tagOf(to) == .task and self.assignable(tk.inner, to.task.inner),
             .any, .unknown, .enum_ref, .type_ref => true,
             .nil, .optional => false, // needs an optional target / must be unwrapped
             .module => tagOf(to) == .module, // modules aren't really values
@@ -708,6 +726,12 @@ const Analyzer = struct {
         const opt = try self.arena.create(Optional);
         opt.* = .{ .inner = inner, .name = try std.fmt.allocPrint(self.arena, "?{s}", .{typeName(inner)}) };
         return .{ .optional = opt };
+    }
+
+    fn makeTask(self: *Analyzer, inner: Type) Error!Type {
+        const tk = try self.arena.create(TaskType);
+        tk.* = .{ .inner = inner, .name = try std.fmt.allocPrint(self.arena, "task<{s}>", .{typeName(inner)}) };
+        return .{ .task = tk };
     }
 
     fn makeList(self: *Analyzer, elem: Type) Error!Type {
@@ -1423,6 +1447,15 @@ const Analyzer = struct {
             .comprehension => |c| try self.typeComprehension(c),
             .map_comprehension => |c| try self.typeMapComprehension(c),
             .conditional => |c| try self.typeConditional(c),
+            .await_expr => |aw| blk: {
+                const ot = try self.typeOf(aw.operand.*);
+                // `await task<T>` → T; awaiting a non-task is a no-op (its own type).
+                break :blk switch (ot) {
+                    .task => |tk| tk.inner,
+                    .any, .unknown => .unknown,
+                    else => ot,
+                };
+            },
             .member => |m| blk: {
                 const ot = try self.typeOf(m.object.*);
                 break :blk try self.memberType(ot, m.name, m.span);
@@ -1673,7 +1706,8 @@ const Analyzer = struct {
         switch (ct) {
             .func => |sig| {
                 try self.checkArgs(c, sig.params, sig.param_names, sig.required);
-                return sig.ret;
+                // Calling an `async` function yields a `task<ret>`, resolved by `await`.
+                return if (sig.is_async) try self.makeTask(sig.ret) else sig.ret;
             },
             .any, .unknown => {
                 for (c.args) |arg| _ = try self.typeOf(arg.value.*);
@@ -3701,4 +3735,31 @@ test "a duplicate signal name is reported" {
     var analysis = try analyzeSource(testing.allocator, "signal ping\nsignal ping");
     defer analysis.deinit();
     try expectMessageContains(analysis, "already declared");
+}
+
+test "calling an async function yields a task, and await unwraps it" {
+    const src =
+        \\async func work(n: int) -> int:
+        \\    return n + 1
+        \\func main():
+        \\    var t: task<int> = work(1)
+        \\    var r: int = await t
+        \\    print(r)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "assigning an async result to the inner type without await is a type error" {
+    const src =
+        \\async func work(n: int) -> int:
+        \\    return n + 1
+        \\func main():
+        \\    var r: int = work(1)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    // work(1) is a task<int>, not an int, until awaited.
+    try expectMessageContains(analysis, "task<int>");
 }

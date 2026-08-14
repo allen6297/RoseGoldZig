@@ -39,6 +39,7 @@ const Builtin = enum {
     map,     filter, reduce,
     connect, emit,
     sqrt,    pow,    floor,  ceil,  round,
+    gather,
 };
 
 const builtin_names = [_][]const u8{
@@ -48,6 +49,7 @@ const builtin_names = [_][]const u8{
     "map",   "filter", "reduce",
     "connect", "emit",
     "sqrt",  "pow",  "floor", "ceil", "round",
+    "gather",
 };
 
 /// A compile-time upvalue descriptor: `is_local` captures local slot `index` of
@@ -73,6 +75,8 @@ const Function = struct {
     defaults: []const ?Value = &.{},
     /// Parameter names (for named-argument calls); empty if unused.
     param_names: []const []const u8 = &.{},
+    /// An `async` function: calling it yields a `Task` (run when awaited).
+    is_async: bool = false,
 };
 
 /// A module's runtime namespace: its own top-level bindings (functions, types,
@@ -158,6 +162,17 @@ const Value = union(enum) {
     signal: *Signal,
     /// A tuple `(a, b, ...)` — a fixed, ordered group; compared elementwise.
     tuple: *List,
+    /// A pending `async` call; awaiting it runs the body (once) and memoizes.
+    task: *Task,
+};
+
+/// The deferred result of an `async` call: the callee (a closure or bound
+/// method) and its arguments, plus a memoized result once resolved.
+const Task = struct {
+    callee: Value,
+    args: []const Value,
+    done: bool = false,
+    result: Value = .nil,
 };
 
 fn bitOpSymbol(op: Op) []const u8 {
@@ -227,6 +242,7 @@ fn valuesEqual(a: Value, b: Value) bool {
             std.mem.eql(u8, x.member, b.enum_value.member),
         .module => |x| b == .module and x == b.module,
         .signal => |x| b == .signal and x == b.signal,
+        .task => |x| b == .task and x == b.task,
         .tuple => |x| b == .tuple and blk: {
             if (x.items.len != b.tuple.items.len) break :blk false;
             for (x.items, b.tuple.items) |ea, eb| {
@@ -288,6 +304,7 @@ const Op = enum(u8) {
     raise, // pop a value and throw it, unwinding to the nearest handler
     call, // u8 argc
     call_kw, // u8 argc, u16 index into chunk.kw_argnames
+    await_task, // pop a value; if a Task, run it (once) and push its result
     ret,
     build_list, // u16 count
     list_append, // pop value, pop list, append value to list (for comprehensions)
@@ -847,6 +864,7 @@ const Compiler = struct {
     fn compileMethod(self: *Compiler, t: *TypeDef, f: Decl.Func) Error!*Function {
         _ = t;
         const func = try self.makeFunction(f.name, f.params.len);
+        func.is_async = f.is_async;
         try self.attachDefaults(func, f.params);
         var fs = FnState{ .func = func, .enclosing = null };
         const saved = self.cur;
@@ -985,6 +1003,7 @@ const Compiler = struct {
 
     fn compileFunction(self: *Compiler, f: Decl.Func, enclosing: ?*FnState) Error!*Function {
         const func = try self.makeFunction(f.name, f.params.len);
+        func.is_async = f.is_async;
         try self.attachDefaults(func, f.params);
 
         var fs = FnState{ .func = func, .enclosing = enclosing };
@@ -1476,6 +1495,10 @@ const Compiler = struct {
             .match => |m| try self.compileMatch(m),
             .comprehension => |c| try self.compileComprehension(c),
             .map_comprehension => |c| try self.compileMapComprehension(c),
+            .await_expr => |aw| {
+                try self.expr(aw.operand.*);
+                try self.emit(.await_task, aw.span);
+            },
             .conditional => |c| {
                 // `then if cond else else_val` — jump-based; each branch runs with
                 // the condition already popped, so both compile at `before`.
@@ -1881,6 +1904,9 @@ const VM = struct {
     /// Per-site inline cache of resolved global pointers (see `get_global`). Valid
     /// because a site always runs in its own module and the map never rehashes.
     global_cache: []?*Value = &.{},
+    /// While forcing a Task's body, an async call runs its body instead of
+    /// re-wrapping it in another Task (see `call`/`callKw` and `forceTask`).
+    forcing: bool = false,
     runtime_error: ?RuntimeError = null,
 
     fn fail(self: *VM, comptime fmt: []const u8, args: anytype) VMError {
@@ -2100,6 +2126,10 @@ const VM = struct {
                     const names = chunk.kw_argnames.items[self.readU16(frame)];
                     try self.callKw(argc, names);
                     frame = &self.frames.items[self.frames.items.len - 1];
+                },
+                .await_task => {
+                    const v = self.pop();
+                    try self.push(if (v == .task) try self.forceTask(v.task) else v);
                 },
                 .ret => {
                     const result = self.pop();
@@ -2472,6 +2502,16 @@ const VM = struct {
 
     fn call(self: *VM, argc: usize) VMError!void {
         const callee = self.peek(argc);
+        // Calling an `async` function yields a Task instead of running the body —
+        // unless we're forcing one (an awaited call runs to completion now). The
+        // flag is consumed here so nested async calls in the body still defer.
+        if (isAsyncCallee(callee)) {
+            if (self.forcing) {
+                self.forcing = false;
+            } else {
+                return self.spawnTask(callee, argc);
+            }
+        }
         switch (callee) {
             .closure => |cl| {
                 const f = cl.func;
@@ -2506,6 +2546,39 @@ const VM = struct {
             },
             else => return self.fail("{s} is not callable", .{@tagName(callee)}),
         }
+    }
+
+    /// Is `callee` an `async` function value? (Calling one yields a Task.)
+    fn isAsyncCallee(callee: Value) bool {
+        return switch (callee) {
+            .closure => |cl| cl.func.is_async,
+            .bound_method => |bm| bm.func.is_async,
+            else => false,
+        };
+    }
+
+    /// Package a deferred `async` call: copy its args off the stack (dropping the
+    /// callee) and push a pending Task in their place.
+    fn spawnTask(self: *VM, callee: Value, argc: usize) VMError!void {
+        const base = self.stack.items.len - argc;
+        const args = try self.alloc.dupe(Value, self.stack.items[base..]);
+        self.stack.shrinkRetainingCapacity(base - 1); // drop args + callee
+        const t = try self.alloc.create(Task);
+        t.* = .{ .callee = callee, .args = args };
+        try self.push(.{ .task = t });
+    }
+
+    /// Resolve a Task: run its body once (with `forcing` set so the call doesn't
+    /// re-wrap) and memoize the result. Re-awaiting returns the cached value.
+    fn forceTask(self: *VM, t: *Task) VMError!Value {
+        if (t.done) return t.result;
+        self.forcing = true;
+        errdefer self.forcing = false;
+        const r = try self.callValueSync(t.callee, t.args);
+        self.forcing = false;
+        t.done = true;
+        t.result = r;
+        return r;
     }
 
     /// Invoke `callee` with `args` and run it to completion, returning its value.
@@ -2760,6 +2833,18 @@ const VM = struct {
                 const x = toFloat(args[0]) orelse return self.fail("round expects a number", .{});
                 return .{ .int = @intFromFloat(@round(x)) };
             },
+            .gather => {
+                if (args.len != 1 or args[0] != .list) return self.fail("gather expects a list of tasks", .{});
+                const src = args[0].list;
+                const out = try self.alloc.create(List);
+                out.* = .empty;
+                var i: usize = 0;
+                while (i < src.items.len) : (i += 1) {
+                    const item = src.items[i];
+                    try out.append(self.alloc, if (item == .task) try self.forceTask(item.task) else item);
+                }
+                return .{ .list = out };
+            },
         }
     }
 
@@ -2902,6 +2987,7 @@ const VM = struct {
             },
             .closure, .builtin, .bound_method => try buf.appendSlice(self.alloc, "<function>"),
             .module => try buf.appendSlice(self.alloc, "<module>"),
+            .task => try buf.appendSlice(self.alloc, "<task>"),
             .signal => |s| {
                 try buf.appendSlice(self.alloc, "<signal ");
                 try buf.appendSlice(self.alloc, s.name);
@@ -3926,4 +4012,39 @@ test "vm: runtime error surfaces" {
     defer result.deinit();
     try testing.expect(result.runtime_error != null);
     try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "division by zero") != null);
+}
+
+test "vm: an async function returns a task that await resolves" {
+    try expectVMOutput(
+        "async func double(n: int) -> int:\n    return n * 2\nfunc main():\n    var t = double(21)\n    print(await t)",
+        "42\n",
+    );
+}
+
+test "vm: awaiting a task twice runs the body once (memoized)" {
+    try expectVMOutput(
+        "var runs = 0\nasync func step() -> int:\n    runs = runs + 1\n    return runs\nfunc main():\n    var t = step()\n    print(await t)\n    print(await t)\n    print(runs)",
+        "1\n1\n1\n",
+    );
+}
+
+test "vm: nested awaits inside an async body" {
+    try expectVMOutput(
+        "async func double(n: int) -> int:\n    return n * 2\nasync func quad(n: int) -> int:\n    return await double(await double(n))\nfunc main():\n    print(await quad(3))",
+        "12\n",
+    );
+}
+
+test "vm: gather awaits a list of tasks in order" {
+    try expectVMOutput(
+        "async func double(n: int) -> int:\n    return n * 2\nfunc main():\n    print(gather([double(i) for i in 1..4]))",
+        "[2, 4, 6]\n",
+    );
+}
+
+test "vm: an error raised in an async body propagates through await" {
+    try expectVMOutput(
+        "async func boom() -> int:\n    raise \"kaboom\"\n    return 0\nfunc main():\n    try:\n        print(await boom())\n    catch e:\n        print(\"caught: \" + e)",
+        "caught: kaboom\n",
+    );
 }

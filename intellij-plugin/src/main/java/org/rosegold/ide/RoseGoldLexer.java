@@ -19,10 +19,11 @@ public final class RoseGoldLexer extends LexerBase {
             "import", "class", "struct", "extends", "uses", "func", "var", "const",
             "enum", "if", "elif", "else", "match", "for", "in", "while", "break",
             "continue", "return", "pass", "nil", "pub", "private", "static", "true",
-            "false", "and", "or", "not", "signal", "try", "catch", "raise");
+            "false", "and", "or", "not", "signal", "try", "catch", "raise", "async",
+            "await");
 
     private static final Set<String> TYPES = Set.of(
-            "int", "float", "str", "bool", "void", "any", "list", "map");
+            "int", "float", "str", "bool", "void", "any", "list", "map", "task");
 
     private CharSequence buffer = "";
     private int endOffset = 0;
