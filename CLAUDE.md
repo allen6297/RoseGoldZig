@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (341 as of writing)
+zig build test                  # run every test (342 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -313,7 +313,8 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   (`collectRefs` skips `##` comments and string text but includes identifiers inside `${…}`
   holes; honors `includeDeclaration`; name-based, not scope-aware), `documentHighlight` (the
   same-file cousin — `collectRefs` over just the current buffer, declarations marked Write
-  and other occurrences Read), and `rename` /
+  and other occurrences Read), `foldingRange` (`computeFoldingRanges`: indentation-based
+  colon-block bodies + runs of 2+ `##` comment lines), and `rename` /
   `prepareRename`: `prepareRename` returns the identifier's range + placeholder (rejecting
   keywords), and `rename` reuses the same workspace search to emit a `WorkspaceEdit`
   (`documentChanges`: one `TextDocumentEdit` per file replacing every occurrence with the

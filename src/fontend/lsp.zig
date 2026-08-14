@@ -33,6 +33,8 @@ const LspDiag = struct {
 const Location = struct { uri: []const u8, range: Range };
 /// `kind`: 1 = Text, 2 = Read, 3 = Write.
 const DocumentHighlight = struct { range: Range, kind: u32 };
+/// `kind`: "region" (a colon-block body) or "comment" (a run of `##` lines).
+const FoldingRange = struct { startLine: u32, endLine: u32, kind: []const u8 };
 
 // rename / workspace-edit wire types
 const TextEdit = struct { range: Range, newText: []const u8 };
@@ -184,6 +186,61 @@ fn scanDecls(alloc: std.mem.Allocator, text: []const u8) ![]Decl {
         });
     }
     return out.toOwnedSlice(alloc);
+}
+
+// --- folding -----------------------------------------------------------------
+
+const LineInfo = struct { indent: u32, blank: bool, colon: bool, comment: bool };
+
+/// Classify one source line for folding: its indent, whether it's blank, whether
+/// its code (past any trailing `## comment`) ends with `:`, and whether it's a
+/// whole-line comment.
+fn classifyLine(l: []const u8) LineInfo {
+    var i: usize = 0;
+    while (i < l.len and (l[i] == ' ' or l[i] == '\t')) i += 1;
+    const trimmed = l[i..];
+    const comment = std.mem.startsWith(u8, trimmed, "##");
+    const hash = std.mem.indexOf(u8, l, "##");
+    const code = std.mem.trimEnd(u8, if (hash) |h| l[0..h] else l, " \t");
+    return .{
+        .indent = @intCast(i),
+        .blank = trimmed.len == 0,
+        .colon = code.len > 0 and code[code.len - 1] == ':',
+        .comment = comment,
+    };
+}
+
+/// Folding ranges for a document: each colon-block body (header line through its
+/// last more-indented line, skipping trailing blanks) and each run of 2+
+/// consecutive whole-line comments.
+fn computeFoldingRanges(a: std.mem.Allocator, text: []const u8, out: *std.ArrayList(FoldingRange)) !void {
+    var lines: std.ArrayList(LineInfo) = .empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| try lines.append(a, classifyLine(std.mem.trimEnd(u8, raw, "\r")));
+    const n = lines.items.len;
+
+    // Colon-block bodies (by indentation).
+    for (lines.items, 0..) |hdr, i| {
+        if (hdr.blank or !hdr.colon) continue;
+        var last: usize = i;
+        var k = i + 1;
+        while (k < n) : (k += 1) {
+            if (lines.items[k].blank) continue;
+            if (lines.items[k].indent > hdr.indent) last = k else break;
+        }
+        if (last > i) try out.append(a, .{ .startLine = @intCast(i), .endLine = @intCast(last), .kind = "region" });
+    }
+
+    // Runs of consecutive whole-line comments.
+    var i: usize = 0;
+    while (i < n) {
+        if (lines.items[i].comment) {
+            var j = i;
+            while (j + 1 < n and lines.items[j + 1].comment) j += 1;
+            if (j > i) try out.append(a, .{ .startLine = @intCast(i), .endLine = @intCast(j), .kind = "comment" });
+            i = j + 1;
+        } else i += 1;
+    }
 }
 
 // --- position helpers --------------------------------------------------------
@@ -685,6 +742,8 @@ const Server = struct {
                 try self.onReferences(id.?, params);
             } else if (std.mem.eql(u8, method, "textDocument/documentHighlight")) {
                 try self.onDocumentHighlight(id.?, params);
+            } else if (std.mem.eql(u8, method, "textDocument/foldingRange")) {
+                try self.onFoldingRange(id.?, params);
             } else if (std.mem.eql(u8, method, "textDocument/prepareRename")) {
                 try self.onPrepareRename(id.?, params);
             } else if (std.mem.eql(u8, method, "textDocument/rename")) {
@@ -736,6 +795,7 @@ const Server = struct {
             documentSymbolProvider: bool,
             referencesProvider: bool,
             documentHighlightProvider: bool,
+            foldingRangeProvider: bool,
             completionProvider: struct { triggerCharacters: []const []const u8 },
             signatureHelpProvider: struct { triggerCharacters: []const []const u8 },
             renameProvider: struct { prepareProvider: bool },
@@ -750,6 +810,7 @@ const Server = struct {
                 .documentSymbolProvider = true,
                 .referencesProvider = true,
                 .documentHighlightProvider = true,
+                .foldingRangeProvider = true,
                 .completionProvider = .{ .triggerCharacters = &.{"."} },
                 .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
                 .renameProvider = .{ .prepareProvider = true },
@@ -1084,6 +1145,17 @@ const Server = struct {
             .activeParameter = active,
         };
         try self.respond(id, result);
+    }
+
+    fn onFoldingRange(self: *Server, id: std.json.Value, params: ?std.json.Value) !void {
+        const empty = &[_]FoldingRange{};
+        const uri = self.uriOf(params) orelse return self.respond(id, empty);
+        const text = self.docs.get(uri) orelse return self.respond(id, empty);
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        var out: std.ArrayList(FoldingRange) = .empty;
+        computeFoldingRanges(arena_state.allocator(), text, &out) catch return self.respond(id, empty);
+        try self.respond(id, out.items);
     }
 
     /// Highlight every occurrence of the identifier under the cursor within the
@@ -1569,6 +1641,34 @@ test "uriToPath strips file:// and percent-decodes" {
     try testing.expectEqualStrings("/a/My Code/app.rg", p2);
 
     try testing.expect(uriToPath(gpa, "untitled:Untitled-1") == null);
+}
+
+test "computeFoldingRanges folds colon blocks and comment runs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text =
+        "## a\n" ++ // 0  comment
+        "## b\n" ++ // 1  comment  → comment run 0..1
+        "func main():\n" ++ // 2  header
+        "    var x = 1\n" ++ // 3  body
+        "    if x:\n" ++ // 4  nested header
+        "        print(x)\n" ++ // 5  nested body
+        "\n" ++ // 6  blank
+        "    var y = 2\n"; // 7  still main's body
+    var out: std.ArrayList(FoldingRange) = .empty;
+    try computeFoldingRanges(a, text, &out);
+
+    var main_ok = false;
+    var if_ok = false;
+    var comment_ok = false;
+    for (out.items) |f| {
+        if (f.startLine == 2 and f.endLine == 7 and std.mem.eql(u8, f.kind, "region")) main_ok = true;
+        if (f.startLine == 4 and f.endLine == 5 and std.mem.eql(u8, f.kind, "region")) if_ok = true;
+        if (f.startLine == 0 and f.endLine == 1 and std.mem.eql(u8, f.kind, "comment")) comment_ok = true;
+    }
+    try testing.expect(main_ok and if_ok and comment_ok);
+    try testing.expectEqual(@as(usize, 3), out.items.len);
 }
 
 test "isValidIdent / isKeyword gate rename targets" {
