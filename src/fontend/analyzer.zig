@@ -77,6 +77,12 @@ const MapType = struct {
     name: []const u8,
 };
 
+/// A tuple `(A, B, ...)`, carrying its element types and a pre-formatted name.
+const TupleType = struct {
+    elems: []const Type,
+    name: []const u8,
+};
+
 /// An inferred type. `unknown` marks something we couldn't determine (usually
 /// downstream of another error) and `any` is an explicit escape hatch; both are
 /// compatible with everything so they suppress cascading diagnostics. Lists and
@@ -93,6 +99,8 @@ const Type = union(enum) {
     list: *const ListType,
     /// A `map<K, V>` (key/value types tracked).
     map: *const MapType,
+    /// A tuple `(A, B, ...)` (element types tracked).
+    tuple: *const TupleType,
     named: []const u8,
     func: *const FuncSig,
     /// A reference to an enum type itself (e.g. `Status` in `Status.OK`), as
@@ -149,6 +157,7 @@ fn typeName(t: Type) []const u8 {
         .void => "void",
         .list => |l| l.name,
         .map => |m| m.name,
+        .tuple => |tp| tp.name,
         .named => |n| n,
         .func => "function",
         .enum_ref => |n| n,
@@ -497,6 +506,11 @@ const Analyzer = struct {
 
     /// Report a reference to an unknown type in an annotation.
     fn checkType(self: *Analyzer, t: TypeRef) Error!void {
+        // A tuple `(A, B, ...)`: just validate each element type.
+        if (t.is_tuple) {
+            for (t.args) |a| try self.checkType(a);
+            return;
+        }
         // A `mod.T` qualifier: `mod` must be an imported module that exports the
         // type `T`.
         if (t.module) |mod_name| {
@@ -539,6 +553,11 @@ const Analyzer = struct {
     }
 
     fn annotationBase(self: *Analyzer, t: TypeRef) Error!Type {
+        if (t.is_tuple) {
+            const elems = try self.arena.alloc(Type, t.args.len);
+            for (t.args, 0..) |a, i| elems[i] = try self.annotationType(a);
+            return self.makeTuple(elems);
+        }
         // An imported type `mod.T` resolves to a `named` instance type; its member
         // scope is available if the module exported it (merged into user_types).
         if (t.module != null) return .{ .named = t.name };
@@ -626,6 +645,12 @@ const Analyzer = struct {
             .list => |l| tagOf(to) == .list and self.assignable(l.elem, to.list.elem),
             .map => |m| tagOf(to) == .map and
                 self.assignable(m.key, to.map.key) and self.assignable(m.value, to.map.value),
+            .tuple => |tp| tagOf(to) == .tuple and tp.elems.len == to.tuple.elems.len and blk: {
+                for (tp.elems, to.tuple.elems) |a, b| {
+                    if (!self.assignable(a, b)) break :blk false;
+                }
+                break :blk true;
+            },
             .func => tagOf(to) == .func,
             .named => |n| tagOf(to) == .named and self.isSubtype(n, to.named),
             .any, .unknown, .enum_ref, .type_ref => true,
@@ -658,6 +683,19 @@ const Analyzer = struct {
             .name = try std.fmt.allocPrint(self.arena, "map<{s}, {s}>", .{ typeName(key), typeName(value) }),
         };
         return .{ .map = mt };
+    }
+
+    fn makeTuple(self: *Analyzer, elems: []const Type) Error!Type {
+        var name: std.ArrayList(u8) = .empty;
+        try name.append(self.arena, '(');
+        for (elems, 0..) |e, i| {
+            if (i > 0) try name.appendSlice(self.arena, ", ");
+            try name.appendSlice(self.arena, typeName(e));
+        }
+        try name.append(self.arena, ')');
+        const tt = try self.arena.create(TupleType);
+        tt.* = .{ .elems = elems, .name = try name.toOwnedSlice(self.arena) };
+        return .{ .tuple = tt };
     }
 
     /// The least upper bound of two types, or null if they are incompatible. A
@@ -1174,6 +1212,22 @@ const Analyzer = struct {
                 const ty = try self.checkVarDecl(x);
                 try self.declareIn(self.current, x.name, if (x.is_const) .constant else .variable, ty, x.span);
             },
+            .destructure => |d| {
+                const vt = try self.typeOf(d.value.*);
+                const kind: SymbolKind = if (d.is_const) .constant else .variable;
+                if (tagOf(vt) == .tuple) {
+                    const elems = vt.tuple.elems;
+                    if (elems.len != d.names.len) {
+                        try self.report(d.span, "cannot destructure {d} value(s) into {d} name(s)", .{ elems.len, d.names.len });
+                    }
+                    for (d.names, 0..) |n, i| {
+                        try self.declareIn(self.current, n, kind, if (i < elems.len) elems[i] else .unknown, d.span);
+                    }
+                } else {
+                    if (!isAnyish(vt)) try self.report(parser.exprSpan(d.value.*), "cannot destructure a {s} (expected a tuple)", .{typeName(vt)});
+                    for (d.names) |n| try self.declareIn(self.current, n, kind, .unknown, d.span);
+                }
+            },
             .return_stmt => |x| try self.checkReturn(x),
             .if_stmt => |x| {
                 try self.checkCondition(x.cond);
@@ -1334,6 +1388,11 @@ const Analyzer = struct {
             },
             .match => |m| try self.typeMatch(m),
             .lambda => |lam| try self.typeLambda(lam),
+            .tuple => |t| blk: {
+                const elems = try self.arena.alloc(Type, t.elements.len);
+                for (t.elements, 0..) |el, i| elems[i] = try self.typeOf(el.*);
+                break :blk try self.makeTuple(elems);
+            },
         };
     }
 

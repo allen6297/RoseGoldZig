@@ -24,7 +24,7 @@ zig build run -- run --disasm FILE.rg  # print the compiled VM bytecode (don't r
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
-zig build test                  # run every test (302 as of writing)
+zig build test                  # run every test (305 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -115,7 +115,8 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `for i, x in iter:` — a second binding gives index+element for a list/string or
   key+value for a map), `break`, `continue`, `pass`, assignment (incl. compound
   `+= -= *= /= %=`, which
-  the parser desugars to `x = x <op> e`), expression statements. All statement
+  the parser desugars to `x = x <op> e`), tuple **destructuring** `var a, b = tuple`
+  (also destructures a list; arity is checked), expression statements. All statement
   blocks are colon-blocks (indentation); braces `{ }` are only for `enum`/`match`
   bodies.
 - **Expressions:** literals (incl. `nil`), string interpolation `"a ${expr} b"`
@@ -123,15 +124,18 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   literals inside a hole), identifiers, `and`/`or`/`not`,
   arithmetic/comparison with precedence, a range `a..b` (the ints `a` … `b-1`, as a
   `list<int>`), calls, indexing `a[i]`, member access `x.f`,
-  array `[...]` and map `{k: v}` literals, anonymous functions `func(params): expr`
+  array `[...]` and map `{k: v}` literals, tuple literals `(a, b, ...)` (two or more
+  elements; a single `(e)` is just grouping), anonymous functions `func(params): expr`
   (single expression, implicitly returned; or `func(params):` + an indented block)
   that close over the surrounding scope, and `match subj { pattern: body, ... }`
   (patterns: literals, `_`, a binding name, or an enum case `Enum.CASE` — covering
   every case is exhaustive without a `_`).
 - **Types:** `int`, `float`, `str`, `bool`, `void`, `any`, `list`/`map` (optionally
   with element types — `list<T>`, `map<K, V>`, nestable; a bare `list`/`map` is
-  `list<any>`/`map<any, any>`), plus user classes/structs/enums, an imported type
-  named `mod.T`, and optionals `?T` (hold `T` or `nil`). `int` widens to `float`.
+  `list<any>`/`map<any, any>`), tuples `(A, B, ...)` (fixed, ordered, compared
+  elementwise; used for multiple return values), plus user classes/structs/enums, an
+  imported type named `mod.T`, and optionals `?T` (hold `T` or `nil`). `int` widens to
+  `float`.
   A subclass is assignable to its bases (via `extends`/`uses`, transitively). `nil` and a
   value both fit `?T`; a `?T` must be unwrapped (e.g. narrowed via `if v != nil:`) before
   it's usable as `T`. `?T`-returning functions may fall off the end (yielding `nil`).

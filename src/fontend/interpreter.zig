@@ -178,6 +178,8 @@ pub const Value = union(enum) {
     enum_type: *const EnumType,
     enum_value: *const EnumValue,
     signal: *Signal,
+    /// A tuple `(a, b, ...)` — a fixed, ordered group; compared elementwise.
+    tuple: *List,
     /// An imported module, reached by its bound name; members are its globals.
     module: *Env,
 };
@@ -230,6 +232,13 @@ fn valuesEqual(a: Value, b: Value) bool {
             std.mem.eql(u8, x.type_name, b.enum_value.type_name) and
             std.mem.eql(u8, x.member, b.enum_value.member),
         .signal => |x| b == .signal and x == b.signal,
+        .tuple => |x| b == .tuple and blk: {
+            if (x.items.len != b.tuple.items.len) break :blk false;
+            for (x.items, b.tuple.items) |ea, eb| {
+                if (!valuesEqual(ea, eb)) break :blk false;
+            }
+            break :blk true;
+        },
         .module => |x| b == .module and x == b.module,
     };
 }
@@ -909,6 +918,17 @@ const Interpreter = struct {
                 const v = if (x.value) |val| try self.eval(val.*) else Value.nil;
                 try self.define(self.env, x.name, v);
             },
+            .destructure => |d| {
+                const v = try self.eval(d.value.*);
+                const items: []const Value = switch (v) {
+                    .tuple, .list => |l| l.items,
+                    else => return self.fail(d.span, "cannot destructure a {s}", .{@tagName(v)}),
+                };
+                if (items.len != d.names.len) {
+                    return self.fail(d.span, "cannot destructure {d} value(s) into {d} name(s)", .{ items.len, d.names.len });
+                }
+                for (d.names, items) |n, item| try self.define(self.env, n, item);
+            },
             .assign => |x| try self.execAssign(x),
             .return_stmt => |x| {
                 self.ret_value = if (x.value) |v| try self.eval(v.*) else Value.nil;
@@ -1501,6 +1521,12 @@ const Interpreter = struct {
                 };
                 break :blk .{ .closure = cl };
             },
+            .tuple => |t| blk: {
+                const l = try self.arena.create(List);
+                l.* = .empty;
+                for (t.elements) |el| try l.append(self.arena, try self.eval(el.*));
+                break :blk .{ .tuple = l };
+            },
         };
     }
 
@@ -1770,6 +1796,14 @@ const Interpreter = struct {
                     try self.appendValue(buf, item);
                 }
                 try buf.append(self.arena, ']');
+            },
+            .tuple => |l| {
+                try buf.append(self.arena, '(');
+                for (l.items, 0..) |item, i| {
+                    if (i > 0) try buf.appendSlice(self.arena, ", ");
+                    try self.appendValue(buf, item);
+                }
+                try buf.append(self.arena, ')');
             },
             .map => |m| {
                 try buf.append(self.arena, '{');
@@ -2521,6 +2555,29 @@ test "string and collection stdlib builtins" {
         \\    print(abs(-5), min(3, 7), max(3, 7))
     ;
     try expectOutput(src, "HI bye\n[a, b, c]\nx-y-z\ntrue true\n[1, 2, 3] [3, 2, 1]\n5 3 7\n");
+}
+
+test "tuples: literals, multiple return, destructuring, equality" {
+    const src =
+        \\func minmax(xs: list<int>) -> (int, int):
+        \\    var lo = xs[0]
+        \\    var hi = xs[0]
+        \\    for x in xs:
+        \\        if x < lo:
+        \\            lo = x
+        \\        if x > hi:
+        \\            hi = x
+        \\    return (lo, hi)
+        \\
+        \\func main():
+        \\    var lo, hi = minmax([3, 7, 1, 9])
+        \\    print(lo, hi)
+        \\    print((1, "two"))
+        \\    print((1, 2) == (1, 2), (1, 2) == (1, 3))
+        \\    var a, b = (10, 20)
+        \\    print(a + b)
+    ;
+    try expectOutput(src, "1 9\n(1, two)\ntrue false\n30\n");
 }
 
 test "math builtins: sqrt, pow, floor, ceil, round" {

@@ -45,6 +45,9 @@ pub const TypeRef = struct {
     /// A module qualifier for an imported type: `mod.T` → `module = "mod"`,
     /// `name = "T"`. Null for an unqualified type.
     module: ?[]const u8 = null,
+    /// A tuple type `(A, B, ...)`: `is_tuple` is set and `args` holds the element
+    /// types (`name` is the placeholder `"tuple"`).
+    is_tuple: bool = false,
 };
 
 pub const Param = struct {
@@ -89,8 +92,11 @@ pub const Expr = union(enum) {
     lambda: *const Lambda,
     interpolation: *const Interpolation,
     range: Range,
+    tuple: Tuple,
 
     pub const Literal = struct { text: []const u8, span: Span };
+    /// A fixed, ordered group of values: `(a, b, ...)` (two or more elements).
+    pub const Tuple = struct { elements: []const *Expr, span: Span };
     pub const Range = struct { start: *Expr, end: *Expr, span: Span };
     pub const Bool = struct { value: bool, span: Span };
     pub const Ident = struct { name: []const u8, span: Span };
@@ -151,6 +157,7 @@ pub const VarDecl = struct {
 
 pub const Stmt = union(enum) {
     var_decl: VarDecl,
+    destructure: Destructure,
     return_stmt: Return,
     if_stmt: If,
     while_stmt: While,
@@ -161,6 +168,8 @@ pub const Stmt = union(enum) {
     break_stmt: Span,
     continue_stmt: Span,
 
+    /// `var a, b, ... = tuple` — binds each name to the corresponding element.
+    pub const Destructure = struct { names: []const []const u8, value: *Expr, is_const: bool, span: Span };
     pub const Return = struct { value: ?*Expr, span: Span };
     pub const ElseIf = struct { cond: *Expr, body: []const Stmt };
     pub const If = struct {
@@ -267,6 +276,7 @@ pub fn exprSpan(e: Expr) Span {
         .lambda => |l| l.span,
         .interpolation => |x| x.span,
         .range => |r| r.span,
+        .tuple => |t| t.span,
     };
 }
 
@@ -509,6 +519,17 @@ const Parser = struct {
 
     fn parseType(self: *Parser) Error!TypeRef {
         const optional = self.eat(.question);
+        // A tuple type: `(A, B, ...)`.
+        if (self.at(.l_paren)) {
+            const lp = self.advance();
+            var arg_list: std.ArrayList(TypeRef) = .empty;
+            try arg_list.append(self.alloc, try self.parseType());
+            while (self.eat(.comma)) {
+                try arg_list.append(self.alloc, try self.parseType());
+            }
+            const rp = try self.expect(.r_paren, "expected ')' to close the tuple type");
+            return .{ .name = "tuple", .is_tuple = true, .args = try arg_list.toOwnedSlice(self.alloc), .span = joinSpan(lp.span, rp.span), .optional = optional };
+        }
         const first = try self.expect(.identifier, "expected a type name");
         // A `mod.T` qualifier names a type exported by an imported module.
         var module: ?[]const u8 = null;
@@ -551,6 +572,43 @@ const Parser = struct {
             .value = value,
             .span = spanFrom(kw, self.prev()),
         };
+    }
+
+    /// A `var`/`const` statement: either a single binding (with optional type and
+    /// initializer) or a destructuring `var a, b = tuple`.
+    fn parseVarOrDestructure(self: *Parser) Error!Stmt {
+        const kw = self.advance(); // 'var' or 'const'
+        const is_const = kw.kind == .kw_const;
+        const first = try self.expect(.identifier, "expected a variable name");
+        if (self.at(.comma)) {
+            var names: std.ArrayList([]const u8) = .empty;
+            try names.append(self.alloc, first.text);
+            while (self.eat(.comma)) {
+                const n = try self.expect(.identifier, "expected a variable name");
+                try names.append(self.alloc, n.text);
+            }
+            _ = try self.expect(.assign, "expected '=' in a destructuring binding");
+            const value = try self.parseExpr();
+            return .{ .destructure = .{
+                .names = try names.toOwnedSlice(self.alloc),
+                .value = value,
+                .is_const = is_const,
+                .span = spanFrom(kw, self.prev()),
+            } };
+        }
+        var type_ref: ?TypeRef = null;
+        if (self.eat(.colon)) type_ref = try self.parseType();
+        var value: ?*Expr = null;
+        if (self.eat(.assign)) value = try self.parseExpr();
+        return .{ .var_decl = .{
+            .visibility = .default,
+            .is_const = is_const,
+            .is_static = false,
+            .name = first.text,
+            .type = type_ref,
+            .value = value,
+            .span = spanFrom(kw, self.prev()),
+        } };
     }
 
     /// Parse `( name[: type], ... )`. Parameter types are optional.
@@ -824,7 +882,7 @@ const Parser = struct {
                 const t = self.advance();
                 return .{ .continue_stmt = t.span };
             },
-            .kw_var, .kw_const => return .{ .var_decl = try self.parseVarDecl(.default, false) },
+            .kw_var, .kw_const => return self.parseVarOrDestructure(),
             else => {
                 const expr = try self.parseExpr();
                 if (self.eat(.assign)) {
@@ -1088,10 +1146,21 @@ const Parser = struct {
             .l_bracket => return self.mkExpr(.{ .array = try self.parseArrayLiteral() }),
             .l_brace => return self.mkExpr(.{ .map = try self.parseMapLiteral() }),
             .l_paren => {
-                _ = self.advance();
-                const inner = try self.parseExpr();
+                const lp = self.advance();
+                const first = try self.parseExpr();
+                // `(a, b, ...)` is a tuple; a single `(expr)` is just grouping.
+                if (self.at(.comma)) {
+                    var elements: std.ArrayList(*Expr) = .empty;
+                    try elements.append(self.alloc, first);
+                    while (self.eat(.comma)) {
+                        if (self.at(.r_paren)) break; // trailing comma
+                        try elements.append(self.alloc, try self.parseExpr());
+                    }
+                    const rp = try self.expect(.r_paren, "expected ')' to close the tuple");
+                    return self.mkExpr(.{ .tuple = .{ .elements = try elements.toOwnedSlice(self.alloc), .span = joinSpan(lp.span, rp.span) } });
+                }
                 _ = try self.expect(.r_paren, "expected ')' to close the group");
-                return inner;
+                return first;
             },
             else => {
                 try self.err("expected an expression");

@@ -47,6 +47,7 @@ fn declLine(d: Decl) u32 {
 fn stmtLine(s: Stmt) u32 {
     return switch (s) {
         .var_decl => |x| x.span.line,
+        .destructure => |x| x.span.line,
         .return_stmt => |x| x.span.line,
         .if_stmt => |x| x.span.line,
         .while_stmt => |x| x.span.line,
@@ -259,6 +260,15 @@ const Formatter = struct {
 
     fn typeRef(self: *Formatter, t: TypeRef) Error!void {
         if (t.optional) try self.w("?");
+        if (t.is_tuple) {
+            try self.w("(");
+            for (t.args, 0..) |a, i| {
+                if (i > 0) try self.w(", ");
+                try self.typeRef(a);
+            }
+            try self.w(")");
+            return;
+        }
         if (t.module) |m| {
             try self.w(m);
             try self.w(".");
@@ -286,6 +296,17 @@ const Formatter = struct {
         try self.emitCommentsBefore(stmtLine(s));
         switch (s) {
             .var_decl => |v| try self.varDecl(v),
+            .destructure => |d| {
+                try self.pad();
+                try self.w(if (d.is_const) "const " else "var ");
+                for (d.names, 0..) |n, i| {
+                    if (i > 0) try self.w(", ");
+                    try self.w(n);
+                }
+                try self.w(" = ");
+                try self.expr(d.value.*);
+                try self.nl();
+            },
             .return_stmt => |r| {
                 try self.pad();
                 try self.w("return");
@@ -442,6 +463,14 @@ const Formatter = struct {
                     try self.expr(entry.value.*);
                 }
                 try self.w("}");
+            },
+            .tuple => |t| {
+                try self.w("(");
+                for (t.elements, 0..) |el, i| {
+                    if (i > 0) try self.w(", ");
+                    try self.expr(el.*);
+                }
+                try self.w(")");
             },
             .match => |m| try self.matchExpr(m),
             .lambda => |lam| try self.lambda(lam),

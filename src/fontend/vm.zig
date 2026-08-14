@@ -144,6 +144,8 @@ const Value = union(enum) {
     enum_value: *const EnumValue,
     module: *RtModule,
     signal: *Signal,
+    /// A tuple `(a, b, ...)` — a fixed, ordered group; compared elementwise.
+    tuple: *List,
 };
 
 fn isTruthy(v: Value) bool {
@@ -193,6 +195,13 @@ fn valuesEqual(a: Value, b: Value) bool {
             std.mem.eql(u8, x.member, b.enum_value.member),
         .module => |x| b == .module and x == b.module,
         .signal => |x| b == .signal and x == b.signal,
+        .tuple => |x| b == .tuple and blk: {
+            if (x.items.len != b.tuple.items.len) break :blk false;
+            for (x.items, b.tuple.items) |ea, eb| {
+                if (!valuesEqual(ea, eb)) break :blk false;
+            }
+            break :blk true;
+        },
     };
 }
 
@@ -240,6 +249,8 @@ const Op = enum(u8) {
     ret,
     build_list, // u16 count
     build_map, // u16 entry count (2*count values popped)
+    build_tuple, // u16 count -> pop count values into a tuple
+    unpack, // u16 count -> pop a tuple/list of exactly count, push its elements
     interp, // u16 part count -> concat the parts as strings
     new_instance, // u16 rttype index -> push a fresh instance (fields nil)
     get_member, // u16 name-const index -> instance field, or bound method
@@ -1036,6 +1047,14 @@ const Compiler = struct {
                 if (v.value) |val| try self.expr(val.*) else try self.emit(.nil, v.span);
                 try self.cur.locals.append(self.alloc, .{ .name = v.name, .depth = self.cur.scope_depth });
             },
+            .destructure => |d| {
+                // Evaluate the value, unpack it into its elements on the stack,
+                // then bind each name to the element slot it now occupies.
+                try self.expr(d.value.*);
+                try self.emit(.unpack, d.span);
+                try self.emitU16(@intCast(d.names.len), d.span);
+                for (d.names) |n| try self.cur.locals.append(self.alloc, .{ .name = n, .depth = self.cur.scope_depth });
+            },
             .expr_stmt => |e| {
                 try self.expr(e.*);
                 try self.emit(.pop, parser.exprSpan(e.*));
@@ -1285,6 +1304,11 @@ const Compiler = struct {
                 for (a.elements) |el| try self.expr(el.*);
                 try self.emit(.build_list, a.span);
                 try self.emitU16(@intCast(a.elements.len), a.span);
+            },
+            .tuple => |t| {
+                for (t.elements) |el| try self.expr(el.*);
+                try self.emit(.build_tuple, t.span);
+                try self.emitU16(@intCast(t.elements.len), t.span);
             },
             .map => |m| {
                 for (m.entries) |entry| {
@@ -1698,6 +1722,25 @@ const VM = struct {
                     try l.appendSlice(self.alloc, self.stack.items[start..]);
                     self.stack.shrinkRetainingCapacity(start);
                     try self.push(.{ .list = l });
+                },
+                .build_tuple => {
+                    const count = self.readU16(frame);
+                    const l = try self.alloc.create(List);
+                    l.* = .empty;
+                    const start = self.stack.items.len - count;
+                    try l.appendSlice(self.alloc, self.stack.items[start..]);
+                    self.stack.shrinkRetainingCapacity(start);
+                    try self.push(.{ .tuple = l });
+                },
+                .unpack => {
+                    const count = self.readU16(frame);
+                    const v = self.pop();
+                    const items: []const Value = switch (v) {
+                        .tuple, .list => |l| l.items,
+                        else => return self.fail("cannot destructure a {s}", .{@tagName(v)}),
+                    };
+                    if (items.len != count) return self.fail("cannot destructure {d} value(s) into {d} name(s)", .{ items.len, count });
+                    for (items) |item| try self.push(item);
                 },
                 .build_map => {
                     const count = self.readU16(frame);
@@ -2296,6 +2339,14 @@ const VM = struct {
                 }
                 try buf.append(self.alloc, ']');
             },
+            .tuple => |l| {
+                try buf.append(self.alloc, '(');
+                for (l.items, 0..) |item, i| {
+                    if (i > 0) try buf.appendSlice(self.alloc, ", ");
+                    try self.appendValueTo(buf, item);
+                }
+                try buf.append(self.alloc, ')');
+            },
             .map => |m| {
                 try buf.append(self.alloc, '{');
                 for (m.entries.items, 0..) |e, i| {
@@ -2407,7 +2458,7 @@ fn disasmInstr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), ch: *const Chu
             try out.print(alloc, " -> {d}", .{readU16At(code, offset + 1)});
             break :blk offset + 3;
         },
-        .build_list, .build_map, .interp => blk: {
+        .build_list, .build_map, .build_tuple, .unpack, .interp => blk: {
             try out.print(alloc, " {d}", .{readU16At(code, offset + 1)});
             break :blk offset + 3;
         },
@@ -2610,6 +2661,43 @@ test "vm: stdlib builtins" {
         \\    print(replace("a-b", "-", "+"))
     ;
     try expectVMOutput(src, "5 3 7\nHI bye\n[1, 2, 3] [3, 2, 1]\n[a, b, c] x-y\ntrue 1\n[z] true\na+b\n");
+}
+
+test "vm: tuples, multiple return, and destructuring" {
+    const src =
+        \\func minmax(xs: list<int>) -> (int, int):
+        \\    var lo = xs[0]
+        \\    var hi = xs[0]
+        \\    for x in xs:
+        \\        if x < lo:
+        \\            lo = x
+        \\        if x > hi:
+        \\            hi = x
+        \\    return (lo, hi)
+        \\
+        \\func main():
+        \\    var lo, hi = minmax([3, 7, 1, 9])
+        \\    print(lo, hi)
+        \\    print((1, "two"))
+        \\    print((1, 2) == (1, 2), (1, 2) == (1, 3))
+        \\    var a, b = (10, 20)
+        \\    print(a + b)
+    ;
+    try expectVMOutput(src, "1 9\n(1, two)\ntrue false\n30\n");
+}
+
+test "vm: destructuring inside a loop tracks slots" {
+    // Destructuring in a loop body exercises local-slot bookkeeping across rounds.
+    const src =
+        \\func main():
+        \\    var pairs = [(1, 2), (3, 4), (5, 6)]
+        \\    var total = 0
+        \\    for p in pairs:
+        \\        var a, b = p
+        \\        total = total + a * b
+        \\    print(total)
+    ;
+    try expectVMOutput(src, "44\n");
 }
 
 test "vm: math builtins" {
