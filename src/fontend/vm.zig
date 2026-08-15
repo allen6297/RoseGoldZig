@@ -1056,30 +1056,36 @@ const Compiler = struct {
         defer self.cur.locals.shrinkRetainingCapacity(orig_len);
 
         var end_jumps: std.ArrayList(usize) = .empty;
-        for (m.arms) |arm| switch (arm.pattern) {
-            .wildcard => {
-                try self.expr(arm.body.*);
-                try end_jumps.append(self.alloc, try self.emitJump(.jump, arm.span));
-            },
-            .binding => |bd| {
-                // The subject *is* the bound value: rename its slot so the body
-                // resolves the binding name to it, then restore the name.
-                const saved = self.cur.locals.items[subj].name;
-                self.cur.locals.items[subj].name = bd.name;
-                try self.expr(arm.body.*);
-                self.cur.locals.items[subj].name = saved;
-                try end_jumps.append(self.alloc, try self.emitJump(.jump, arm.span));
-            },
-            else => {
-                try self.emitLocal(.get_local, subj, arm.span);
-                try self.patternConst(arm.pattern);
-                try self.emit(.eq, arm.span);
-                const next = try self.emitJump(.jump_if_false, arm.span);
-                try self.expr(arm.body.*);
-                try end_jumps.append(self.alloc, try self.emitJump(.jump, arm.span));
-                self.patchJump(next);
-            },
-        };
+        for (m.arms) |arm| {
+            // Jumps to the next arm: from a failed pattern test and/or a false guard.
+            var nexts: [2]usize = undefined;
+            var nn: usize = 0;
+            // A binding renames the subject's slot for this arm's guard + body.
+            var restore_name: ?[]const u8 = null;
+            switch (arm.pattern) {
+                .wildcard => {},
+                .binding => |bd| {
+                    restore_name = self.cur.locals.items[subj].name;
+                    self.cur.locals.items[subj].name = bd.name;
+                },
+                else => {
+                    try self.emitLocal(.get_local, subj, arm.span);
+                    try self.patternConst(arm.pattern);
+                    try self.emit(.eq, arm.span);
+                    nexts[nn] = try self.emitJump(.jump_if_false, arm.span);
+                    nn += 1;
+                },
+            }
+            if (arm.guard) |g| {
+                try self.expr(g.*);
+                nexts[nn] = try self.emitJump(.jump_if_false, arm.span);
+                nn += 1;
+            }
+            try self.expr(arm.body.*);
+            if (restore_name) |rn| self.cur.locals.items[subj].name = rn;
+            try end_jumps.append(self.alloc, try self.emitJump(.jump, arm.span));
+            for (nexts[0..nn]) |j| self.patchJump(j);
+        }
         // No arm matched -> nil (mirrors the interpreter).
         try self.emit(.nil, m.span);
         for (end_jumps.items) |j| self.patchJump(j);
@@ -3622,6 +3628,25 @@ test "vm: match on strings and bools" {
         \\    print(match true { true: "yes" false: "no" })
     ;
     try expectVMOutput(src, "2\nyes\n");
+}
+
+test "vm: match guards (byte-identical to the interpreter)" {
+    const src =
+        \\func classify(n: int) -> str:
+        \\    return match n {
+        \\        0: "zero"
+        \\        x if x < 0: "negative"
+        \\        x if x % 2 == 0: "even"
+        \\        _: "odd"
+        \\    }
+        \\
+        \\func main():
+        \\    print(classify(-3))
+        \\    print(classify(0))
+        \\    print(classify(4))
+        \\    print(classify(7))
+    ;
+    try expectVMOutput(src, "negative\nzero\neven\nodd\n");
 }
 
 test "vm: string interpolation" {

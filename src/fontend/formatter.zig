@@ -613,6 +613,10 @@ const Formatter = struct {
         for (m.arms) |arm| {
             try self.pad();
             try self.pattern(arm.pattern);
+            if (arm.guard) |g| {
+                try self.w(" if ");
+                try self.expr(g.*);
+            }
             try self.w(": ");
             try self.expr(arm.body.*);
             try self.nl();
@@ -687,6 +691,13 @@ test "formats conditional expressions" {
     const out = try fmt(gpa, "func main():\n    var x =  a  if  c  else  b");
     defer gpa.free(out);
     try testing.expectEqualStrings("func main():\n    var x = a if c else b\n", out);
+}
+
+test "formats match guards" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "func main():\n    print(match n {x if x>0: 1\n_: 0})");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("func main():\n    print(match n {\n        x if x > 0: 1\n        _: 0\n    })\n", out);
 }
 
 test "formats list comprehensions" {

@@ -2022,12 +2022,17 @@ const Analyzer = struct {
             if (has_catch_all) {
                 try self.report(arm.span, "unreachable match arm; an earlier '_' or binding already matches everything", .{});
             }
+            // A guarded arm is conditional, so it never covers a case or acts as a
+            // catch-all (the guard might be false).
+            const guarded = arm.guard != null;
             switch (arm.pattern) {
-                .wildcard, .binding => has_catch_all = true,
-                .bool_literal => |b| {
+                .wildcard, .binding => if (!guarded) {
+                    has_catch_all = true;
+                },
+                .bool_literal => |b| if (!guarded) {
                     if (b.value) covers_true = true else covers_false = true;
                 },
-                .enum_case => |ec| try self.checkEnumCasePattern(ec, subject, subject_enum, &covered),
+                .enum_case => |ec| try self.checkEnumCasePattern(ec, subject, subject_enum, if (guarded) null else &covered),
                 else => {},
             }
 
@@ -2038,6 +2043,15 @@ const Analyzer = struct {
             }
             const saved = self.current;
             self.current = child;
+            if (arm.guard) |g| {
+                const gt = self.typeOf(g.*) catch |e| {
+                    self.current = saved;
+                    return e;
+                };
+                if (tagOf(gt) != .bool and !isAnyish(gt)) {
+                    try self.report(parser.exprSpan(g.*), "match guard must be a bool, got {s}", .{typeName(gt)});
+                }
+            }
             const at = self.typeOf(arm.body.*) catch |e| {
                 self.current = saved;
                 return e;
@@ -2065,7 +2079,7 @@ const Analyzer = struct {
 
     /// Validate an `Enum.CASE` pattern against the match subject, recording the
     /// case as covered when it belongs to the subject's enum.
-    fn checkEnumCasePattern(self: *Analyzer, ec: Pattern.EnumCase, subject: Type, subject_enum: ?[]const u8, covered: *NameSet) Error!void {
+    fn checkEnumCasePattern(self: *Analyzer, ec: Pattern.EnumCase, subject: Type, subject_enum: ?[]const u8, covered: ?*NameSet) Error!void {
         const scope = self.enum_types.get(ec.enum_name) orelse {
             try self.report(ec.span, "unknown enum '{s}'", .{ec.enum_name});
             return;
@@ -2079,7 +2093,7 @@ const Analyzer = struct {
                 try self.report(ec.span, "pattern '{s}.{s}' does not match a subject of type '{s}'", .{ ec.enum_name, ec.case, se });
                 return;
             }
-            try covered.put(self.arena, ec.case, {});
+            if (covered) |c| try c.put(self.arena, ec.case, {});
         } else if (!isAnyish(subject)) {
             try self.report(ec.span, "cannot match an enum case against {s}", .{typeName(subject)});
         }
@@ -2323,6 +2337,19 @@ test "a match without a catch-all is not exhaustive" {
     ;
     var analysis = try analyzeSource(testing.allocator, src);
     defer analysis.deinit();
+    try expectMessageContains(analysis, "not exhaustive");
+}
+
+test "a guarded arm does not establish exhaustiveness" {
+    const src =
+        \\func f(n: int) -> str:
+        \\    return match n {
+        \\        x if x > 0: "pos"
+        \\    }
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    // The only arm is guarded, so the match is not exhaustive.
     try expectMessageContains(analysis, "not exhaustive");
 }
 

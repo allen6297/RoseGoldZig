@@ -2114,21 +2114,39 @@ const Interpreter = struct {
     fn evalMatch(self: *Interpreter, m: Expr.Match) Error!Value {
         const subject = try self.eval(m.subject.*);
         for (m.arms) |arm| {
-            switch (arm.pattern) {
-                .wildcard => return self.eval(arm.body.*),
-                .binding => |bd| {
-                    const child = try self.newEnv(self.env);
-                    try self.define(child, bd.name, subject);
-                    const saved = self.env;
-                    self.env = child;
-                    defer self.env = saved;
-                    return self.eval(arm.body.*);
+            // Does the pattern fit? A binding sets up a child env for the arm.
+            var child: ?@TypeOf(self.env) = null;
+            const matched = switch (arm.pattern) {
+                .wildcard => true,
+                .binding => |bd| blk: {
+                    const c = try self.newEnv(self.env);
+                    try self.define(c, bd.name, subject);
+                    child = c;
+                    break :blk true;
                 },
-                else => {
-                    const pv = try self.patternValue(arm.pattern);
-                    if (valuesEqual(pv, subject)) return self.eval(arm.body.*);
-                },
+                else => valuesEqual(try self.patternValue(arm.pattern), subject),
+            };
+            if (!matched) continue;
+
+            const saved = self.env;
+            if (child) |c| self.env = c;
+            // A guard runs in the (bound) arm scope; a false guard skips the arm.
+            if (arm.guard) |g| {
+                const gv = self.eval(g.*) catch |e| {
+                    self.env = saved;
+                    return e;
+                };
+                if (!isTruthy(gv)) {
+                    self.env = saved;
+                    continue;
+                }
             }
+            const body = self.eval(arm.body.*) catch |e| {
+                self.env = saved;
+                return e;
+            };
+            self.env = saved;
+            return body;
         }
         return .nil;
     }
@@ -2589,6 +2607,25 @@ test "match expression selects the right arm" {
         \\    print(describe(500))
     ;
     try expectOutput(src, "not found\nunknown\n");
+}
+
+test "match guards select conditionally and fall through when false" {
+    const src =
+        \\func classify(n: int) -> str:
+        \\    return match n {
+        \\        0: "zero"
+        \\        x if x < 0: "negative"
+        \\        x if x % 2 == 0: "even"
+        \\        _: "odd"
+        \\    }
+        \\
+        \\func main():
+        \\    print(classify(-3))
+        \\    print(classify(0))
+        \\    print(classify(4))
+        \\    print(classify(7))
+    ;
+    try expectOutput(src, "negative\nzero\neven\nodd\n");
 }
 
 test "strings, booleans, and logical operators" {

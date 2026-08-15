@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (391 as of writing)
+zig build test                  # run every test (395 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -151,8 +151,12 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   that close over the surrounding scope, `await expr` (a unary prefix binding tighter
   than binary ops; resolves a `task<T>` to its `T` — see **Async/await**), and
   `match subj { pattern: body, ... }`
-  (patterns: literals, `_`, a binding name, or an enum case `Enum.CASE` — covering
-  every case is exhaustive without a `_`).
+  (patterns: literals, `_`, a binding name, or an enum case `Enum.CASE`; an arm may
+  carry an `if <expr>` **guard** — `case x if x > 0: …` — which must be a bool and
+  is evaluated in the arm's (bound) scope, so the arm matches only when the pattern
+  fits *and* the guard holds. A **guarded arm never establishes exhaustiveness**
+  (its guard might be false), so it doesn't count as a catch-all or cover an enum
+  case. Covering every case is exhaustive without a `_`).
 - **Types:** `int`, `float`, `str`, `bool`, `void`, `any`, `list`/`map` (optionally
   with element types — `list<T>`, `map<K, V>`, nestable; a bare `list`/`map` is
   `list<any>`/`map<any, any>`), tuples `(A, B, ...)` (fixed, ordered, compared

@@ -163,6 +163,9 @@ pub const Expr = union(enum) {
 
 pub const MatchArm = struct {
     pattern: Pattern,
+    /// An optional `if <expr>` guard: the arm matches only when the pattern fits
+    /// *and* the guard is true. A guarded arm never establishes exhaustiveness.
+    guard: ?*Expr = null,
     body: *Expr,
     span: Span,
 };
@@ -1473,10 +1476,12 @@ const Parser = struct {
         var arms: std.ArrayList(MatchArm) = .empty;
         while (!self.at(.r_brace) and !self.atEnd()) {
             const pattern = try self.parsePattern();
+            const guard: ?*Expr = if (self.eat(.kw_if)) try self.parseExpr() else null;
             _ = try self.expect(.colon, "expected ':' after a match pattern");
             const body = try self.parseExpr();
             try arms.append(self.alloc, .{
                 .pattern = pattern,
+                .guard = guard,
                 .body = body,
                 .span = joinSpan(patternSpan(pattern), exprSpan(body.*)),
             });
