@@ -39,6 +39,11 @@ public final class RoseGoldColorSettingsPage implements ColorSettingsPage {
 
     @Override
     public @NotNull String getDemoText() {
+        // Only tag identifiers the way the real editor colors them: an identifier
+        // after `func` is a declaration; an identifier immediately before `(` is a
+        // call (including method calls like `c.area()`). A whole string literal —
+        // interpolation and all — is one uniform token, so nothing inside the
+        // "${...}" is tagged, matching how a real .rg file renders.
         return "## RoseGold sample\n" +
                 "import mathutil\n\n" +
                 "enum Color { RED, GREEN }\n\n" +
@@ -48,7 +53,8 @@ public final class RoseGoldColorSettingsPage implements ColorSettingsPage {
                 "        return 3.14 * r * r\n\n" +
                 "func <fdef>main</fdef>():\n" +
                 "    var c = <fcall>Circle</fcall>()\n" +
-                "    <fcall>print</fcall>(\"area = ${c.<fcall>area</fcall>()}\")\n" +
+                "    var a = c.<fcall>area</fcall>()\n" +
+                "    <fcall>print</fcall>(\"area = ${a}\")\n" +
                 "    for i in 0..5:\n" +
                 "        <fcall>print</fcall>(i)\n";
     }
