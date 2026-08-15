@@ -28,7 +28,17 @@ dependencies {
         // IDE. Keep this in step with `sinceBuild` below.
         def platformVersion = project.findProperty('platformVersion') ?: '2026.2.1'
         intellijIdea platformVersion
+
+        // Headless platform test fixtures (BasePlatformTestCase), so completion /
+        // rename can be driven end-to-end in `./gradlew test` without an IDE.
+        testFramework org.jetbrains.intellij.platform.gradle.TestFrameworkType.Platform.INSTANCE
     }
+    testImplementation 'junit:junit:4.13.2'
+}
+
+// JUnit 3/4-style platform tests (BasePlatformTestCase extends UsefulTestCase).
+test {
+    useJUnit()
 }
 
 java {
