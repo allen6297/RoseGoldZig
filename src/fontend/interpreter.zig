@@ -2114,22 +2114,11 @@ const Interpreter = struct {
     fn evalMatch(self: *Interpreter, m: Expr.Match) Error!Value {
         const subject = try self.eval(m.subject.*);
         for (m.arms) |arm| {
-            // Does the pattern fit? A binding sets up a child env for the arm.
-            var child: ?@TypeOf(self.env) = null;
-            const matched = switch (arm.pattern) {
-                .wildcard => true,
-                .binding => |bd| blk: {
-                    const c = try self.newEnv(self.env);
-                    try self.define(c, bd.name, subject);
-                    child = c;
-                    break :blk true;
-                },
-                else => valuesEqual(try self.patternValue(arm.pattern), subject),
-            };
-            if (!matched) continue;
+            const child = try self.newEnv(self.env);
+            if (!try self.bindPattern(arm.pattern, subject, child)) continue;
 
             const saved = self.env;
-            if (child) |c| self.env = c;
+            self.env = child;
             // A guard runs in the (bound) arm scope; a false guard skips the arm.
             if (arm.guard) |g| {
                 const gv = self.eval(g.*) catch |e| {
@@ -2149,6 +2138,33 @@ const Interpreter = struct {
             return body;
         }
         return .nil;
+    }
+
+    /// Whether `value` matches `p`, binding any names into `env` as it goes.
+    /// Structural patterns (tuple/list) recurse and match element-wise.
+    fn bindPattern(self: *Interpreter, p: parser.Pattern, value: Value, env: *Env) Error!bool {
+        switch (p) {
+            .wildcard => return true,
+            .binding => |bd| {
+                try self.define(env, bd.name, value);
+                return true;
+            },
+            .tuple => |seq| {
+                if (value != .tuple or value.tuple.items.len != seq.elems.len) return false;
+                for (seq.elems, value.tuple.items) |sub, item| {
+                    if (!try self.bindPattern(sub, item, env)) return false;
+                }
+                return true;
+            },
+            .list => |seq| {
+                if (value != .list or value.list.items.len != seq.elems.len) return false;
+                for (seq.elems, value.list.items) |sub, item| {
+                    if (!try self.bindPattern(sub, item, env)) return false;
+                }
+                return true;
+            },
+            else => return valuesEqual(try self.patternValue(p), value),
+        }
     }
 
     fn patternValue(self: *Interpreter, p: parser.Pattern) Error!Value {
@@ -2626,6 +2642,31 @@ test "match guards select conditionally and fall through when false" {
         \\    print(classify(7))
     ;
     try expectOutput(src, "negative\nzero\neven\nodd\n");
+}
+
+test "match destructures tuple and list patterns, nested and guarded" {
+    const src =
+        \\func classify(v: any) -> str:
+        \\    return match v {
+        \\        (0, (a, b)): "zero-pair ${a}/${b}"
+        \\        (x, y) if x > 10: "big ${x},${y}"
+        \\        (x, y): "flat ${x},${y}"
+        \\        [a, b, c]: "triple ${a} ${b} ${c}"
+        \\        [only]: "single ${only}"
+        \\        []: "empty"
+        \\        _: "other"
+        \\    }
+        \\
+        \\func main():
+        \\    print(classify((0, (7, 8))))
+        \\    print(classify((99, 1)))
+        \\    print(classify((3, 4)))
+        \\    print(classify([1, 2, 3]))
+        \\    print(classify([42]))
+        \\    print(classify([]))
+        \\    print(classify("x"))
+    ;
+    try expectOutput(src, "zero-pair 7/8\nbig 99,1\nflat 3,4\ntriple 1 2 3\nsingle 42\nempty\nother\n");
 }
 
 test "strings, booleans, and logical operators" {

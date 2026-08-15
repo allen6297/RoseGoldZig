@@ -183,8 +183,14 @@ pub const Pattern = union(enum) {
     bool_literal: Expr.Bool,
     binding: Expr.Ident,
     enum_case: EnumCase,
+    /// A tuple pattern `(p1, p2, …)` — matches a tuple of the same arity,
+    /// binding element-wise. Sub-patterns may nest.
+    tuple: Seq,
+    /// A list pattern `[p1, p2, …]` — matches a list of exactly that length.
+    list: Seq,
 
     pub const EnumCase = struct { enum_name: []const u8, case: []const u8, span: Span };
+    pub const Seq = struct { elems: []const Pattern, span: Span };
 };
 
 pub const VarDecl = struct {
@@ -345,6 +351,7 @@ fn patternSpan(p: Pattern) Span {
         .bool_literal => |b| b.span,
         .binding => |id| id.span,
         .enum_case => |ec| ec.span,
+        .tuple, .list => |seq| seq.span,
     };
 }
 
@@ -1531,11 +1538,38 @@ const Parser = struct {
                 }
                 return .{ .binding = .{ .name = first.text, .span = first.span } };
             },
+            .l_paren => {
+                const open = self.advance();
+                const elems = try self.parsePatternSeq(.r_paren);
+                const close = try self.expect(.r_paren, "expected ')' to close a tuple pattern");
+                // A single `(p)` with no comma is just grouping.
+                if (elems.len == 1) return elems[0];
+                return .{ .tuple = .{ .elems = elems, .span = spanFrom(open, close) } };
+            },
+            .l_bracket => {
+                const open = self.advance();
+                const elems = try self.parsePatternSeq(.r_bracket);
+                const close = try self.expect(.r_bracket, "expected ']' to close a list pattern");
+                return .{ .list = .{ .elems = elems, .span = spanFrom(open, close) } };
+            },
             else => {
                 try self.err("expected a pattern");
                 return error.ParseError;
             },
         }
+    }
+
+    /// Parse comma-separated sub-patterns up to `close` (a trailing comma is ok).
+    fn parsePatternSeq(self: *Parser, close: lexer.TokenKind) Error![]const Pattern {
+        var elems: std.ArrayList(Pattern) = .empty;
+        if (!self.at(close)) {
+            while (true) {
+                try elems.append(self.alloc, try self.parsePattern());
+                if (!self.eat(.comma)) break;
+                if (self.at(close)) break; // trailing comma
+            }
+        }
+        return elems.toOwnedSlice(self.alloc);
     }
 };
 
@@ -1905,6 +1939,32 @@ test "parses enum-case patterns in match" {
     try testing.expectEqualStrings("Status", arms[0].pattern.enum_case.enum_name);
     try testing.expectEqualStrings("OK", arms[0].pattern.enum_case.case);
     try testing.expect(std.meta.activeTag(arms[1].pattern) == .binding);
+}
+
+test "parses tuple and list destructuring patterns with nesting" {
+    const src =
+        \\func f(p: any) -> int:
+        \\    return match p {
+        \\        (0, (a, b)): a
+        \\        [x, y]: x
+        \\        _: 0
+        \\    }
+    ;
+    var tree = try parse(testing.allocator, src);
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const arms = tree.module.decls[0].func.body[0].return_stmt.value.?.match.arms;
+    try testing.expectEqual(@as(usize, 3), arms.len);
+    // (0, (a, b)) — a 2-tuple whose second element is itself a 2-tuple.
+    try testing.expect(std.meta.activeTag(arms[0].pattern) == .tuple);
+    try testing.expectEqual(@as(usize, 2), arms[0].pattern.tuple.elems.len);
+    try testing.expect(std.meta.activeTag(arms[0].pattern.tuple.elems[0]) == .int_literal);
+    try testing.expect(std.meta.activeTag(arms[0].pattern.tuple.elems[1]) == .tuple);
+    // [x, y] — a 2-element list pattern.
+    try testing.expect(std.meta.activeTag(arms[1].pattern) == .list);
+    try testing.expectEqual(@as(usize, 2), arms[1].pattern.list.elems.len);
+    try testing.expect(std.meta.activeTag(arms[2].pattern) == .wildcard);
 }
 
 test "parses a function with a match expression" {

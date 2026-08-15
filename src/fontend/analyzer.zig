@@ -2025,10 +2025,10 @@ const Analyzer = struct {
             // A guarded arm is conditional, so it never covers a case or acts as a
             // catch-all (the guard might be false).
             const guarded = arm.guard != null;
+            if (!guarded and isIrrefutable(arm.pattern, subject)) {
+                has_catch_all = true;
+            }
             switch (arm.pattern) {
-                .wildcard, .binding => if (!guarded) {
-                    has_catch_all = true;
-                },
                 .bool_literal => |b| if (!guarded) {
                     if (b.value) covers_true = true else covers_false = true;
                 },
@@ -2037,10 +2037,7 @@ const Analyzer = struct {
             }
 
             const child = try self.newScope(self.current);
-            switch (arm.pattern) {
-                .binding => |b| try self.declareIn(child, b.name, .binding, .unknown, b.span),
-                else => {},
-            }
+            try self.declarePatternBindings(child, arm.pattern);
             const saved = self.current;
             self.current = child;
             if (arm.guard) |g| {
@@ -2075,6 +2072,35 @@ const Analyzer = struct {
             return .unknown;
         }
         return result orelse .unknown;
+    }
+
+    /// Whether `p` matches every value of type `ty` (so it's a catch-all). A
+    /// wildcard/binding always is; a tuple pattern is iff the subject is a tuple
+    /// of matching arity with all sub-patterns irrefutable. List patterns are
+    /// refutable (the length can differ), as are literals and enum cases.
+    fn isIrrefutable(p: Pattern, ty: Type) bool {
+        return switch (p) {
+            .wildcard, .binding => true,
+            .tuple => |seq| blk: {
+                if (tagOf(ty) != .tuple or ty.tuple.elems.len != seq.elems.len) break :blk false;
+                for (seq.elems, ty.tuple.elems) |sub, et| {
+                    if (!isIrrefutable(sub, et)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+
+    /// Declare every binding a pattern introduces into `scope` (recursing through
+    /// tuple/list sub-patterns). Bindings are `.unknown`-typed, matching the
+    /// lenient design.
+    fn declarePatternBindings(self: *Analyzer, scope: *Scope, p: Pattern) Error!void {
+        switch (p) {
+            .binding => |b| try self.declareIn(scope, b.name, .binding, .unknown, b.span),
+            .tuple, .list => |seq| for (seq.elems) |sub| try self.declarePatternBindings(scope, sub),
+            else => {},
+        }
     }
 
     /// Validate an `Enum.CASE` pattern against the match subject, recording the
@@ -2351,6 +2377,45 @@ test "a guarded arm does not establish exhaustiveness" {
     defer analysis.deinit();
     // The only arm is guarded, so the match is not exhaustive.
     try expectMessageContains(analysis, "not exhaustive");
+}
+
+test "an all-binding tuple pattern is an irrefutable catch-all" {
+    const src =
+        \\func f(p: (int, int)) -> str:
+        \\    return match p {
+        \\        (0, 0): "origin"
+        \\        (x, y): "point ${x},${y}"
+        \\    }
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    // `(x, y)` matches every `(int, int)`, so the match is exhaustive.
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "a list pattern is refutable, so it is not a catch-all" {
+    const src =
+        \\func f(xs: list<int>) -> str:
+        \\    return match xs {
+        \\        [a, b]: "pair"
+        \\    }
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    // The length can differ, so a list pattern never establishes exhaustiveness.
+    try expectMessageContains(analysis, "not exhaustive");
+}
+
+test "destructuring bindings are in scope in the arm body" {
+    const src =
+        \\func f(p: (int, int)) -> int:
+        \\    return match p {
+        \\        (x, y): x + y
+        \\    }
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
 }
 
 test "a wildcard makes a match exhaustive" {

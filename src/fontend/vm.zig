@@ -311,6 +311,8 @@ const Op = enum(u8) {
     build_map, // u16 entry count (2*count values popped)
     build_tuple, // u16 count -> pop count values into a tuple
     unpack, // u16 count -> pop a tuple/list of exactly count, push its elements
+    check_seq, // u8 kind (0=tuple,1=list), u16 count -> pop value, push bool (is that seq of that arity)
+    seq_get, // u16 index -> pop a tuple/list, push element[index] (destructuring)
     interp, // u16 part count -> concat the parts as strings
     new_instance, // u16 rttype index -> push a fresh instance (fields nil)
     get_member, // u16 name-const index -> instance field, or bound method
@@ -426,6 +428,11 @@ const Program = struct { script: *Function };
 // --- compiler ----------------------------------------------------------------
 
 const Local = struct { name: []const u8, depth: u32, captured: bool = false };
+
+/// A place a match arm's pattern test can fail: the jump operand to patch, and
+/// how many extracted element slots are live on the stack at that point (so the
+/// failure path can unwind exactly those before falling to the next arm).
+const MatchFail = struct { at: usize, depth: usize };
 
 const Loop = struct {
     /// Local count at loop entry, so `break`/`continue` can pop body locals.
@@ -1057,34 +1064,40 @@ const Compiler = struct {
 
         var end_jumps: std.ArrayList(usize) = .empty;
         for (m.arms) |arm| {
-            // Jumps to the next arm: from a failed pattern test and/or a false guard.
-            var nexts: [2]usize = undefined;
-            var nn: usize = 0;
-            // A binding renames the subject's slot for this arm's guard + body.
-            var restore_name: ?[]const u8 = null;
-            switch (arm.pattern) {
-                .wildcard => {},
-                .binding => |bd| {
-                    restore_name = self.cur.locals.items[subj].name;
-                    self.cur.locals.items[subj].name = bd.name;
-                },
-                else => {
-                    try self.emitLocal(.get_local, subj, arm.span);
-                    try self.patternConst(arm.pattern);
-                    try self.emit(.eq, arm.span);
-                    nexts[nn] = try self.emitJump(.jump_if_false, arm.span);
-                    nn += 1;
-                },
-            }
+            // Failure sites (from pattern tests and/or a false guard), each with the
+            // count of extracted element slots live at that point.
+            var fails: std.ArrayList(MatchFail) = .empty;
+            // A top-level binding renames the subject slot; destructuring patterns
+            // instead extract element values into fresh slots above the subject
+            // (`arm_base` .. locals.len). Save the subject slot's name so a binding
+            // rename can be undone for the next arm.
+            const saved_name = self.cur.locals.items[subj].name;
+            const arm_base = self.cur.locals.items.len; // == subj + 1
+            try self.emitPattern(arm.pattern, subj, arm_base, &fails, arm.span);
             if (arm.guard) |g| {
                 try self.expr(g.*);
-                nexts[nn] = try self.emitJump(.jump_if_false, arm.span);
-                nn += 1;
+                try fails.append(self.alloc, .{ .at = try self.emitJump(.jump_if_false, arm.span), .depth = self.cur.locals.items.len - arm_base });
             }
             try self.expr(arm.body.*);
-            if (restore_name) |rn| self.cur.locals.items[subj].name = rn;
+            const added = self.cur.locals.items.len - arm_base;
+            // Success: collapse [subject, extracted…, result] down to [subject,
+            // result] — copy the result into the first extracted slot (set_local
+            // doesn't pop), then drop the extras + the duplicate.
+            if (added > 0) {
+                try self.emitLocal(.set_local, arm_base, arm.span);
+                var k: usize = 0;
+                while (k < added) : (k += 1) try self.emit(.pop, arm.span);
+            }
+            self.cur.locals.items[subj].name = saved_name;
+            self.cur.locals.shrinkRetainingCapacity(arm_base);
             try end_jumps.append(self.alloc, try self.emitJump(.jump, arm.span));
-            for (nexts[0..nn]) |j| self.patchJump(j);
+            // Failure ladder: `added` operand-less pops, then fall through to the
+            // next arm. A failure with depth D lands D pops from the end, so it
+            // unwinds exactly its own live element slots before dropping through.
+            const ladder = self.here();
+            var pn: usize = 0;
+            while (pn < added) : (pn += 1) try self.emit(.pop, arm.span);
+            for (fails.items) |fs| self.patchJumpTo(fs.at, ladder + (added - fs.depth));
         }
         // No arm matched -> nil (mirrors the interpreter).
         try self.emit(.nil, m.span);
@@ -1093,6 +1106,47 @@ const Compiler = struct {
         // Collapse [subject, result] to just [result] at the subject's slot.
         try self.emitLocal(.set_local, subj, m.span);
         try self.emit(.pop, m.span);
+    }
+
+    /// Emit the test-and-bind for one pattern against the value already in local
+    /// `slot`. A failed structural/literal test records a `MatchFail` (jump +
+    /// current extracted depth relative to `arm_base`). Bindings rename their
+    /// slot; tuple/list patterns extract each element into a fresh local above the
+    /// current top and recurse, so element slots accumulate in `self.cur.locals`.
+    fn emitPattern(self: *Compiler, p: parser.Pattern, slot: usize, arm_base: usize, fails: *std.ArrayList(MatchFail), span: Span) Error!void {
+        switch (p) {
+            .wildcard => {},
+            .binding => |bd| self.cur.locals.items[slot].name = bd.name,
+            .tuple => |seq| try self.emitSeqPattern(seq, 0, slot, arm_base, fails),
+            .list => |seq| try self.emitSeqPattern(seq, 1, slot, arm_base, fails),
+            else => {
+                try self.emitLocal(.get_local, slot, span);
+                try self.patternConst(p);
+                try self.emit(.eq, span);
+                try fails.append(self.alloc, .{ .at = try self.emitJump(.jump_if_false, span), .depth = self.cur.locals.items.len - arm_base });
+            },
+        }
+    }
+
+    fn emitSeqPattern(self: *Compiler, seq: parser.Pattern.Seq, kind: u8, slot: usize, arm_base: usize, fails: *std.ArrayList(MatchFail)) Error!void {
+        // Refutable structural test: is the value a tuple/list of this arity?
+        try self.emitLocal(.get_local, slot, seq.span);
+        try self.emit(.check_seq, seq.span);
+        try self.emitByte(kind, seq.span);
+        try self.emitU16(@intCast(seq.elems.len), seq.span);
+        try fails.append(self.alloc, .{ .at = try self.emitJump(.jump_if_false, seq.span), .depth = self.cur.locals.items.len - arm_base });
+        // A wildcard element needs no slot; every other element is indexed out
+        // into a fresh local (its slot equals the current locals length) and its
+        // sub-pattern recurses against that slot.
+        for (seq.elems, 0..) |sub, i| {
+            if (std.meta.activeTag(sub) == .wildcard) continue;
+            const eslot = self.cur.locals.items.len;
+            try self.emitLocal(.get_local, slot, seq.span);
+            try self.emit(.seq_get, seq.span);
+            try self.emitU16(@intCast(i), seq.span);
+            try self.cur.locals.append(self.alloc, .{ .name = "$e", .depth = self.cur.scope_depth });
+            try self.emitPattern(sub, eslot, arm_base, fails, seq.span);
+        }
     }
 
     /// Push a literal pattern's value as a constant (for the arm's `==` test).
@@ -2185,6 +2239,26 @@ const VM = struct {
                     if (items.len != count) return self.fail("cannot destructure {d} value(s) into {d} name(s)", .{ items.len, count });
                     for (items) |item| try self.push(item);
                 },
+                .check_seq => {
+                    const kind = self.readByte(frame);
+                    const count = self.readU16(frame);
+                    const v = self.pop();
+                    const ok = switch (v) {
+                        .tuple => |l| kind == 0 and l.items.len == count,
+                        .list => |l| kind == 1 and l.items.len == count,
+                        else => false,
+                    };
+                    try self.push(.{ .bool = ok });
+                },
+                .seq_get => {
+                    const idx = self.readU16(frame);
+                    const v = self.pop();
+                    const items = switch (v) {
+                        .tuple, .list => |l| l.items,
+                        else => return self.fail("cannot destructure a {s}", .{@tagName(v)}),
+                    };
+                    try self.push(items[idx]);
+                },
                 .build_map => {
                     const count = self.readU16(frame);
                     const m = try self.alloc.create(Map);
@@ -3102,9 +3176,13 @@ fn disasmInstr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), ch: *const Chu
             try out.print(alloc, " -> {d}", .{readU16At(code, offset + 1)});
             break :blk offset + 3;
         },
-        .build_list, .build_map, .build_tuple, .unpack, .interp => blk: {
+        .build_list, .build_map, .build_tuple, .unpack, .interp, .seq_get => blk: {
             try out.print(alloc, " {d}", .{readU16At(code, offset + 1)});
             break :blk offset + 3;
+        },
+        .check_seq => blk: {
+            try out.print(alloc, " {s} {d}", .{ if (code[offset + 1] == 0) "tuple" else "list", readU16At(code, offset + 2) });
+            break :blk offset + 4;
         },
         else => offset + 1, // no operand
     };
@@ -3647,6 +3725,31 @@ test "vm: match guards (byte-identical to the interpreter)" {
         \\    print(classify(7))
     ;
     try expectVMOutput(src, "negative\nzero\neven\nodd\n");
+}
+
+test "vm: match destructuring patterns (byte-identical to the interpreter)" {
+    const src =
+        \\func classify(v: any) -> str:
+        \\    return match v {
+        \\        (0, (a, b)): "zero-pair ${a}/${b}"
+        \\        (x, y) if x > 10: "big ${x},${y}"
+        \\        (x, y): "flat ${x},${y}"
+        \\        [a, b, c]: "triple ${a} ${b} ${c}"
+        \\        [only]: "single ${only}"
+        \\        []: "empty"
+        \\        _: "other"
+        \\    }
+        \\
+        \\func main():
+        \\    print(classify((0, (7, 8))))
+        \\    print(classify((99, 1)))
+        \\    print(classify((3, 4)))
+        \\    print(classify([1, 2, 3]))
+        \\    print(classify([42]))
+        \\    print(classify([]))
+        \\    print(classify("x"))
+    ;
+    try expectVMOutput(src, "zero-pair 7/8\nbig 99,1\nflat 3,4\ntriple 1 2 3\nsingle 42\nempty\nother\n");
 }
 
 test "vm: string interpolation" {

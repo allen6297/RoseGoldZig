@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (395 as of writing)
+zig build test                  # run every test (402 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -60,7 +60,7 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
 | `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. Registers the `std/*.rg` files as named `@embedFile` imports on the frontend test module (they live outside `src/`) so tests can embed them. |
 | `std/*.rg` | The **standard library**, written in RoseGold itself: `lists.rg`, `strings.rg`, `mathx.rg`, `sets.rg`. Imported as `import std.lists` etc.; the CLI auto-discovers the `std/` root so no `--path` is needed (see **Standard library**). Runs on both backends. |
-| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, `defaults.rg`, `features.rg` (bitwise/slicing/named-args/comprehensions), `async.rg` (async/await/gather), and `stddemo.rg` (uses the bundled `std/` library — all run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
+| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, `defaults.rg`, `features.rg` (bitwise/slicing/named-args/comprehensions), `async.rg` (async/await/gather), `patterns.rg` (match guards + tuple/list destructuring), and `stddemo.rg` (uses the bundled `std/` library — all run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
 
 Each layer imports the ones below it (`interpreter`/`analyzer` → `parser` → `lexer`,
 and `loader`/`formatter` → `parser`); there are no upward dependencies. `main.zig`
@@ -151,12 +151,18 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   that close over the surrounding scope, `await expr` (a unary prefix binding tighter
   than binary ops; resolves a `task<T>` to its `T` — see **Async/await**), and
   `match subj { pattern: body, ... }`
-  (patterns: literals, `_`, a binding name, or an enum case `Enum.CASE`; an arm may
-  carry an `if <expr>` **guard** — `case x if x > 0: …` — which must be a bool and
-  is evaluated in the arm's (bound) scope, so the arm matches only when the pattern
-  fits *and* the guard holds. A **guarded arm never establishes exhaustiveness**
-  (its guard might be false), so it doesn't count as a catch-all or cover an enum
-  case. Covering every case is exhaustive without a `_`).
+  (patterns: literals, `_`, a binding name, an enum case `Enum.CASE`, or a
+  **destructuring pattern** — a tuple `(p1, p2, …)` or list `[p1, p2, …]` whose
+  sub-patterns may nest and bind (`(0, (a, b))`, `[x, y]`). A tuple pattern matches a
+  tuple of the same arity element-wise; a list pattern matches a list of *exactly*
+  that length. An arm may carry an `if <expr>` **guard** — `case x if x > 0: …` —
+  which must be a bool and is evaluated in the arm's (bound) scope, so the arm matches
+  only when the pattern fits *and* the guard holds. A **guarded arm never establishes
+  exhaustiveness** (its guard might be false), so it doesn't count as a catch-all or
+  cover an enum case. An **all-binding tuple pattern is irrefutable** (a catch-all)
+  when the subject is a tuple of matching arity — `(x, y)` covers every `(int, int)`;
+  a **list pattern is always refutable** (its length can differ). Covering every case
+  is exhaustive without a `_`).
 - **Types:** `int`, `float`, `str`, `bool`, `void`, `any`, `list`/`map` (optionally
   with element types — `list<T>`, `map<K, V>`, nestable; a bare `list`/`map` is
   `list<any>`/`map<any, any>`), tuples `(A, B, ...)` (fixed, ordered, compared
@@ -470,7 +476,13 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   instead of running, an `await_task` opcode forces + memoizes it, and `gather` awaits a
   list — deterministic, so byte-identical to the tree-walker. `match` on
   literal/`_`/binding patterns compiles too (the subject lives in a slot found via a
-  compile-time stack pointer, `FnState.stack_top`). Enums compile too: the enum name
+  compile-time stack pointer, `FnState.stack_top`). **Destructuring patterns** compile
+  too (`emitPattern`/`emitSeqPattern`): a `check_seq` opcode does the refutable
+  structural test (right tuple/list of the right arity), a `seq_get` opcode indexes an
+  element out into a fresh local, and sub-patterns recurse against those slots. A per-arm
+  **failure ladder** of operand-less `pop`s unwinds exactly the element slots a partial
+  match left live before dropping to the next arm (each fail site lands `depth` pops from
+  the ladder's end). Byte-identical to the interpreter. Enums compile too: the enum name
   binds to an `enum_type` value, `Enum.CASE` reads a case via `get_member`, cases compare
   by identity and print `Enum.CASE`, and enum-case `match` arms work. `static` members
   compile too: the type name binds to a `type` value (callable to construct, and the

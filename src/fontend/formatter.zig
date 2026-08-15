@@ -637,7 +637,18 @@ const Formatter = struct {
                 try self.w(".");
                 try self.w(ec.case);
             },
+            .tuple => |seq| try self.patternSeq("(", seq.elems, ")"),
+            .list => |seq| try self.patternSeq("[", seq.elems, "]"),
         }
+    }
+
+    fn patternSeq(self: *Formatter, open: []const u8, elems: []const Pattern, close: []const u8) Error!void {
+        try self.w(open);
+        for (elems, 0..) |sub, i| {
+            if (i > 0) try self.w(", ");
+            try self.pattern(sub);
+        }
+        try self.w(close);
     }
 
     fn lambda(self: *Formatter, lam: *const Expr.Lambda) Error!void {
@@ -698,6 +709,13 @@ test "formats match guards" {
     const out = try fmt(gpa, "func main():\n    print(match n {x if x>0: 1\n_: 0})");
     defer gpa.free(out);
     try testing.expectEqualStrings("func main():\n    print(match n {\n        x if x > 0: 1\n        _: 0\n    })\n", out);
+}
+
+test "formats tuple and list destructuring patterns" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "func main():\n    print(match p {( 0 ,y ):1\n[a,b,c]:2\n_:0})");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("func main():\n    print(match p {\n        (0, y): 1\n        [a, b, c]: 2\n        _: 0\n    })\n", out);
 }
 
 test "formats list comprehensions" {
