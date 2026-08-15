@@ -1,0 +1,70 @@
+<scheme name="Darcula" version="142" parent_scheme="Darcula">
+  <!-- Explicit default attributes for the RoseGold text-attribute keys in dark
+       schemes (Darcula and its descendants). See RoseGoldDefault.xml for why
+       these are needed. -->
+  <attributes>
+    <option name="ROSEGOLD_KEYWORD">
+      <value>
+        <option name="FOREGROUND" value="CC7832"/>
+        <option name="FONT_TYPE" value="1"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_TYPE">
+      <value>
+        <option name="FOREGROUND" value="A9B7C6"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_IDENTIFIER">
+      <value>
+        <option name="FOREGROUND" value="A9B7C6"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_NUMBER">
+      <value>
+        <option name="FOREGROUND" value="6897BB"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_STRING">
+      <value>
+        <option name="FOREGROUND" value="6A8759"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_COMMENT">
+      <value>
+        <option name="FOREGROUND" value="808080"/>
+        <option name="FONT_TYPE" value="2"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_OPERATOR">
+      <value>
+        <option name="FOREGROUND" value="A9B7C6"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_PARENS">
+      <value>
+        <option name="FOREGROUND" value="A9B7C6"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_BRACKETS">
+      <value>
+        <option name="FOREGROUND" value="A9B7C6"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_BRACES">
+      <value>
+        <option name="FOREGROUND" value="A9B7C6"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_FUN_DEF">
+      <value>
+        <option name="FOREGROUND" value="FFC66D"/>
+        <option name="FONT_TYPE" value="1"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_FUN_CALL">
+      <value>
+        <option name="FOREGROUND" value="FFC66D"/>
+      </value>
+    </option>
+  </attributes>
+</scheme>

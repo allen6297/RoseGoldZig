@@ -1,0 +1,72 @@
+<scheme name="Default" version="142" parent_scheme="Default">
+  <!-- Explicit default attributes for the RoseGold text-attribute keys in light
+       schemes. Without these the keys only *inherit* from their fallbacks, which
+       makes the Color Scheme page show them as inherited (override checkboxes
+       off), so editing a color appears to do nothing. Defining them here gives
+       each category its own editable default. -->
+  <attributes>
+    <option name="ROSEGOLD_KEYWORD">
+      <value>
+        <option name="FOREGROUND" value="0033B3"/>
+        <option name="FONT_TYPE" value="1"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_TYPE">
+      <value>
+        <option name="FOREGROUND" value="000080"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_IDENTIFIER">
+      <value>
+        <option name="FOREGROUND" value="000000"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_NUMBER">
+      <value>
+        <option name="FOREGROUND" value="1750EB"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_STRING">
+      <value>
+        <option name="FOREGROUND" value="067D17"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_COMMENT">
+      <value>
+        <option name="FOREGROUND" value="8C8C8C"/>
+        <option name="FONT_TYPE" value="2"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_OPERATOR">
+      <value>
+        <option name="FOREGROUND" value="000000"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_PARENS">
+      <value>
+        <option name="FOREGROUND" value="000000"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_BRACKETS">
+      <value>
+        <option name="FOREGROUND" value="000000"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_BRACES">
+      <value>
+        <option name="FOREGROUND" value="000000"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_FUN_DEF">
+      <value>
+        <option name="FOREGROUND" value="00627A"/>
+        <option name="FONT_TYPE" value="1"/>
+      </value>
+    </option>
+    <option name="ROSEGOLD_FUN_CALL">
+      <value>
+        <option name="FOREGROUND" value="00627A"/>
+      </value>
+    </option>
+  </attributes>
+</scheme>
