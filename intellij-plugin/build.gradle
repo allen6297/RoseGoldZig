@@ -1,8 +1,9 @@
 plugins {
     id 'java'
     // IntelliJ Platform Gradle Plugin 2.x — rewritten for modern Gradle (8.5+,
-    // incl. Gradle 9). The classic 1.x plugin does NOT work on Gradle 9.
-    id 'org.jetbrains.intellij.platform' version '2.6.0'
+    // incl. Gradle 9). The classic 1.x plugin does NOT work on Gradle 9. Keep this
+    // recent enough to resolve the target platform (older 2.x can't see 2026.x).
+    id 'org.jetbrains.intellij.platform' version '2.18.1'
 }
 
 group = 'org.rosegold'
@@ -17,8 +18,13 @@ repositories {
 
 dependencies {
     intellijPlatform {
-        // The target IDE to build/run against. IC = IDEA Community.
-        intellijIdeaCommunity '2023.3.8'
+        // The target IDE to build/run against. Since 2025.3 the Community and
+        // Ultimate distributions were unified into a single `intellijIdea(...)`
+        // artifact. Downloading a full release assembles the complete platform
+        // classpath; override the version with -PplatformVersion=… to match your
+        // IDE. Keep this in step with `sinceBuild` below.
+        def platformVersion = project.findProperty('platformVersion') ?: '2026.2.1'
+        intellijIdea platformVersion
     }
 }
 
@@ -32,7 +38,9 @@ intellijPlatform {
     pluginConfiguration {
         ideaVersion {
             sinceBuild = '233'
-            untilBuild = '243.*'
+            // No upper bound: the plugin uses stable platform APIs, so let it
+            // load on current and future builds (the IDE only enforces this).
+            untilBuild = provider { null }
         }
     }
 }

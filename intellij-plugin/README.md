@@ -33,27 +33,38 @@ IDEs. Written in Java against the IntelliJ Platform.
 
 ## Build & install
 
-Uses the **IntelliJ Platform Gradle Plugin 2.x**, which supports Gradle 8.5+
-(including Gradle 9). You need a JetBrains IDE (which bundles Gradle) or a
-standalone Gradle 8.5+.
+Uses the **IntelliJ Platform Gradle Plugin 2.x** and a committed Gradle wrapper
+(`./gradlew`, Gradle 9.6), so you don't need Gradle on your PATH.
 
-**From the command line** (with `gradle` on PATH):
+By default it builds against **IntelliJ IDEA 2026.2.1** (platform build 262).
+That platform runs on **JDK 25**, so the plugin must be compiled with a JDK 25 —
+`gradle.properties` points the toolchain at the JBR 25 bundled inside an
+installed IDE (`/Applications/IntelliJ IDEA.app/Contents/jbr`), and
+`settings.gradle` enables toolchain auto-provisioning as a fallback (Gradle
+downloads a JDK 25 if none is found).
+
+**From the command line:**
 
 ```bash
 cd intellij-plugin
-gradle buildPlugin          # → build/distributions/rosegold-intellij-0.1.0.zip
-gradle runIde               # launch a sandbox IDE to try it
+./gradlew buildPlugin        # → build/distributions/rosegold-intellij-0.1.0.zip
+./gradlew runIde             # launch a sandbox IDE to try it
 ```
 
 Then install the zip via *Settings | Plugins | ⚙ | Install Plugin from Disk…*.
 
+**Targeting a different IDE version:** pass `-PplatformVersion=…` to match your
+IDE, e.g. `./gradlew buildPlugin -PplatformVersion=2025.3`. If your IDE's bundled
+JBR lives elsewhere, add its `…/Contents/Home` to
+`org.gradle.java.installations.paths` in `gradle.properties` (or let the foojay
+resolver download the matching JDK). The plugin declares `since-build=233` with
+no upper bound, so a single build loads on current and future IDEs.
+
 **From the IDE:** open the `intellij-plugin/` folder in IntelliJ IDEA as a Gradle
 project and run the **`runIde`** or **`buildPlugin`** Gradle task.
 
-> First run downloads the target IntelliJ IDEA Community distribution
-> (`2023.3.8`, a few hundred MB) — expect it to take a while.
-> No Gradle wrapper (`gradlew`) is committed; use your installed Gradle, or run
-> `gradle wrapper` once to generate one.
+> First run downloads the target IntelliJ IDEA distribution (a few hundred MB)
+> and, if needed, a JDK 25 — expect it to take a while.
 
 ## Pointing it at the compiler
 
