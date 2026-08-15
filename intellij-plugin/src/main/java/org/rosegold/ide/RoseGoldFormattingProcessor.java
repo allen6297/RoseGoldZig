@@ -28,16 +28,12 @@ public final class RoseGoldFormattingProcessor implements ExternalFormatProcesso
     }
 
     @Override
-    public @Nullable TextRange format(@NotNull PsiFile psiFile, @NotNull TextRange textRange, boolean b, boolean b1, boolean b2, int i) {
-        return null;
-    }
-
-    @Override
     public @Nullable TextRange format(@NotNull PsiFile source,
                                       @NotNull TextRange range,
                                       boolean canChangeWhiteSpaceOnly,
                                       boolean keepLineBreaks,
-                                      boolean enableBulkUpdate) {
+                                      boolean enableBulkUpdate,
+                                      int cursorOffset) {
         Project project = source.getProject();
         Document document = PsiDocumentManager.getInstance(project).getDocument(source);
         if (document == null) {
@@ -53,8 +49,8 @@ public final class RoseGoldFormattingProcessor implements ExternalFormatProcesso
     }
 
     @Override
-    public int indent(@NotNull PsiFile source, int lineStartOffset) {
-        return 0;
+    public @Nullable String indent(@NotNull PsiFile source, int lineStartOffset) {
+        return null; // whole-file `fmt` only; no on-the-fly single-line indentation
     }
 
     @Override
