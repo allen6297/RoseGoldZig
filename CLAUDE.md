@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (386 as of writing)
+zig build test                  # run every test (391 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -58,8 +58,9 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/fontend/lsp.zig` | Language Server (`lsp`): JSON-RPC over stdio. Reuses the parser+analyzer for live diagnostics (`publishDiagnostics`), plus hover, go-to-definition, and document symbols from a declaration scan. |
 | `src/fontend/tests.zig` | Test aggregator; the `zig build test` frontend target roots here. |
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
-| `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. |
-| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, `defaults.rg`, `features.rg` (bitwise/slicing/named-args/comprehensions), and `async.rg` (async/await/gather — all run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
+| `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. Registers the `std/*.rg` files as named `@embedFile` imports on the frontend test module (they live outside `src/`) so tests can embed them. |
+| `std/*.rg` | The **standard library**, written in RoseGold itself: `lists.rg`, `strings.rg`, `mathx.rg`, `sets.rg`. Imported as `import std.lists` etc.; the CLI auto-discovers the `std/` root so no `--path` is needed (see **Standard library**). Runs on both backends. |
+| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, `defaults.rg`, `features.rg` (bitwise/slicing/named-args/comprehensions), `async.rg` (async/await/gather), and `stddemo.rg` (uses the bundled `std/` library — all run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
 
 Each layer imports the ones below it (`interpreter`/`analyzer` → `parser` → `lexer`,
 and `loader`/`formatter` → `parser`); there are no upward dependencies. `main.zig`
@@ -283,6 +284,28 @@ drives the loader, then the analyzer and interpreter over the loaded module set
 - **Limits (v1):** imports resolve relative to the importer's dir, then the supplied
   search roots (no implicit/global package registry); a runtime error is attributed to
   the entry file.
+
+### Standard library
+- **`std/` is a library written in RoseGold itself**, loaded through the ordinary module
+  system — it dogfoods imports rather than being built into the runtime. Modules:
+  `std.lists` (sum/product/take/drop/unique/flatten/zip/enumerate/chunk/…), `std.strings`
+  (repeat/pad_left/pad_right/center/capitalize/title/words/lines/count_char/reverse_str/…),
+  `std.mathx` (gcd/lcm/clamp/sign/factorial/is_prime/fib/mean/… + `PI`; named `mathx` so it
+  doesn't shadow the built-in `sqrt`/`pow`/…), and `std.sets` (a `Set` class backed by a
+  map: add/member/remove/size/to_list/union/intersect, plus `of(list)`). Element types are
+  kept loose (`list`/`any`). See `examples/stddemo.rg` (runs on both backends).
+- **Auto-discovered root.** The CLI (`main.zig` → `findStdRoot`) appends the directory that
+  *contains* `std/` as an implicit search root — found by walking up from the current
+  directory (`.`, `..`, `../..`) to the first level with a `std/lists.rg` — so
+  `import std.lists` resolves with no `--path`. It's appended **after** any user `--path`
+  roots, so those still win, and a project's own local module shadows it (importer-relative
+  resolution is tried first). Pass `--path DIR` (where `DIR` holds `std/`) to point
+  elsewhere.
+- **Tested as real source.** `build.zig` registers the `std/*.rg` files as named
+  `@embedFile` imports on the frontend test module (they live outside `src/`); the analyzer
+  embeds them and asserts they analyze cleanly, and the interpreter + VM embed `lists.rg`
+  and `sets.rg` and run them (byte-identical) so the bundled library is covered on both
+  backends.
 
 ### Default parameters
 - A parameter may declare a **default value** (`func f(a, b = 10, c = BASE):`). Defaults

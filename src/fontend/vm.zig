@@ -4048,3 +4048,21 @@ test "vm: an error raised in an async body propagates through await" {
         "caught: kaboom\n",
     );
 }
+
+test "vm: std.lists (the real bundled module) runs and matches the interpreter" {
+    try expectModuleOutput(
+        "lists",
+        @embedFile("std/lists.rg"),
+        "import std.lists\nfunc main():\n    print(lists.sum([1, 2, 3, 4]))\n    print(lists.unique([1, 1, 2, 3, 3]))\n    print(lists.chunk([1, 2, 3, 4, 5], 2))",
+        "10\n[1, 2, 3]\n[[1, 2], [3, 4], [5]]\n",
+    );
+}
+
+test "vm: std.sets (a bundled class) runs and matches the interpreter" {
+    try expectModuleOutput(
+        "sets",
+        @embedFile("std/sets.rg"),
+        "import std.sets\nfunc main():\n    var s = sets.of([1, 2, 2, 3])\n    print(s.size())\n    print(s.member(2))\n    print(s.member(9))",
+        "3\ntrue\nfalse\n",
+    );
+}

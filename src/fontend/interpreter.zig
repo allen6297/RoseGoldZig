@@ -3443,6 +3443,24 @@ test "an error raised in an async body propagates through await" {
     );
 }
 
+test "std.lists (the real bundled module) runs through the interpreter" {
+    try expectProgramOutput(
+        "lists",
+        @embedFile("std/lists.rg"),
+        "import std.lists\nfunc main():\n    print(lists.sum([1, 2, 3, 4]))\n    print(lists.unique([1, 1, 2, 3, 3]))\n    print(lists.chunk([1, 2, 3, 4, 5], 2))",
+        "10\n[1, 2, 3]\n[[1, 2], [3, 4], [5]]\n",
+    );
+}
+
+test "std.sets (a bundled class) runs through the interpreter" {
+    try expectProgramOutput(
+        "sets",
+        @embedFile("std/sets.rg"),
+        "import std.sets\nfunc main():\n    var s = sets.of([1, 2, 2, 3])\n    print(s.size())\n    print(s.member(2))\n    print(s.member(9))",
+        "3\ntrue\nfalse\n",
+    );
+}
+
 test "reaching an undefined module member is a runtime error" {
     const gpa = testing.allocator;
     var dep_tree = try parser.parse(gpa, "pub func real() -> int:\n    return 1");

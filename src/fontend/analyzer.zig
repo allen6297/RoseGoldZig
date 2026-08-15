@@ -3763,3 +3763,21 @@ test "assigning an async result to the inner type without await is a type error"
     // work(1) is a task<int>, not an int, until awaited.
     try expectMessageContains(analysis, "task<int>");
 }
+
+// The bundled standard library is RoseGold source; guard that it stays valid as
+// the language evolves. Each module is standalone (no imports), so it parses and
+// analyzes on its own with zero diagnostics. (The files are registered as named
+// `@embedFile` imports in build.zig, since they live outside `src/`.)
+test "the bundled standard library modules analyze cleanly" {
+    const sources = [_][]const u8{
+        @embedFile("std/lists.rg"),
+        @embedFile("std/strings.rg"),
+        @embedFile("std/mathx.rg"),
+        @embedFile("std/sets.rg"),
+    };
+    for (sources) |src| {
+        var analysis = try analyzeSource(testing.allocator, src);
+        defer analysis.deinit();
+        try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+    }
+}

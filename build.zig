@@ -83,6 +83,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // The bundled standard library (RoseGold source under `std/`) lives outside
+    // `src/`, so the frontend tests reach it through named `@embedFile` imports
+    // (wired onto the frontend test module below) rather than a relative path.
+    const std_modules = [_][]const u8{ "std/lists.rg", "std/strings.rg", "std/mathx.rg", "std/sets.rg" };
+
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
@@ -139,13 +144,16 @@ pub fn build(b: *std.Build) void {
     // their own files under src/fontend and are not reachable from the
     // executable's tests, so they get a dedicated test target rooted at an
     // aggregator that imports all of them.
-    const frontend_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/fontend/tests.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const frontend_module = b.createModule(.{
+        .root_source_file = b.path("src/fontend/tests.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    // The interpreter/VM tests embed the real std modules (see above).
+    for (std_modules) |name| {
+        frontend_module.addAnonymousImport(name, .{ .root_source_file = b.path(name) });
+    }
+    const frontend_tests = b.addTest(.{ .root_module = frontend_module });
     const run_frontend_tests = b.addRunArtifact(frontend_tests);
 
     // A top level step for running all tests. dependOn can be called multiple

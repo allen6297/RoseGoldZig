@@ -133,6 +133,11 @@ fn handle(
     }
     const path = args[arg_index];
 
+    // Append the bundled standard library's location as an implicit search root
+    // (after any user `--path` roots, so those win), letting `import std.foo`
+    // resolve without a flag.
+    if (findStdRoot(arena, io)) |std_root| try roots.append(arena, std_root);
+
     // Load the entry file and everything it imports (lex + parse each), in
     // dependency order. Missing files, cycles, and parse errors surface here.
     const graph = try Loader.loadWithPaths(arena, io, path, roots.items);
@@ -422,6 +427,24 @@ fn lineText(src: []const u8, line: u32) []const u8 {
 
 fn trimCr(s: []const u8) []const u8 {
     return if (s.len > 0 and s[s.len - 1] == '\r') s[0 .. s.len - 1] else s;
+}
+
+/// Locate the bundled standard library and return the search *root* under which
+/// `import std.foo` resolves (i.e. the directory that *contains* the `std/`
+/// folder), or null if none is found.
+///
+/// The lookup is relative to the current directory, walking up a few levels
+/// (`.`, `..`, `../..`) so it works whether the program runs from the project
+/// root or a subdirectory; the first level whose `std/lists.rg` exists wins.
+/// A user can always point elsewhere with `--path`, which takes precedence.
+fn findStdRoot(arena: std.mem.Allocator, io: Io) ?[]const u8 {
+    const roots = [_][]const u8{ ".", "..", "../.." };
+    for (roots) |root| {
+        const sentinel = std.fs.path.join(arena, &.{ root, "std", "lists.rg" }) catch continue;
+        _ = Io.Dir.cwd().readFileAlloc(io, sentinel, arena, .limited(4096)) catch continue;
+        return root;
+    }
+    return null;
 }
 
 test "simple test" {
