@@ -34,6 +34,8 @@
         <additionalTextAttributes scheme="Darcula" file="colorSchemes/RoseGoldDarcula.xml"/>
         <lang.commenter language="RoseGold" implementationClass="org.rosegold.ide.RoseGoldCommenter"/>
         <lang.braceMatcher language="RoseGold" implementationClass="org.rosegold.ide.RoseGoldBraceMatcher"/>
+        <lang.quoteHandler language="RoseGold" implementationClass="org.rosegold.ide.RoseGoldQuoteHandler"/>
+        <typedHandler implementation="org.rosegold.ide.RoseGoldTypedHandler"/>
         <completion.contributor language="RoseGold"
                                 implementationClass="org.rosegold.ide.RoseGoldCompletionContributor"/>
         <codeInsight.parameterInfo language="RoseGold"
