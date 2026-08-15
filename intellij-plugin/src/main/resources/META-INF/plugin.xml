@@ -36,6 +36,8 @@
         <lang.braceMatcher language="RoseGold" implementationClass="org.rosegold.ide.RoseGoldBraceMatcher"/>
         <completion.contributor language="RoseGold"
                                 implementationClass="org.rosegold.ide.RoseGoldCompletionContributor"/>
+        <codeInsight.parameterInfo language="RoseGold"
+                                   implementationClass="org.rosegold.ide.RoseGoldParameterInfoHandler"/>
         <externalAnnotator language="RoseGold"
                            implementationClass="org.rosegold.ide.RoseGoldExternalAnnotator"/>
         <externalFormatProcessor implementation="org.rosegold.ide.RoseGoldFormattingProcessor"/>
