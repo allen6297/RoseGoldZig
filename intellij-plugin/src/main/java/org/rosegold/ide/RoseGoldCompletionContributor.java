@@ -20,8 +20,10 @@ import org.jetbrains.annotations.NotNull;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -90,14 +92,18 @@ public final class RoseGoldCompletionContributor extends CompletionContributor {
                             return;
                         }
 
-                        // `receiver.<caret>` → that module's members.
+                        // `receiver.<caret>` → an imported module's members, or a
+                        // typed local's / a class's own members.
                         int i = offset;
                         while (i > 0 && isIdentChar(text.charAt(i - 1))) i--;
                         if (i > 0 && text.charAt(i - 1) == '.') {
                             int dot = i - 1;
                             int j = dot;
                             while (j > 0 && isIdentChar(text.charAt(j - 1))) j--;
-                            addModuleMembers(parameters, text, text.substring(j, dot), result);
+                            String receiver = text.substring(j, dot);
+                            if (!addModuleMembers(parameters, text, receiver, result)) {
+                                addTypeMembers(text, receiver, dot, result);
+                            }
                             return;
                         }
 
@@ -137,9 +143,13 @@ public final class RoseGoldCompletionContributor extends CompletionContributor {
         return PrioritizedLookupElement.withPriority(e, priority);
     }
 
-    /** After `receiver.`: if `receiver` is an imported module, add its `pub` members. */
-    private static void addModuleMembers(CompletionParameters parameters, String text,
-                                         String receiver, CompletionResultSet result) {
+    /**
+     * After `receiver.`: if `receiver` is an imported module, add its `pub`
+     * members. Returns true if `receiver` resolved to a module (so the caller
+     * shouldn't also try a type).
+     */
+    private static boolean addModuleMembers(CompletionParameters parameters, String text,
+                                            String receiver, CompletionResultSet result) {
         String[] segs = null;
         Matcher im = IMPORT.matcher(text);
         while (im.find()) {
@@ -150,17 +160,17 @@ public final class RoseGoldCompletionContributor extends CompletionContributor {
             }
         }
         if (segs == null) {
-            return;
+            return false;
         }
         File mod = resolveModuleFile(parameters, segs);
         if (mod == null) {
-            return;
+            return true; // it names an import; just couldn't read the file
         }
         final String src;
         try {
             src = FileUtil.loadFile(mod);
         } catch (Exception e) {
-            return;
+            return true;
         }
         Matcher pm = PUB_DECL.matcher(src);
         while (pm.find()) {
@@ -168,6 +178,63 @@ public final class RoseGoldCompletionContributor extends CompletionContributor {
             result.addElement(prioritized(
                     base(pm.group(2), receiver + " " + kind, kind.equals("func")), 20));
         }
+        return true;
+    }
+
+    /**
+     * After `receiver.`: when `receiver` is a class/struct name (statics) or a
+     * local/parameter whose type is a class/struct declared in this file, add
+     * that type's `var`/`func` members. Types are inferred from `var x: T`,
+     * `var x = T(…)`, or a `x: T` parameter annotation.
+     */
+    private static void addTypeMembers(String text, String receiver, int before,
+                                       CompletionResultSet result) {
+        Map<String, RoseGoldDeclaration> types = new HashMap<>();
+        for (RoseGoldDeclaration d : RoseGoldDeclarations.scanFlat(text)) {
+            if (d.kind == RoseGoldDeclaration.Kind.CLASS || d.kind == RoseGoldDeclaration.Kind.STRUCT) {
+                types.putIfAbsent(d.name, d);
+            }
+        }
+        // `Type.` (statics) uses the name directly; otherwise infer the local's type.
+        RoseGoldDeclaration type = types.get(receiver);
+        if (type == null) {
+            String inferred = inferLocalType(text, receiver, before, types.keySet());
+            type = inferred == null ? null : types.get(inferred);
+        }
+        if (type == null) {
+            return;
+        }
+        for (RoseGoldDeclaration m : type.children) {
+            boolean fn = m.kind == RoseGoldDeclaration.Kind.FUNCTION;
+            if (fn || m.kind == RoseGoldDeclaration.Kind.VAR) {
+                result.addElement(prioritized(
+                        base(m.name, type.name + " " + (fn ? "func" : "field"), fn), 25));
+            }
+        }
+    }
+
+    /**
+     * Infer the type of local/parameter `receiver` by scanning for a binding
+     * before `before`: `[var|const] receiver: T`, or `receiver = T(`. Only a `T`
+     * naming a known class/struct (`knownTypes`) counts; the nearest such binding
+     * wins.
+     */
+    private static String inferLocalType(String text, String receiver, int before, Set<String> knownTypes) {
+        Pattern p = Pattern.compile(
+                "\\b" + Pattern.quote(receiver) +
+                        "\\s*(?::\\s*([A-Za-z_][A-Za-z0-9_]*)|=\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\()");
+        Matcher m = p.matcher(text);
+        String best = null;
+        while (m.find()) {
+            if (m.start() >= before) {
+                break;
+            }
+            String t = m.group(1) != null ? m.group(1) : m.group(2);
+            if (t != null && knownTypes.contains(t)) {
+                best = t; // last binding before the use wins
+            }
+        }
+        return best;
     }
 
     /** `import <caret>` → sibling `.rg` modules and `std.*` modules. */

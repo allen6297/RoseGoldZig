@@ -8,7 +8,8 @@
         <ul>
             <li>Syntax highlighting (keywords, types, strings, numbers, comments; function defs vs. calls)</li>
             <li><code>##</code> line-comment toggling and brace matching</li>
-            <li>Keyword &amp; builtin code completion, plus quick-doc for the standard library</li>
+            <li>Keyword, builtin &amp; member completion (a typed local's <code>x.method()</code>), plus quick-doc for the standard library</li>
+            <li>Rename refactoring (Shift+F6) across the file</li>
             <li>Live error highlighting via the RoseGold compiler's <code>check</code> command</li>
             <li>Structure view, code folding, and reformatting via <code>fmt</code></li>
             <li>Live templates, auto-indent after <code>:</code>, go-to-declaration, and find-usages</li>
@@ -58,6 +59,7 @@
                                   implementation="org.rosegold.ide.RoseGoldReferenceContributor"/>
         <lang.findUsagesProvider language="RoseGold"
                                  implementationClass="org.rosegold.ide.RoseGoldFindUsagesProvider"/>
+        <renameHandler implementation="org.rosegold.ide.RoseGoldRenameHandler"/>
 
         <applicationService serviceImplementation="org.rosegold.ide.RoseGoldSettings"/>
         <applicationConfigurable parentId="language"
