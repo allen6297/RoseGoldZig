@@ -1,5 +1,8 @@
 plugins {
     id 'java'
+    // Kotlin is used for the inlay-hints provider (the declarative inlay API is
+    // absent from this platform's classpath, and the legacy one is Kotlin-shaped).
+    id 'org.jetbrains.kotlin.jvm' version '2.4.0'
     // IntelliJ Platform Gradle Plugin 2.x — rewritten for modern Gradle (8.5+,
     // incl. Gradle 9). The classic 1.x plugin does NOT work on Gradle 9. Keep this
     // recent enough to resolve the target platform (older 2.x can't see 2026.x).
@@ -7,7 +10,7 @@ plugins {
 }
 
 group = 'org.rosegold'
-version = '0.1.4'
+version = '0.1.5'
 
 repositories {
     mavenCentral()
@@ -31,6 +34,14 @@ dependencies {
 java {
     sourceCompatibility = JavaVersion.VERSION_17
     targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        // The inlay API is @ApiStatus.Experimental/ScheduledForRemoval in spots.
+        freeCompilerArgs.add('-Xjvm-default=all')
+    }
 }
 
 intellijPlatform {

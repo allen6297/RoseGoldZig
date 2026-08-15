@@ -38,6 +38,8 @@
                                 implementationClass="org.rosegold.ide.RoseGoldCompletionContributor"/>
         <codeInsight.parameterInfo language="RoseGold"
                                    implementationClass="org.rosegold.ide.RoseGoldParameterInfoHandler"/>
+        <codeInsight.inlayProvider language="RoseGold"
+                                   implementationClass="org.rosegold.ide.RoseGoldInlayHintsProvider"/>
         <externalAnnotator language="RoseGold"
                            implementationClass="org.rosegold.ide.RoseGoldExternalAnnotator"/>
         <externalFormatProcessor implementation="org.rosegold.ide.RoseGoldFormattingProcessor"/>
