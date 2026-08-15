@@ -25,7 +25,7 @@ zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (402 as of writing)
+zig build test                  # run every test (406 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -59,8 +59,8 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/fontend/tests.zig` | Test aggregator; the `zig build test` frontend target roots here. |
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
 | `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. Registers the `std/*.rg` files as named `@embedFile` imports on the frontend test module (they live outside `src/`) so tests can embed them. |
-| `std/*.rg` | The **standard library**, written in RoseGold itself: `lists.rg`, `strings.rg`, `mathx.rg`, `sets.rg`. Imported as `import std.lists` etc.; the CLI auto-discovers the `std/` root so no `--path` is needed (see **Standard library**). Runs on both backends. |
-| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, `defaults.rg`, `features.rg` (bitwise/slicing/named-args/comprehensions), `async.rg` (async/await/gather), `patterns.rg` (match guards + tuple/list destructuring), and `stddemo.rg` (uses the bundled `std/` library — all run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
+| `std/*.rg` | The **standard library**, written in RoseGold itself: `lists.rg`, `strings.rg`, `mathx.rg`, `sets.rg`, `test.rg` (a unit-test framework). Imported as `import std.lists` etc.; the CLI auto-discovers the `std/` root so no `--path` is needed (see **Standard library**). Runs on both backends. |
+| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, `defaults.rg`, `features.rg` (bitwise/slicing/named-args/comprehensions), `async.rg` (async/await/gather), `patterns.rg` (match guards + tuple/list destructuring), `stddemo.rg` (uses the bundled `std/` library), and `selftest.rg` (a `std.test` suite — all run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
 
 Each layer imports the ones below it (`interpreter`/`analyzer` → `parser` → `lexer`,
 and `loader`/`formatter` → `parser`); there are no upward dependencies. `main.zig`
@@ -173,6 +173,13 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   A subclass is assignable to its bases (via `extends`/`uses`, transitively). `nil` and a
   value both fit `?T`; a `?T` must be unwrapped (e.g. narrowed via `if v != nil:`) before
   it's usable as `T`. `?T`-returning functions may fall off the end (yielding `nil`).
+- **Equality (`==`/`!=`) is deep for every composite value.** Lists, maps, and tuples all
+  compare **structurally by value** (recursively), so `[1, 2] == [1, 2]` and
+  `{1: "a"} == {1: "a"}` are true regardless of identity; two maps are equal when they map
+  the same keys to equal values (order-independent). It's a single `valuesEqual` (plus a
+  `mapsEqual` helper) in each backend, also used for `match` literal tests and map-key
+  lookup, so both backends stay byte-identical. (Instances/closures/etc. still compare by
+  identity.)
 - **Analyzer checks:** undefined names, duplicate declarations, unknown types,
   init/return/operator/condition/assignment/call type compatibility, construction
   arguments (count + types against a class's `init`, or none if it has no `init`),
@@ -301,9 +308,14 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `std.lists` (sum/product/take/drop/unique/flatten/zip/enumerate/chunk/…), `std.strings`
   (repeat/pad_left/pad_right/center/capitalize/title/words/lines/count_char/reverse_str/…),
   `std.mathx` (gcd/lcm/clamp/sign/factorial/is_prime/fib/mean/… + `PI`; named `mathx` so it
-  doesn't shadow the built-in `sqrt`/`pow`/…), and `std.sets` (a `Set` class backed by a
-  map: add/member/remove/size/to_list/union/intersect, plus `of(list)`). Element types are
-  kept loose (`list`/`any`). See `examples/stddemo.rg` (runs on both backends).
+  doesn't shadow the built-in `sqrt`/`pow`/…), `std.sets` (a `Set` class backed by a
+  map: add/member/remove/size/to_list/union/intersect, plus `of(list)`), and `std.test`
+  (a tiny unit-testing framework: `assert`/`assert_eq`/`assert_ne`/`assert_true`/
+  `assert_false`/`assert_raises`, and `run(cases)` — a list of `(name, fn)` pairs, each a
+  zero-arg callable; an assertion `raise`s on failure, `run` catches per case, prints a
+  line each plus a summary, and returns whether all passed). Element types are
+  kept loose (`list`/`any`). See `examples/stddemo.rg` and `examples/selftest.rg` (both
+  run on both backends).
 - **Auto-discovered root.** The CLI (`main.zig` → `findStdRoot`) appends the directory that
   *contains* `std/` as an implicit search root — found by walking up from the current
   directory (`.`, `..`, `../..`) to the first level with a `std/lists.rg` — so
@@ -313,9 +325,9 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   elsewhere.
 - **Tested as real source.** `build.zig` registers the `std/*.rg` files as named
   `@embedFile` imports on the frontend test module (they live outside `src/`); the analyzer
-  embeds them and asserts they analyze cleanly, and the interpreter + VM embed `lists.rg`
-  and `sets.rg` and run them (byte-identical) so the bundled library is covered on both
-  backends.
+  embeds them and asserts they analyze cleanly, and the interpreter + VM embed `lists.rg`,
+  `sets.rg`, and `test.rg` and run them (byte-identical) so the bundled library is covered
+  on both backends.
 
 ### Default parameters
 - A parameter may declare a **default value** (`func f(a, b = 10, c = BASE):`). Defaults

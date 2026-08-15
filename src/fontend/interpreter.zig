@@ -261,6 +261,25 @@ fn toFloat(v: Value) ?f64 {
     };
 }
 
+/// Two maps are equal when they have the same size and every key in `a` maps to
+/// a value equal to that key's value in `b` (order-independent; keys are unique
+/// within a map). Used by `valuesEqual` for deep map equality.
+fn mapsEqual(a: *const Map, b: *const Map) bool {
+    if (a.entries.items.len != b.entries.items.len) return false;
+    for (a.entries.items) |ea| {
+        var found = false;
+        for (b.entries.items) |eb| {
+            if (valuesEqual(ea.key, eb.key)) {
+                if (!valuesEqual(ea.value, eb.value)) return false;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
 fn valuesEqual(a: Value, b: Value) bool {
     return switch (a) {
         .nil => b == .nil,
@@ -276,8 +295,17 @@ fn valuesEqual(a: Value, b: Value) bool {
         },
         .bool => |x| b == .bool and b.bool == x,
         .str => |x| b == .str and std.mem.eql(u8, x, b.str),
-        .list => |x| b == .list and x == b.list,
-        .map => |x| b == .map and x == b.map,
+        // Lists and maps compare deeply by value (like tuples/strings): a list is
+        // equal to another of the same length with elementwise-equal items; a map
+        // to another of the same size mapping every key to an equal value.
+        .list => |x| b == .list and blk: {
+            if (x.items.len != b.list.items.len) break :blk false;
+            for (x.items, b.list.items) |ea, eb| {
+                if (!valuesEqual(ea, eb)) break :blk false;
+            }
+            break :blk true;
+        },
+        .map => |x| b == .map and mapsEqual(x, b.map),
         .func => |x| b == .func and x == b.func,
         .builtin => |x| b == .builtin and x == b.builtin,
         .instance => |x| b == .instance and x == b.instance,
@@ -3536,6 +3564,27 @@ test "std.sets (a bundled class) runs through the interpreter" {
         @embedFile("std/sets.rg"),
         "import std.sets\nfunc main():\n    var s = sets.of([1, 2, 2, 3])\n    print(s.size())\n    print(s.member(2))\n    print(s.member(9))",
         "3\ntrue\nfalse\n",
+    );
+}
+
+test "lists and maps compare deeply by value" {
+    const src =
+        \\func main():
+        \\    print([1, 2, 3] == [1, 2, 3])
+        \\    print([1, 2] == [1, 2, 3])
+        \\    print([[1], [2]] == [[1], [2]])
+        \\    print({1: "a", 2: "b"} == {2: "b", 1: "a"})
+        \\    print({1: "a"} == {1: "z"})
+    ;
+    try expectOutput(src, "true\nfalse\ntrue\ntrue\nfalse\n");
+}
+
+test "std.test (the bundled framework) runs a suite through the interpreter" {
+    try expectProgramOutput(
+        "test",
+        @embedFile("std/test.rg"),
+        "import std.test\nfunc ok():\n    test.assert_eq([1, 2], [1, 2])\nfunc bad():\n    test.assert(false, \"nope\")\nfunc main():\n    print(test.run([(\"ok\", ok), (\"bad\", bad)]))",
+        "ok   - ok\nFAIL - bad: assertion failed: nope\n1 passed, 1 failed\nfalse\n",
     );
 }
 

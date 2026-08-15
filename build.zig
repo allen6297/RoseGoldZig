@@ -86,7 +86,7 @@ pub fn build(b: *std.Build) void {
     // The bundled standard library (RoseGold source under `std/`) lives outside
     // `src/`, so the frontend tests reach it through named `@embedFile` imports
     // (wired onto the frontend test module below) rather than a relative path.
-    const std_modules = [_][]const u8{ "std/lists.rg", "std/strings.rg", "std/mathx.rg", "std/sets.rg" };
+    const std_modules = [_][]const u8{ "std/lists.rg", "std/strings.rg", "std/mathx.rg", "std/sets.rg", "std/test.rg" };
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
