@@ -24,8 +24,9 @@ zig build run -- run --disasm FILE.rg  # print the compiled VM bytecode (don't r
 zig build run -- check FILE.rg  # parse and analyze only, report problems
 zig build run -- repl           # interactive session (also the default, no file)
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
+zig build run -- doc FILE.rg    # print Markdown API docs from FILE's ## comments (stdout)
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (406 as of writing)
+zig build test                  # run every test (410 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -33,13 +34,14 @@ zig test src/fontend/parser.zig
 zig test src/fontend/interpreter.zig   # covers parser + lexer too
 ```
 
-The CLI (`run`/`check`/`repl`/`fmt`/`lsp`, default `run` with a file / `repl` without)
-prints program output to **stdout** and renders diagnostics (with a source line +
-caret) to **stderr**, exiting non-zero on any error. `repl` starts an interactive
-read-eval-print loop whose definitions and values persist across entries. `fmt`
-re-prints a file in canonical style (to stdout, or in place with `-w`); it walks
+The CLI (`run`/`check`/`repl`/`fmt`/`doc`/`lsp`, default `run` with a file / `repl`
+without) prints program output to **stdout** and renders diagnostics (with a source
+line + caret) to **stderr**, exiting non-zero on any error. `repl` starts an
+interactive read-eval-print loop whose definitions and values persist across entries.
+`fmt` re-prints a file in canonical style (to stdout, or in place with `-w`); it walks
 the AST but the lexer keeps `##` line comments, which the formatter re-emits by
-line (block comments and original blank lines are not preserved).
+line (block comments and original blank lines are not preserved). `doc` prints
+Markdown API docs built from those `##` comments (see **Doc generator**).
 
 ## Layout
 
@@ -54,7 +56,8 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/fontend/analyzer.zig` | Combined name resolution + type checking over the AST. |
 | `src/fontend/interpreter.zig` | Tree-walking evaluator (the default backend, full language). |
 | `src/fontend/vm.zig` | Alternative backend behind `run --vm`: a bytecode compiler + stack VM covering the whole language, incl. modules + cross-module inheritance (see below). Also `run --disasm`. |
-| `src/fontend/formatter.zig` | Canonical source printer (AST → formatted text) behind `fmt`; re-emits `##` line comments by line. |
+| `src/fontend/formatter.zig` | Canonical source printer (AST → formatted text) behind `fmt`; re-emits `##` line comments by line. Also exposes `signature(decl)` — a decl's one-line header — used by the doc generator. |
+| `src/fontend/doc.zig` | Markdown API-doc generator behind `doc`: pairs each declaration's `formatter.signature` with the `##` comment block above it (and a module preamble). |
 | `src/fontend/lsp.zig` | Language Server (`lsp`): JSON-RPC over stdio. Reuses the parser+analyzer for live diagnostics (`publishDiagnostics`), plus hover, go-to-definition, and document symbols from a declaration scan. |
 | `src/fontend/tests.zig` | Test aggregator; the `zig build test` frontend target roots here. |
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
@@ -378,6 +381,24 @@ drives the loader, then the analyzer and interpreter over the loaded module set
 - The checker resolves names at **definition time** (unlike the interpreter's
   call-time binding), so a forward reference to a not-yet-defined name is reported —
   define callees first, or put mutually-recursive definitions in one entry.
+
+### Doc generator (`doc`)
+- `doc FILE.rg` (`doc.zig`, driven by `main.zig` → `docCmd`) parses the file and prints
+  **Markdown API docs to stdout** built from its `##` comments — no analysis, so it works
+  on anything that parses; a parse error is rendered to stderr with a non-zero exit (like
+  `fmt`).
+- **Structure.** A `# <title>` heading (the file's basename without `.rg`), then a
+  **module preamble** (the leading `##` block at the top of the file, unless it directly
+  abuts the first declaration — in which case it's that declaration's doc), then one
+  section per top-level declaration (`import`s skipped): a `## \`<signature>\`` heading
+  holding the **canonical signature** (`formatter.signature`, so types/defaults/`->`
+  render exactly as `fmt` would) followed by the `##` block written directly above it.
+  A class/struct also documents each of its members (`var`/`func`) one level deeper (`###`).
+- **Comment association** (`docRunBefore`): a declaration's doc block is the maximal run of
+  `##` comment lines with *consecutive* line numbers ending exactly on the line above it
+  (a blank line breaks the run). `stripPrefix` drops each line's leading `##` + one space.
+  Reuses the parse tree's `comments` (the same `lexer.Comment{ text, line }` list the
+  formatter re-emits).
 
 ### Language Server (`lsp`)
 - `lsp` (`lsp.zig`) speaks **LSP over stdio** (JSON-RPC with `Content-Length` framing;

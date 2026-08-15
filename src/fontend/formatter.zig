@@ -32,6 +32,17 @@ pub fn format(gpa: std.mem.Allocator, module: parser.Module, comments: []const l
     return buf.toOwnedSlice(gpa);
 }
 
+/// Render just the one-line signature (header) of a declaration — no body, no
+/// trailing newline — in canonical style. Used by tooling such as `rosegold doc`
+/// (see `doc.zig`). The caller owns the returned bytes.
+pub fn signature(gpa: std.mem.Allocator, d: Decl) Error![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var f = Formatter{ .gpa = gpa, .buf = &buf };
+    try f.declHeader(d);
+    return buf.toOwnedSlice(gpa);
+}
+
 fn declLine(d: Decl) u32 {
     return switch (d) {
         .import => |x| x.span.line,
@@ -171,6 +182,89 @@ const Formatter = struct {
                 if (s.params.len > 0) try self.params(s.params);
                 try self.nl();
             },
+        }
+    }
+
+    /// The signature/header of a declaration without its body or trailing
+    /// newline: `func f(a: int) -> int`, `class C extends B`, `enum E { A, B }`,
+    /// `const N: int = 1`, `signal s(x)`, `import a.b`. Reuses the same param /
+    /// type / expr rendering as the full formatter so signatures are canonical.
+    fn declHeader(self: *Formatter, d: Decl) Error!void {
+        switch (d) {
+            .import => |im| {
+                try self.w("import ");
+                for (im.path, 0..) |seg, i| {
+                    if (i > 0) try self.w(".");
+                    try self.w(seg);
+                }
+            },
+            .var_decl => |v| {
+                try self.w(visPrefix(v.visibility));
+                if (v.is_static) try self.w("static ");
+                try self.w(if (v.is_const) "const " else "var ");
+                try self.w(v.name);
+                if (v.type) |t| {
+                    try self.w(": ");
+                    try self.typeRef(t);
+                }
+                if (v.value) |val| {
+                    try self.w(" = ");
+                    try self.expr(val.*);
+                }
+            },
+            .func => |f| {
+                try self.w(visPrefix(f.visibility));
+                if (f.is_static) try self.w("static ");
+                if (f.is_async) try self.w("async ");
+                try self.w("func ");
+                try self.w(f.name);
+                try self.params(f.params);
+                if (f.return_type) |rt| {
+                    try self.w(" -> ");
+                    try self.typeRef(rt);
+                }
+            },
+            .class => |c| try self.aggregateHeader("class", c.name, c.visibility, c.extends, c.uses),
+            .struct_decl => |s| try self.aggregateHeader("struct", s.name, s.visibility, null, &.{}),
+            .enum_decl => |e| {
+                try self.w(visPrefix(e.visibility));
+                try self.w("enum ");
+                try self.w(e.name);
+                try self.w(" { ");
+                for (e.members, 0..) |mem, i| {
+                    if (i > 0) try self.w(", ");
+                    try self.w(mem.name);
+                    if (mem.value) |val| {
+                        try self.w(" = ");
+                        try self.expr(val.*);
+                    }
+                }
+                try self.w(" }");
+            },
+            .signal => |s| {
+                try self.w(visPrefix(s.visibility));
+                try self.w("signal ");
+                try self.w(s.name);
+                if (s.params.len > 0) try self.params(s.params);
+            },
+        }
+    }
+
+    fn aggregateHeader(self: *Formatter, kw: []const u8, name: []const u8, vis: Visibility, extends: ?TypeRef, uses: []const TypeRef) Error!void {
+        try self.w(visPrefix(vis));
+        try self.w(kw);
+        try self.w(" ");
+        try self.w(name);
+        if (extends) |base| {
+            try self.w(" extends ");
+            try self.typeRef(base);
+        }
+        if (uses.len > 0) {
+            try self.w(" uses ");
+            for (uses, 0..) |t, i| {
+                if (i > 0) try self.w(", ");
+                try self.typeRef(t);
+            }
         }
     }
 

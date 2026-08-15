@@ -14,6 +14,7 @@ const Loader = @import("fontend/loader.zig");
 const Analyzer = @import("fontend/analyzer.zig");
 const Interpreter = @import("fontend/interpreter.zig");
 const Formatter = @import("fontend/formatter.zig");
+const Doc = @import("fontend/doc.zig");
 const Vm = @import("fontend/vm.zig");
 const Lsp = @import("fontend/lsp.zig");
 
@@ -26,6 +27,7 @@ const usage =
     \\  check   parse and analyze only, then report any problems
     \\  repl    start an interactive session (also the default with no file)
     \\  fmt     re-format the file in canonical style (stdout; `-w` rewrites it)
+    \\  doc     generate Markdown API docs from `##` comments (to stdout)
     \\  lsp     run a Language Server over stdio (diagnostics, hover, go-to-def)
     \\
     \\  --path DIR (or -I DIR)   add a module search root for imports not found
@@ -89,6 +91,15 @@ fn handle(
             return 1;
         }
         return fmtCmd(arena, io, out, err, args[file_index], write);
+    }
+
+    // `doc <file>`: print Markdown API docs generated from the file's `##` comments.
+    if (std.mem.eql(u8, args[1], "doc")) {
+        if (args.len < 3) {
+            try err.writeAll(usage);
+            return 1;
+        }
+        return docCmd(arena, io, out, err, args[2]);
     }
 
     // Parse arguments: an optional subcommand, an optional `--vm`, then a file.
@@ -266,6 +277,31 @@ fn fmtCmd(arena: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, pa
     }
     try out.writeAll(formatted);
     return 0;
+}
+
+fn docCmd(arena: std.mem.Allocator, io: Io, out: *Io.Writer, err: *Io.Writer, path: []const u8) !u8 {
+    const src = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 << 20)) catch |e| {
+        try err.print("error: could not read '{s}': {s}\n", .{ path, @errorName(e) });
+        return 1;
+    };
+    const tree = try Parser.parse(arena, src);
+    if (tree.diagnostics.len > 0) {
+        for (tree.diagnostics) |d| {
+            try render(err, "error", path, src, d.message, d.line, d.col);
+        }
+        try err.print("{d} error(s)\n", .{tree.diagnostics.len});
+        return 1;
+    }
+    const markdown = try Doc.generate(arena, moduleTitle(path), tree.module, tree.comments);
+    try out.writeAll(markdown);
+    return 0;
+}
+
+/// The bare module name for a `doc` heading: the file's basename without its
+/// directory or `.rg` extension (`std/lists.rg` -> `lists`).
+fn moduleTitle(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    return if (std.mem.endsWith(u8, base, ".rg")) base[0 .. base.len - 3] else base;
 }
 
 // --- REPL --------------------------------------------------------------------
