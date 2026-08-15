@@ -36,14 +36,17 @@ public final class RoseGoldSyntaxHighlighter extends SyntaxHighlighterBase {
             createTextAttributesKey("ROSEGOLD_BAD_CHARACTER", HighlighterColors.BAD_CHARACTER);
     public static final TextAttributesKey FUN_DEF =
             createTextAttributesKey("ROSEGOLD_FUN_DEF", DefaultLanguageHighlighterColors.FUNCTION_DECLARATION);
+    // Fall back to FUNCTION_DECLARATION rather than FUNCTION_CALL: many themes
+    // (e.g. Islands Dark, Darcula) leave function *calls* at the plain identifier
+    // color, so calls would be invisible. Declarations are near-universally colored.
     public static final TextAttributesKey FUN_CALL =
-            createTextAttributesKey("ROSEGOLD_FUN_CALL", DefaultLanguageHighlighterColors.FUNCTION_CALL);
+            createTextAttributesKey("ROSEGOLD_FUN_CALL", DefaultLanguageHighlighterColors.FUNCTION_DECLARATION);
 
     private static final TextAttributesKey[] EMPTY = new TextAttributesKey[0];
 
     @Override
     public @NotNull Lexer getHighlightingLexer() {
-        return new RoseGoldLexer();
+        return new RoseGoldLexer(true); // refine func declarations/calls for coloring
     }
 
     @Override
@@ -51,6 +54,8 @@ public final class RoseGoldSyntaxHighlighter extends SyntaxHighlighterBase {
         if (t.equals(RoseGoldTokenTypes.KEYWORD)) return one(KEYWORD);
         if (t.equals(RoseGoldTokenTypes.TYPE)) return one(TYPE);
         if (t.equals(RoseGoldTokenTypes.IDENTIFIER)) return one(IDENTIFIER);
+        if (t.equals(RoseGoldTokenTypes.FUNC_DECL)) return one(FUN_DEF);
+        if (t.equals(RoseGoldTokenTypes.FUNC_CALL)) return one(FUN_CALL);
         if (t.equals(RoseGoldTokenTypes.NUMBER)) return one(NUMBER);
         if (t.equals(RoseGoldTokenTypes.STRING)) return one(STRING);
         if (t.equals(RoseGoldTokenTypes.COMMENT)) return one(COMMENT);

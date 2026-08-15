@@ -8,6 +8,12 @@ public interface RoseGoldTokenTypes {
     IElementType KEYWORD = new RoseGoldTokenType("KEYWORD");
     IElementType TYPE = new RoseGoldTokenType("TYPE");
     IElementType IDENTIFIER = new RoseGoldTokenType("IDENTIFIER");
+    // Highlighting-only refinements of IDENTIFIER: an identifier right after
+    // `func` (a declaration) and one immediately before `(` (a call). Emitted only
+    // by the highlighting lexer, so the parser's PSI still sees plain IDENTIFIERs
+    // (keeping references, quick-doc, and find-usages working).
+    IElementType FUNC_DECL = new RoseGoldTokenType("FUNC_DECL");
+    IElementType FUNC_CALL = new RoseGoldTokenType("FUNC_CALL");
     IElementType NUMBER = new RoseGoldTokenType("NUMBER");
     IElementType STRING = new RoseGoldTokenType("STRING");
     IElementType COMMENT = new RoseGoldTokenType("COMMENT");
