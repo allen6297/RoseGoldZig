@@ -17,9 +17,10 @@ public final class RoseGoldRunConfigurationEditor extends SettingsEditor<RoseGol
     private final JBCheckBox vmCheck = new JBCheckBox("Run on the bytecode VM (--vm)");
 
     public RoseGoldRunConfigurationEditor() {
-        fileField.addBrowseFolderListener(
-                "RoseGold File", "Select the .rg file to run", null,
-                FileChooserDescriptorFactory.createSingleFileDescriptor("rg"));
+        fileField.addBrowseFolderListener(null,
+                FileChooserDescriptorFactory.createSingleFileDescriptor("rg")
+                        .withTitle("RoseGold File")
+                        .withDescription("Select the .rg file to run"));
         panel = FormBuilder.createFormBuilder()
                 .addLabeledComponent(new JBLabel("RoseGold file:"), fileField, 1, false)
                 .addComponent(vmCheck)

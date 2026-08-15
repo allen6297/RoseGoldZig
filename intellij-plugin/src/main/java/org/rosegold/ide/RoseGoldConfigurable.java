@@ -22,9 +22,10 @@ public final class RoseGoldConfigurable implements Configurable {
     @Override
     public @Nullable JComponent createComponent() {
         pathField = new TextFieldWithBrowseButton();
-        pathField.addBrowseFolderListener(
-                "RoseGold Executable", "Select the RoseGold_Zig executable", null,
-                FileChooserDescriptorFactory.createSingleFileDescriptor());
+        pathField.addBrowseFolderListener(null,
+                FileChooserDescriptorFactory.createSingleFileOrExecutableAppDescriptor()
+                        .withTitle("RoseGold Executable")
+                        .withDescription("Select the RoseGold_Zig executable"));
         return FormBuilder.createFormBuilder()
                 .addLabeledComponent(new JBLabel("RoseGold_Zig executable:"), pathField, 1, false)
                 .addComponentFillVertically(new JPanel(), 0)
