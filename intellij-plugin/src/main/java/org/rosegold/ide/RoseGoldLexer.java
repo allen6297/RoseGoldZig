@@ -25,14 +25,14 @@ public final class RoseGoldLexer extends LexerBase {
     private static final Set<String> TYPES = Set.of(
             "int", "float", "str", "bool", "void", "any", "list", "map", "task");
 
-    /** State: the previous significant token was the `func` keyword. */
-    private static final int AFTER_FUNC = 1;
-
     /**
-     * When true, refine function-name identifiers into {@code FUNC_DECL}/
-     * {@code FUNC_CALL} so the syntax highlighter can color them (the annotator
-     * pass never runs for this flat-PSI language, so coloring must happen here).
-     * The parser's lexer leaves them as plain {@code IDENTIFIER}.
+     * When true, refine a function-name identifier (one immediately before
+     * {@code (}) into {@code FUNC_CALL} so the syntax highlighter can color it —
+     * a declaration {@code func add(} qualifies too, since the name precedes the
+     * paren. This is stateless (no lexer state), so it can't upset IntelliJ's
+     * incremental highlighter. The annotator pass never runs for this flat-PSI
+     * language, so coloring must happen here. The parser's lexer leaves these as
+     * plain {@code IDENTIFIER}.
      */
     private final boolean highlighting;
 
@@ -40,7 +40,6 @@ public final class RoseGoldLexer extends LexerBase {
     private int endOffset = 0;
     private int tokenStart = 0;
     private int tokenEnd = 0;
-    private int state = 0;
     private IElementType tokenType = null;
 
     public RoseGoldLexer() {
@@ -56,13 +55,12 @@ public final class RoseGoldLexer extends LexerBase {
         this.buffer = buffer;
         this.endOffset = endOffset;
         this.tokenStart = startOffset;
-        this.state = initialState;
         scanToken();
     }
 
     @Override
     public int getState() {
-        return state;
+        return 0;
     }
 
     @Override
@@ -117,11 +115,6 @@ public final class RoseGoldLexer extends LexerBase {
             set(RoseGoldTokenTypes.COMMENT, i);
             return;
         }
-        // Whitespace/comments above are trivia and leave `state` alone, so the
-        // "after func" flag carries across the space between `func` and the name.
-        // Every other (significant) token clears it unless re-set below.
-        final int prevState = state;
-        state = 0;
         if (c == '"') {
             i++;
             while (i < endOffset) {
@@ -156,13 +149,10 @@ public final class RoseGoldLexer extends LexerBase {
             final String word = buffer.subSequence(tokenStart, i).toString();
             if (KEYWORDS.contains(word)) {
                 set(RoseGoldTokenTypes.KEYWORD, i);
-                if (word.equals("func")) state = AFTER_FUNC;
             } else if (TYPES.contains(word)) {
                 set(RoseGoldTokenTypes.TYPE, i);
-            } else if (highlighting && prevState == AFTER_FUNC) {
-                set(RoseGoldTokenTypes.FUNC_DECL, i); // `func <name>`
             } else if (highlighting && i < endOffset && buffer.charAt(i) == '(') {
-                set(RoseGoldTokenTypes.FUNC_CALL, i); // `<name>(`
+                set(RoseGoldTokenTypes.FUNC_CALL, i); // `<name>(` — call or declaration
             } else {
                 set(RoseGoldTokenTypes.IDENTIFIER, i);
             }
