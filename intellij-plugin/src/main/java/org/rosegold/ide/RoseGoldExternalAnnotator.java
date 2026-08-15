@@ -47,6 +47,10 @@ public final class RoseGoldExternalAnnotator
         final int line;
         final int col;
         final String message;
+        // Optional "qualify" quick-fix: replace `matchLen` chars at the error
+        // location with `replacement` (e.g. `Error` → `Global.Error`).
+        int matchLen = 0;
+        String replacement = null;
 
         Diag(String path, int line, int col, String message) {
             this.path = path;
@@ -96,7 +100,11 @@ public final class RoseGoldExternalAnnotator
                 cmd.setWorkDirectory(info.basePath);
             }
             ProcessOutput output = ExecUtil.execAndGetOutput(cmd);
-            return parse(output.getStderr(), temp.getName());
+            List<Diag> diags = parse(output.getStderr(), temp.getName());
+            for (Diag d : diags) {
+                addQualifyFix(d, info);
+            }
+            return diags;
         } catch (Exception e) {
             return null; // executable missing / not runnable — stay quiet
         } finally {
@@ -137,6 +145,88 @@ public final class RoseGoldExternalAnnotator
         return diags;
     }
 
+    private static final Pattern QUOTED = Pattern.compile("'([^']+)'");
+    private static final Pattern IMPORT = Pattern.compile("^\\s*import\\s+([A-Za-z_][A-Za-z0-9_.]*)");
+
+    /**
+     * If {@code d} is an "unknown type / undefined name 'X'" error and some
+     * module imported by this buffer exports {@code X}, record a quick-fix that
+     * qualifies it as {@code mod.X}.
+     */
+    private static void addQualifyFix(Diag d, Info info) {
+        if (!d.message.startsWith("unknown type") && !d.message.startsWith("undefined name")) {
+            return;
+        }
+        Matcher qm = QUOTED.matcher(d.message);
+        if (!qm.find()) {
+            return;
+        }
+        String name = qm.group(1);
+        if (name.contains(".")) {
+            return; // already qualified
+        }
+        String qualified = findQualifier(info, name);
+        if (qualified != null) {
+            d.matchLen = name.length();
+            d.replacement = qualified;
+        }
+    }
+
+    /** {@code mod.name} if some {@code import}ed module in this buffer exports {@code name}. */
+    private static @Nullable String findQualifier(Info info, String name) {
+        for (String raw : info.text.split("\n")) {
+            Matcher im = IMPORT.matcher(raw);
+            if (!im.find()) {
+                continue;
+            }
+            String[] segs = im.group(1).split("\\.");
+            String leaf = segs[segs.length - 1];
+            File mod = resolveModuleFile(info, segs);
+            if (mod != null && moduleExports(mod, name)) {
+                return leaf + "." + name;
+            }
+        }
+        return null;
+    }
+
+    /** Resolve {@code a.b.c} → the {@code a/b/c.rg} file: importer dir, project base, a few ancestors. */
+    private static @Nullable File resolveModuleFile(Info info, String[] segs) {
+        String rel = String.join(File.separator, segs) + ".rg";
+        List<File> bases = new ArrayList<>();
+        bases.add(new File(info.dir));
+        if (info.basePath != null) {
+            bases.add(new File(info.basePath));
+        }
+        File up = new File(info.dir);
+        for (int i = 0; i < 4 && up != null; i++) {
+            up = up.getParentFile();
+            if (up != null) {
+                bases.add(up);
+            }
+        }
+        for (File base : bases) {
+            File f = new File(base, rel);
+            if (f.isFile()) {
+                return f;
+            }
+        }
+        return null;
+    }
+
+    /** Whether the module source declares {@code pub <kind> name} at top level. */
+    private static boolean moduleExports(File mod, String name) {
+        final String src;
+        try {
+            src = FileUtil.loadFile(mod);
+        } catch (Exception e) {
+            return false;
+        }
+        Pattern decl = Pattern.compile(
+                "^pub\\s+(?:enum|class|struct|func|const|var)\\s+" + Pattern.quote(name) + "\\b",
+                Pattern.MULTILINE);
+        return decl.matcher(src).find();
+    }
+
     @Override
     public void apply(@NotNull PsiFile file, List<Diag> diags, @NotNull AnnotationHolder holder) {
         if (diags == null || diags.isEmpty()) {
@@ -156,9 +246,15 @@ public final class RoseGoldExternalAnnotator
             if (end <= start) {
                 end = Math.min(start + 1, textLen);
             }
-            holder.newAnnotation(HighlightSeverity.ERROR, d.message)
-                    .range(new com.intellij.openapi.util.TextRange(start, end))
-                    .create();
+            var builder = holder.newAnnotation(HighlightSeverity.ERROR, d.message)
+                    .range(new com.intellij.openapi.util.TextRange(start, end));
+            if (d.replacement != null && d.matchLen > 0) {
+                int fixEnd = Math.min(start + d.matchLen, lineEnd);
+                if (fixEnd > start) {
+                    builder = builder.withFix(new RoseGoldQualifyFix(start, fixEnd, d.replacement));
+                }
+            }
+            builder.create();
         }
     }
 }
