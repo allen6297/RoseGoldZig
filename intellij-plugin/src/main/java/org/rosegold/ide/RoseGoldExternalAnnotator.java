@@ -3,62 +3,79 @@ package org.rosegold.ide;
 import com.intellij.execution.configurations.GeneralCommandLine;
 import com.intellij.execution.process.ProcessOutput;
 import com.intellij.execution.util.ExecUtil;
+import com.intellij.openapi.editor.Document;
+import com.intellij.openapi.editor.Editor;
+import com.intellij.openapi.util.io.FileUtil;
+import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.lang.annotation.AnnotationHolder;
 import com.intellij.lang.annotation.ExternalAnnotator;
 import com.intellij.lang.annotation.HighlightSeverity;
-import com.intellij.openapi.editor.Document;
-import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.psi.PsiDocumentManager;
 import com.intellij.psi.PsiFile;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Runs {@code RoseGold_Zig check} on the file and turns each reported diagnostic
- * into an editor annotation, so real compiler errors are underlined live. Errors
- * reflect the file on disk, so they refresh on save.
+ * Runs {@code RoseGold_Zig check} and turns each reported diagnostic into an
+ * editor annotation, so real compiler errors are underlined live. It checks the
+ * <em>current editor buffer</em> (written to a temp file), not the file on disk,
+ * so errors refresh as you type rather than only after a save.
  */
 public final class RoseGoldExternalAnnotator
         extends ExternalAnnotator<RoseGoldExternalAnnotator.Info, List<RoseGoldExternalAnnotator.Diag>> {
 
     public static final class Info {
-        final String path;
-        final String basePath;
+        final String text;      // live buffer contents
+        final String dir;       // the real file's directory (for import resolution)
+        final String basePath;  // project base (working dir + executable lookup)
 
-        Info(String path, String basePath) {
-            this.path = path;
+        Info(String text, String dir, String basePath) {
+            this.text = text;
+            this.dir = dir;
             this.basePath = basePath;
         }
     }
 
     public static final class Diag {
+        final String path;
         final int line;
         final int col;
         final String message;
 
-        Diag(int line, int col, String message) {
+        Diag(String path, int line, int col, String message) {
+            this.path = path;
             this.line = line;
             this.col = col;
             this.message = message;
         }
     }
 
-    // Matches the location line, e.g. `  --> /path/file.rg:3:5`.
-    private static final Pattern LOCATION = Pattern.compile("-->\\s+.+:(\\d+):(\\d+)");
+    // The location line, e.g. `  --> /path/file.rg:3:5` — captures path, line, col.
+    private static final Pattern LOCATION = Pattern.compile("-->\\s+(.+):(\\d+):(\\d+)");
 
     @Override
     public @Nullable Info collectInformation(@NotNull PsiFile file) {
+        return infoFor(file, file.getText());
+    }
+
+    @Override
+    public @Nullable Info collectInformation(@NotNull PsiFile file, @NotNull Editor editor, boolean hasErrors) {
+        // The document text reflects unsaved edits — that's what we want to check.
+        return infoFor(file, editor.getDocument().getText());
+    }
+
+    private static @Nullable Info infoFor(@NotNull PsiFile file, @NotNull String text) {
         VirtualFile vf = file.getVirtualFile();
-        if (vf == null) {
+        if (vf == null || vf.getParent() == null) {
             return null;
         }
-        String base = file.getProject().getBasePath();
-        return new Info(vf.getPath(), base);
+        return new Info(text, vf.getParent().getPath(), file.getProject().getBasePath());
     }
 
     @Override
@@ -66,21 +83,31 @@ public final class RoseGoldExternalAnnotator
         if (info == null) {
             return null;
         }
-        String exe = RoseGoldExecutable.resolve(info.basePath);
-        GeneralCommandLine cmd = new GeneralCommandLine(exe, "check", info.path);
-        if (info.basePath != null) {
-            cmd.setWorkDirectory(info.basePath);
-        }
-        final ProcessOutput output;
+        File temp = null;
         try {
-            output = ExecUtil.execAndGetOutput(cmd);
+            // Check the live buffer: write it to a temp file and point imports at
+            // the real file's directory (`--path`) so they resolve exactly as they
+            // would on disk, but against the current unsaved content.
+            temp = FileUtil.createTempFile("rosegold_check", ".rg", true);
+            FileUtil.writeToFile(temp, info.text);
+            String exe = RoseGoldExecutable.resolve(info.basePath);
+            GeneralCommandLine cmd = new GeneralCommandLine(exe, "check", "--path", info.dir, temp.getAbsolutePath());
+            if (info.basePath != null) {
+                cmd.setWorkDirectory(info.basePath);
+            }
+            ProcessOutput output = ExecUtil.execAndGetOutput(cmd);
+            return parse(output.getStderr(), temp.getName());
         } catch (Exception e) {
             return null; // executable missing / not runnable — stay quiet
+        } finally {
+            if (temp != null) {
+                FileUtil.delete(temp);
+            }
         }
-        return parse(output.getStderr());
     }
 
-    private static List<Diag> parse(String stderr) {
+    /** Parse diagnostics, keeping only those in the checked file ({@code tempName}). */
+    private static List<Diag> parse(String stderr, String tempName) {
         List<Diag> diags = new ArrayList<>();
         String pendingMessage = null;
         for (String raw : stderr.split("\n")) {
@@ -92,12 +119,16 @@ public final class RoseGoldExternalAnnotator
             } else if (pendingMessage != null) {
                 Matcher m = LOCATION.matcher(line);
                 if (m.find()) {
-                    try {
-                        int lineNo = Integer.parseInt(m.group(1));
-                        int col = Integer.parseInt(m.group(2));
-                        diags.add(new Diag(lineNo, col, pendingMessage));
-                    } catch (NumberFormatException ignored) {
-                        // skip a malformed location
+                    String path = m.group(1);
+                    // Only surface diagnostics for the file being edited, not for
+                    // imported modules it pulls in.
+                    if (path.endsWith(tempName)) {
+                        try {
+                            diags.add(new Diag(path, Integer.parseInt(m.group(2)),
+                                    Integer.parseInt(m.group(3)), pendingMessage));
+                        } catch (NumberFormatException ignored) {
+                            // skip a malformed location
+                        }
                     }
                     pendingMessage = null;
                 }
