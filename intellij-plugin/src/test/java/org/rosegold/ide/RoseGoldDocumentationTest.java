@@ -69,4 +69,32 @@ public class RoseGoldDocumentationTest extends BasePlatformTestCase {
         assertNotNull(doc);
         assertTrue(doc, doc.contains("length of a list"));
     }
+
+    /** Hovering `mod.member` shows the member's doc from the imported module. */
+    public void testDocForImportedModuleMember() {
+        myFixture.addFileToProject("util.rg",
+                "## Doubles its argument.\n" +
+                "pub func twice(n: int) -> int:\n" +
+                "    return n + n\n");
+        myFixture.configureByText("main.rg",
+                "import util\n" +
+                "\n" +
+                "func main():\n" +
+                "    print(util.tw<caret>ice(21))\n");
+        String doc = docAtCaret();
+        assertNotNull("expected cross-module doc", doc);
+        assertTrue(doc, doc.contains("pub func twice(n: int) -&gt; int"));
+        assertTrue(doc, doc.contains("Doubles its argument."));
+    }
+
+    /** Hovering a function parameter shows the parameter as written. */
+    public void testDocForParameter() {
+        myFixture.configureByText("e.rg",
+                "func scale(xs: list<int>, factor: int) -> int:\n" +
+                "    return fac<caret>tor\n");
+        String doc = docAtCaret();
+        assertNotNull(doc);
+        assertTrue(doc, doc.contains("factor: int"));
+        assertTrue(doc, doc.contains("parameter of scale"));
+    }
 }

@@ -2,8 +2,10 @@ package org.rosegold.ide;
 
 import com.intellij.lang.documentation.AbstractDocumentationProvider;
 import com.intellij.openapi.editor.Editor;
+import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.psi.PsiElement;
 import com.intellij.psi.PsiFile;
+import com.intellij.psi.PsiManager;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
@@ -79,15 +81,135 @@ public final class RoseGoldDocumentationProvider extends AbstractDocumentationPr
         if (name == null || name.isEmpty()) {
             return null;
         }
+        PsiFile file = e.getContainingFile();
+        if (!(file instanceof RoseGoldFile)) {
+            return DOCS.containsKey(name) ? "<code>" + DOCS.get(name) + "</code>" : null;
+        }
+        CharSequence text = file.getViewProvider().getContents();
+        int offset = e.getTextRange().getStartOffset();
+
+        // `mod.member` — a member of an imported module takes priority (it's qualified).
+        String moduleDoc = moduleMemberDoc(file, text, offset, name);
+        if (moduleDoc != null) {
+            return moduleDoc;
+        }
         String builtin = DOCS.get(name);
         if (builtin != null) {
             return "<code>" + builtin + "</code>";
         }
-        PsiFile file = e.getContainingFile();
-        if (!(file instanceof RoseGoldFile)) {
+        // A top-level / member / local declaration in this file.
+        String local = declDoc(text, name);
+        if (local != null) {
+            return local;
+        }
+        // Failing that, a parameter of the enclosing function.
+        return paramDoc(text, name, offset);
+    }
+
+    /**
+     * When the hovered name is `member` in `receiver.member` and `receiver` is an
+     * imported module, resolve that module's file and render `member`'s doc from
+     * it (prefixed with the module name).
+     */
+    private static @Nullable String moduleMemberDoc(PsiFile file, CharSequence text, int offset, String member) {
+        if (offset < 2 || text.charAt(offset - 1) != '.') {
             return null;
         }
-        return declDoc(file.getViewProvider().getContents(), name);
+        int j = offset - 1; // the '.'
+        int k = j;
+        while (k > 0 && isIdentChar(text.charAt(k - 1))) {
+            k--;
+        }
+        if (k == j) {
+            return null;
+        }
+        String receiver = text.subSequence(k, j).toString();
+        String[] segs = RoseGoldModules.importSegments(text, receiver);
+        if (segs == null) {
+            return null;
+        }
+        VirtualFile modFile = RoseGoldModules.resolveModuleFile(file, segs);
+        if (modFile == null) {
+            return null;
+        }
+        PsiFile modPsi = PsiManager.getInstance(file.getProject()).findFile(modFile);
+        if (modPsi == null) {
+            return null;
+        }
+        String doc = declDoc(modPsi.getViewProvider().getContents(), member);
+        if (doc == null) {
+            return null;
+        }
+        return "<i>" + escape(receiver) + "</i><br>" + doc;
+    }
+
+    /**
+     * When the hovered name is a parameter of the nearest enclosing function,
+     * render that parameter as written (`n: int`, `xs: list&lt;int&gt; = []`).
+     */
+    private static @Nullable String paramDoc(CharSequence text, String name, int offset) {
+        RoseGoldDeclaration fn = null;
+        for (RoseGoldDeclaration d : RoseGoldDeclarations.scanFlat(text)) {
+            if (d.kind == RoseGoldDeclaration.Kind.FUNCTION && d.nameOffset < offset
+                    && (fn == null || d.nameOffset > fn.nameOffset)) {
+                fn = d;
+            }
+        }
+        if (fn == null) {
+            return null;
+        }
+        String header = text.subSequence(fn.nameOffset, lineEndOffset(text, fn.nameOffset)).toString();
+        int open = header.indexOf('(');
+        if (open < 0) {
+            return null;
+        }
+        int depth = 0;
+        int close = -1;
+        for (int i = open; i < header.length(); i++) {
+            char c = header.charAt(i);
+            if (c == '(') {
+                depth++;
+            } else if (c == ')' && --depth == 0) {
+                close = i;
+                break;
+            }
+        }
+        if (close < 0) {
+            return null;
+        }
+        for (String param : splitParams(header.substring(open + 1, close))) {
+            String p = param.trim();
+            int e = 0;
+            while (e < p.length() && isIdentChar(p.charAt(e))) {
+                e++;
+            }
+            if (p.substring(0, e).equals(name)) {
+                return "<code>" + escape(p) + "</code><br><br><i>parameter of " + escape(fn.name) + "</i>";
+            }
+        }
+        return null;
+    }
+
+    /** Split a parameter list on top-level commas (ignoring commas inside `<> () []`). */
+    private static List<String> splitParams(String params) {
+        List<String> out = new ArrayList<>();
+        int depth = 0;
+        int start = 0;
+        for (int i = 0; i < params.length(); i++) {
+            char c = params.charAt(i);
+            if (c == '<' || c == '(' || c == '[') {
+                depth++;
+            } else if (c == '>' || c == ')' || c == ']') {
+                depth--;
+            } else if (c == ',' && depth == 0) {
+                out.add(params.substring(start, i));
+                start = i + 1;
+            }
+        }
+        if (start < params.length()) {
+            out.add(params.substring(start));
+        }
+        return out;
     }
 
     /**
@@ -161,6 +283,10 @@ public final class RoseGoldDocumentationProvider extends AbstractDocumentationPr
             i++;
         }
         return i;
+    }
+
+    private static boolean isIdentChar(char c) {
+        return c == '_' || Character.isLetterOrDigit(c);
     }
 
     private static String escape(String s) {
