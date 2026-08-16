@@ -138,10 +138,15 @@ const BoundMethod = struct { recv: *Instance, func: *const Function };
 const Signal = struct { name: []const u8, handlers: std.ArrayList(Value) = .empty };
 
 /// An enum type: its name and the set of member names it declares.
-const RtEnum = struct { name: []const u8, members: std.StringHashMapUnmanaged(void) = .{} };
+/// An enum type: its cases mapped to payload arity (0 for a plain case).
+const RtEnum = struct { name: []const u8, members: std.StringHashMapUnmanaged(u32) = .{} };
 
-/// A single enum case, e.g. `Status.OK` — compared by identity (name + member).
-const EnumValue = struct { enum_name: []const u8, member: []const u8 };
+/// A single enum case, e.g. `Status.OK`, or a tagged-union `Shape.Circle(2.0)`
+/// carrying a `payload`. Compared by name + member + payload (deep).
+const EnumValue = struct { enum_name: []const u8, member: []const u8, payload: []const Value = &.{} };
+
+/// The constructor of a tagged-union case; calling it builds the `EnumValue`.
+const EnumCtor = struct { enum_name: []const u8, member: []const u8, arity: u32 };
 
 const Value = union(enum) {
     nil,
@@ -158,6 +163,8 @@ const Value = union(enum) {
     type: *RtType,
     enum_type: *const RtEnum,
     enum_value: *const EnumValue,
+    /// The constructor of a tagged-union case; callable to build an `enum_value`.
+    enum_ctor: *const EnumCtor,
     module: *RtModule,
     signal: *Signal,
     /// A tuple `(a, b, ...)` — a fixed, ordered group; compared elementwise.
@@ -267,7 +274,14 @@ fn valuesEqual(a: Value, b: Value) bool {
         .enum_type => |x| b == .enum_type and x == b.enum_type,
         .enum_value => |x| b == .enum_value and
             std.mem.eql(u8, x.enum_name, b.enum_value.enum_name) and
-            std.mem.eql(u8, x.member, b.enum_value.member),
+            std.mem.eql(u8, x.member, b.enum_value.member) and
+            x.payload.len == b.enum_value.payload.len and blk: {
+                for (x.payload, b.enum_value.payload) |ea, eb| {
+                    if (!valuesEqual(ea, eb)) break :blk false;
+                }
+                break :blk true;
+            },
+        .enum_ctor => |x| b == .enum_ctor and x == b.enum_ctor,
         .module => |x| b == .module and x == b.module,
         .signal => |x| b == .signal and x == b.signal,
         .task => |x| b == .task and x == b.task,
@@ -340,7 +354,8 @@ const Op = enum(u8) {
     build_tuple, // u16 count -> pop count values into a tuple
     unpack, // u16 count -> pop a tuple/list of exactly count, push its elements
     check_seq, // u8 kind (0=tuple,1=list), u16 count -> pop value, push bool (is that seq of that arity)
-    seq_get, // u16 index -> pop a tuple/list, push element[index] (destructuring)
+    check_enum, // u16 name-const, u16 member-const -> pop value, push bool (enum_value matching name.member)
+    seq_get, // u16 index -> pop a tuple/list or enum-case payload, push element[index] (destructuring)
     interp, // u16 part count -> concat the parts as strings
     new_instance, // u16 rttype index -> push a fresh instance (fields nil)
     get_member, // u16 name-const index -> instance field, or bound method
@@ -636,7 +651,7 @@ const Compiler = struct {
             .enum_decl => |e| {
                 const rt = try self.alloc.create(RtEnum);
                 rt.* = .{ .name = e.name };
-                for (e.members) |m| try rt.members.put(self.alloc, m.name, {});
+                for (e.members) |m| try rt.members.put(self.alloc, m.name, @intCast(m.payload.len));
                 try self.enums.put(self.alloc, e.name, rt);
             },
             .class => |c| try self.registerType(c.name, c.span, c.members, c.extends, c.uses),
@@ -1147,12 +1162,36 @@ const Compiler = struct {
             .binding => |bd| self.cur.locals.items[slot].name = bd.name,
             .tuple => |seq| try self.emitSeqPattern(seq, 0, slot, arm_base, fails),
             .list => |seq| try self.emitSeqPattern(seq, 1, slot, arm_base, fails),
+            .enum_case => |ec| try self.emitEnumPattern(ec, slot, arm_base, fails),
             else => {
                 try self.emitLocal(.get_local, slot, span);
                 try self.patternConst(p);
                 try self.emit(.eq, span);
                 try fails.append(self.alloc, .{ .at = try self.emitJump(.jump_if_false, span), .depth = self.cur.locals.items.len - arm_base });
             },
+        }
+    }
+
+    /// `Enum.CASE` / `Enum.CASE(p…)`: a refutable name test (`check_enum`,
+    /// ignoring payload) then, when args are given, each payload field indexed
+    /// out (`seq_get`) into a fresh local and its sub-pattern recursed — mirroring
+    /// the interpreter's `bindPattern`.
+    fn emitEnumPattern(self: *Compiler, ec: parser.Pattern.EnumCase, slot: usize, arm_base: usize, fails: *std.ArrayList(MatchFail)) Error!void {
+        try self.emitLocal(.get_local, slot, ec.span);
+        try self.emit(.check_enum, ec.span);
+        try self.emitU16(@intCast(try self.constIndex(.{ .str = ec.enum_name })), ec.span);
+        try self.emitU16(@intCast(try self.constIndex(.{ .str = ec.case })), ec.span);
+        try fails.append(self.alloc, .{ .at = try self.emitJump(.jump_if_false, ec.span), .depth = self.cur.locals.items.len - arm_base });
+        if (ec.args) |args| {
+            for (args, 0..) |sub, i| {
+                if (std.meta.activeTag(sub) == .wildcard) continue;
+                const eslot = self.cur.locals.items.len;
+                try self.emitLocal(.get_local, slot, ec.span);
+                try self.emit(.seq_get, ec.span);
+                try self.emitU16(@intCast(i), ec.span);
+                try self.cur.locals.append(self.alloc, .{ .name = "$e", .depth = self.cur.scope_depth });
+                try self.emitPattern(sub, eslot, arm_base, fails, ec.span);
+            }
         }
     }
 
@@ -1865,10 +1904,16 @@ const Compiler = struct {
     }
 
     fn emitConst(self: *Compiler, v: Value, span: Span) Error!void {
+        try self.emit(.constant, span);
+        try self.emitU16(@intCast(try self.constIndex(v)), span);
+    }
+
+    /// Append `v` to the constant pool and return its index (for opcodes that
+    /// carry a constant operand directly, e.g. `check_enum`).
+    fn constIndex(self: *Compiler, v: Value) Error!usize {
         const idx = self.chunk().constants.items.len;
         try self.chunk().constants.append(self.alloc, v);
-        try self.emit(.constant, span);
-        try self.emitU16(@intCast(idx), span);
+        return idx;
     }
 
     fn emitLocal(self: *Compiler, op: Op, slot: usize, span: Span) Error!void {
@@ -2278,11 +2323,21 @@ const VM = struct {
                     };
                     try self.push(.{ .bool = ok });
                 },
+                .check_enum => {
+                    const name = chunk.constants.items[self.readU16(frame)].str;
+                    const member = chunk.constants.items[self.readU16(frame)].str;
+                    const v = self.pop();
+                    const ok = v == .enum_value and
+                        std.mem.eql(u8, v.enum_value.enum_name, name) and
+                        std.mem.eql(u8, v.enum_value.member, member);
+                    try self.push(.{ .bool = ok });
+                },
                 .seq_get => {
                     const idx = self.readU16(frame);
                     const v = self.pop();
                     const items = switch (v) {
                         .tuple, .list => |l| l.items,
+                        .enum_value => |ev| ev.payload,
                         else => return self.fail("cannot destructure a {s}", .{@tagName(v)}),
                     };
                     try self.push(items[idx]);
@@ -2337,10 +2392,16 @@ const VM = struct {
                             } else return self.fail("type '{s}' has no static member '{s}'", .{ rt.name, name });
                         },
                         .enum_type => |et| {
-                            if (!et.members.contains(name)) return self.fail("enum '{s}' has no member '{s}'", .{ et.name, name });
-                            const ev = try self.alloc.create(EnumValue);
-                            ev.* = .{ .enum_name = et.name, .member = name };
-                            try self.push(.{ .enum_value = ev });
+                            const arity = et.members.get(name) orelse return self.fail("enum '{s}' has no member '{s}'", .{ et.name, name });
+                            if (arity > 0) {
+                                const ec = try self.alloc.create(EnumCtor);
+                                ec.* = .{ .enum_name = et.name, .member = name, .arity = arity };
+                                try self.push(.{ .enum_ctor = ec });
+                            } else {
+                                const ev = try self.alloc.create(EnumValue);
+                                ev.* = .{ .enum_name = et.name, .member = name };
+                                try self.push(.{ .enum_value = ev });
+                            }
                         },
                         .module => |m| {
                             if (m.globals.get(name)) |v| try self.push(v) else return self.fail("module '{s}' has no member '{s}'", .{ m.name, name });
@@ -2651,6 +2712,14 @@ const VM = struct {
                 const result = try self.callBuiltin(bi, args);
                 self.stack.shrinkRetainingCapacity(base - 1); // drop callee + args
                 try self.push(result);
+            },
+            .enum_ctor => |ec| {
+                if (argc != ec.arity) return self.fail("{s}.{s} expects {d} argument(s), got {d}", .{ ec.enum_name, ec.member, ec.arity, argc });
+                const base = self.stack.items.len - argc;
+                const ev = try self.alloc.create(EnumValue);
+                ev.* = .{ .enum_name = ec.enum_name, .member = ec.member, .payload = try self.alloc.dupe(Value, self.stack.items[base..]) };
+                self.stack.shrinkRetainingCapacity(base - 1); // drop callee + args
+                try self.push(.{ .enum_value = ev });
             },
             else => return self.fail("{s} is not callable", .{@tagName(callee)}),
         }
@@ -3107,6 +3176,19 @@ const VM = struct {
                 try buf.appendSlice(self.alloc, ev.enum_name);
                 try buf.append(self.alloc, '.');
                 try buf.appendSlice(self.alloc, ev.member);
+                if (ev.payload.len > 0) {
+                    try buf.append(self.alloc, '(');
+                    for (ev.payload, 0..) |item, i| {
+                        if (i > 0) try buf.appendSlice(self.alloc, ", ");
+                        try self.appendValueTo(buf, item);
+                    }
+                    try buf.append(self.alloc, ')');
+                }
+            },
+            .enum_ctor => |ec| {
+                try buf.appendSlice(self.alloc, ec.enum_name);
+                try buf.append(self.alloc, '.');
+                try buf.appendSlice(self.alloc, ec.member);
             },
             .instance => |inst| {
                 try buf.appendSlice(self.alloc, inst.type.name);
@@ -3211,6 +3293,10 @@ fn disasmInstr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), ch: *const Chu
         .check_seq => blk: {
             try out.print(alloc, " {s} {d}", .{ if (code[offset + 1] == 0) "tuple" else "list", readU16At(code, offset + 2) });
             break :blk offset + 4;
+        },
+        .check_enum => blk: {
+            try out.print(alloc, " {s}.{s}", .{ ch.constants.items[readU16At(code, offset + 1)].str, ch.constants.items[readU16At(code, offset + 3)].str });
+            break :blk offset + 5;
         },
         else => offset + 1, // no operand
     };
@@ -3724,6 +3810,31 @@ test "vm: enums print, compare by identity, and match" {
         \\    print(label(s), label(Status.NOT_FOUND))
     ;
     try expectVMOutput(src, "Status.OK\ntrue false\nok missing\n");
+}
+
+test "vm: tagged-union enums (byte-identical to the interpreter)" {
+    const src =
+        \\enum Json { Null, Bool(b), Num(n), Arr(items) }
+        \\
+        \\func show(j: Json) -> str:
+        \\    return match j {
+        \\        Json.Null: "null"
+        \\        Json.Bool(b) if b: "true"
+        \\        Json.Bool(b): "false"
+        \\        Json.Num(n): "num ${n}"
+        \\        Json.Arr(xs): "arr ${len(xs)}"
+        \\    }
+        \\
+        \\func main():
+        \\    print(Json.Num(42))
+        \\    print(show(Json.Null))
+        \\    print(show(Json.Bool(true)))
+        \\    print(show(Json.Num(7)))
+        \\    print(show(Json.Arr([1, 2, 3])))
+        \\    print(Json.Num(5) == Json.Num(5))
+        \\    print(Json.Num(5) == Json.Num(6))
+    ;
+    try expectVMOutput(src, "Json.Num(42)\nnull\ntrue\nnum 7\narr 3\ntrue\nfalse\n");
 }
 
 test "vm: match on strings and bools" {

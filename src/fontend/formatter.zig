@@ -342,7 +342,9 @@ const Formatter = struct {
         for (e.members, 0..) |mem, i| {
             if (i > 0) try self.w(", ");
             try self.w(mem.name);
-            if (mem.value) |val| {
+            if (mem.payload.len > 0) {
+                try self.params(mem.payload);
+            } else if (mem.value) |val| {
                 try self.w(" = ");
                 try self.expr(val.*);
             }
@@ -730,6 +732,7 @@ const Formatter = struct {
                 try self.w(ec.enum_name);
                 try self.w(".");
                 try self.w(ec.case);
+                if (ec.args) |args| try self.patternSeq("(", args, ")");
             },
             .tuple => |seq| try self.patternSeq("(", seq.elems, ")"),
             .list => |seq| try self.patternSeq("[", seq.elems, "]"),
@@ -796,6 +799,16 @@ test "formats conditional expressions" {
     const out = try fmt(gpa, "func main():\n    var x =  a  if  c  else  b");
     defer gpa.free(out);
     try testing.expectEqualStrings("func main():\n    var x = a if c else b\n", out);
+}
+
+test "formats tagged-union enums and their payload patterns" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "enum Shape{Circle( r : float ),Rect(w,h),Empty}\nfunc a(s):\n    print(match s {Shape.Circle(r):r\n_:0})");
+    defer gpa.free(out);
+    try testing.expectEqualStrings(
+        "enum Shape { Circle(r: float), Rect(w, h), Empty }\n\nfunc a(s):\n    print(match s {\n        Shape.Circle(r): r\n        _: 0\n    })\n",
+        out,
+    );
 }
 
 test "formats match guards" {

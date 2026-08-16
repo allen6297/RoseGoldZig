@@ -145,14 +145,20 @@ const Closure = struct {
     statics: ?*Env,
 };
 
-/// An enum type: its name and the set of member names it declares.
+/// An enum type: its name and its cases, each mapped to its payload arity
+/// (0 for a plain case, N for a tagged-union case `Case(f1, …, fN)`).
 const EnumType = struct {
     name: []const u8,
-    members: std.StringHashMapUnmanaged(void) = .{},
+    members: std.StringHashMapUnmanaged(u32) = .{},
 };
 
-/// A single enum case, e.g. `Status.OK`.
-const EnumValue = struct { type_name: []const u8, member: []const u8 };
+/// A single enum case, e.g. `Status.OK` or a tagged-union `Shape.Circle(2.0)`
+/// (its `payload` holds the case's field values; empty for a plain case).
+const EnumValue = struct { type_name: []const u8, member: []const u8, payload: []const Value = &.{} };
+
+/// The constructor of a tagged-union case (`Shape.Circle`): calling it with the
+/// payload arguments builds the `EnumValue`.
+const EnumCtor = struct { type_name: []const u8, member: []const u8, arity: u32 };
 
 /// A live signal: an ordered list of handlers (any callable value) to invoke
 /// when the signal is emitted. Top-level signals are shared; a class signal is
@@ -179,6 +185,8 @@ pub const Value = union(enum) {
     type_ref: *const TypeInfo,
     enum_type: *const EnumType,
     enum_value: *const EnumValue,
+    /// The constructor of a tagged-union case; callable to build an `enum_value`.
+    enum_ctor: *const EnumCtor,
     signal: *Signal,
     /// A tuple `(a, b, ...)` — a fixed, ordered group; compared elementwise.
     tuple: *List,
@@ -316,7 +324,14 @@ fn valuesEqual(a: Value, b: Value) bool {
         .enum_type => |x| b == .enum_type and x == b.enum_type,
         .enum_value => |x| b == .enum_value and
             std.mem.eql(u8, x.type_name, b.enum_value.type_name) and
-            std.mem.eql(u8, x.member, b.enum_value.member),
+            std.mem.eql(u8, x.member, b.enum_value.member) and
+            x.payload.len == b.enum_value.payload.len and blk: {
+                for (x.payload, b.enum_value.payload) |ea, eb| {
+                    if (!valuesEqual(ea, eb)) break :blk false;
+                }
+                break :blk true;
+            },
+        .enum_ctor => |x| b == .enum_ctor and x == b.enum_ctor,
         .signal => |x| b == .signal and x == b.signal,
         .tuple => |x| b == .tuple and blk: {
             if (x.items.len != b.tuple.items.len) break :blk false;
@@ -788,7 +803,7 @@ const Interpreter = struct {
     fn registerEnum(self: *Interpreter, name: []const u8, members: []const parser.EnumMember) Error!void {
         const et = try self.arena.create(EnumType);
         et.* = .{ .name = name };
-        for (members) |m| try et.members.put(self.arena, m.name, {});
+        for (members) |m| try et.members.put(self.arena, m.name, @intCast(m.payload.len));
         try self.define(self.globals, name, .{ .enum_type = et });
     }
 
@@ -1928,6 +1943,14 @@ const Interpreter = struct {
             .static_method => |sm| try self.callStaticMethod(sm, args, span),
             .closure => |cl| try self.callClosure(cl, args, span),
             .type_ref => |ti| try self.construct(ti, args, span),
+            .enum_ctor => |ec| blk: {
+                if (args.len != ec.arity) {
+                    return self.fail(span, "{s}.{s} expects {d} argument(s), got {d}", .{ ec.type_name, ec.member, ec.arity, args.len });
+                }
+                const ev = try self.arena.create(EnumValue);
+                ev.* = .{ .type_name = ec.type_name, .member = ec.member, .payload = try self.arena.dupe(Value, args) };
+                break :blk .{ .enum_value = ev };
+            },
             else => self.fail(span, "{s} is not callable", .{@tagName(callee)}),
         };
     }
@@ -1945,8 +1968,14 @@ const Interpreter = struct {
                 return self.fail(m.span, "type '{s}' has no member '{s}'", .{ inst.info.name, m.name });
             },
             .enum_type => |et| {
-                if (!et.members.contains(m.name)) {
+                const arity = et.members.get(m.name) orelse
                     return self.fail(m.span, "enum '{s}' has no member '{s}'", .{ et.name, m.name });
+                // A tagged-union case yields a constructor (called with the
+                // payload); a plain case yields the value directly.
+                if (arity > 0) {
+                    const ec = try self.arena.create(EnumCtor);
+                    ec.* = .{ .type_name = et.name, .member = m.name, .arity = arity };
+                    return .{ .enum_ctor = ec };
                 }
                 const ev = try self.arena.create(EnumValue);
                 ev.* = .{ .type_name = et.name, .member = m.name };
@@ -2191,6 +2220,19 @@ const Interpreter = struct {
                 }
                 return true;
             },
+            .enum_case => |ec| {
+                if (value != .enum_value) return false;
+                const ev = value.enum_value;
+                if (!std.mem.eql(u8, ev.type_name, ec.enum_name) or !std.mem.eql(u8, ev.member, ec.case)) return false;
+                // `Enum.CASE(p…)` also destructures the payload element-wise.
+                if (ec.args) |args| {
+                    if (ev.payload.len != args.len) return false;
+                    for (args, ev.payload) |sub, item| {
+                        if (!try self.bindPattern(sub, item, env)) return false;
+                    }
+                }
+                return true;
+            },
             else => return valuesEqual(try self.patternValue(p), value),
         }
     }
@@ -2295,6 +2337,19 @@ const Interpreter = struct {
                 try buf.appendSlice(self.arena, ev.type_name);
                 try buf.append(self.arena, '.');
                 try buf.appendSlice(self.arena, ev.member);
+                if (ev.payload.len > 0) {
+                    try buf.append(self.arena, '(');
+                    for (ev.payload, 0..) |item, i| {
+                        if (i > 0) try buf.appendSlice(self.arena, ", ");
+                        try self.appendValue(buf, item);
+                    }
+                    try buf.append(self.arena, ')');
+                }
+            },
+            .enum_ctor => |ec| {
+                try buf.appendSlice(self.arena, ec.type_name);
+                try buf.append(self.arena, '.');
+                try buf.appendSlice(self.arena, ec.member);
             },
             .instance => |inst| {
                 try buf.appendSlice(self.arena, inst.info.name);
@@ -2635,6 +2690,31 @@ test "match dispatches on enum cases" {
         \\    print(color(Suit.SPADES))
     ;
     try expectOutput(src, "red\nblack\n");
+}
+
+test "tagged-union enums construct, destructure, and compare deeply" {
+    const src =
+        \\enum Json { Null, Bool(b), Num(n), Arr(items) }
+        \\
+        \\func show(j: Json) -> str:
+        \\    return match j {
+        \\        Json.Null: "null"
+        \\        Json.Bool(b) if b: "true"
+        \\        Json.Bool(b): "false"
+        \\        Json.Num(n): "num ${n}"
+        \\        Json.Arr(xs): "arr ${len(xs)}"
+        \\    }
+        \\
+        \\func main():
+        \\    print(Json.Num(42))
+        \\    print(show(Json.Null))
+        \\    print(show(Json.Bool(true)))
+        \\    print(show(Json.Num(7)))
+        \\    print(show(Json.Arr([1, 2, 3])))
+        \\    print(Json.Num(5) == Json.Num(5))
+        \\    print(Json.Num(5) == Json.Num(6))
+    ;
+    try expectOutput(src, "Json.Num(42)\nnull\ntrue\nnum 7\narr 3\ntrue\nfalse\n");
 }
 
 test "match expression selects the right arm" {

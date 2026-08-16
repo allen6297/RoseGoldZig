@@ -189,7 +189,10 @@ pub const Pattern = union(enum) {
     /// A list pattern `[p1, p2, …]` — matches a list of exactly that length.
     list: Seq,
 
-    pub const EnumCase = struct { enum_name: []const u8, case: []const u8, span: Span };
+    /// `Enum.CASE`, or `Enum.CASE(p1, p2, …)` to also destructure a tagged-union
+    /// case's payload (each sub-pattern bound positionally). `args` is null when
+    /// the pattern names the case only.
+    pub const EnumCase = struct { enum_name: []const u8, case: []const u8, args: ?[]const Pattern = null, span: Span };
     pub const Seq = struct { elems: []const Pattern, span: Span };
 };
 
@@ -249,7 +252,14 @@ pub const Stmt = union(enum) {
     pub const Assign = struct { target: *Expr, value: *Expr, span: Span };
 };
 
-pub const EnumMember = struct { name: []const u8, value: ?*Expr, span: Span };
+pub const EnumMember = struct {
+    name: []const u8,
+    value: ?*Expr,
+    /// A tagged-union case's payload fields (`Circle(r: float)`); empty for a
+    /// plain case. Mutually exclusive with `value` (a `= N` int case).
+    payload: []const Param = &.{},
+    span: Span,
+};
 
 pub const Decl = union(enum) {
     import: Import,
@@ -799,10 +809,18 @@ const Parser = struct {
         while (!self.at(.r_brace) and !self.atEnd()) {
             const m = try self.expect(.identifier, "expected an enum member name");
             var value: ?*Expr = null;
-            if (self.eat(.assign)) value = try self.parseExpr();
+            var payload: []const Param = &.{};
+            // A case is either `NAME`, `NAME = int` (a plain value), or
+            // `NAME(fields…)` (a tagged-union payload).
+            if (self.at(.l_paren)) {
+                payload = try self.parseParamList();
+            } else if (self.eat(.assign)) {
+                value = try self.parseExpr();
+            }
             try members.append(self.alloc, .{
                 .name = m.text,
                 .value = value,
+                .payload = payload,
                 .span = if (value) |v| joinSpan(m.span, exprSpan(v.*)) else m.span,
             });
             // Members may be separated by a newline, a comma, or both.
@@ -1532,9 +1550,16 @@ const Parser = struct {
             .identifier => {
                 const first = self.advance();
                 // `Enum.CASE` is an enum-case pattern; a bare name is a binding.
+                // `Enum.CASE(p1, p2, …)` also destructures the case's payload.
                 if (self.eat(.dot)) {
                     const case = try self.expect(.identifier, "expected an enum case after '.'");
-                    return .{ .enum_case = .{ .enum_name = first.text, .case = case.text, .span = spanFrom(first, case) } };
+                    var args: ?[]const Pattern = null;
+                    if (self.at(.l_paren)) {
+                        _ = self.advance();
+                        args = try self.parsePatternSeq(.r_paren);
+                        _ = try self.expect(.r_paren, "expected ')' to close an enum-case pattern");
+                    }
+                    return .{ .enum_case = .{ .enum_name = first.text, .case = case.text, .args = args, .span = spanFrom(first, self.prev()) } };
                 }
                 return .{ .binding = .{ .name = first.text, .span = first.span } };
             },
@@ -1939,6 +1964,34 @@ test "parses enum-case patterns in match" {
     try testing.expectEqualStrings("Status", arms[0].pattern.enum_case.enum_name);
     try testing.expectEqualStrings("OK", arms[0].pattern.enum_case.case);
     try testing.expect(std.meta.activeTag(arms[1].pattern) == .binding);
+}
+
+test "parses a tagged-union enum and its payload patterns" {
+    const src =
+        \\enum Shape { Circle(r: float), Rect(w: float, h: float), Empty }
+        \\func area(s: Shape) -> float:
+        \\    return match s {
+        \\        Shape.Circle(r): r
+        \\        Shape.Empty: 0.0
+        \\    }
+    ;
+    var tree = try parse(testing.allocator, src);
+    defer tree.deinit();
+
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const en = tree.module.decls[0].enum_decl;
+    try testing.expectEqual(@as(usize, 3), en.members.len);
+    try testing.expectEqual(@as(usize, 1), en.members[0].payload.len); // Circle(r)
+    try testing.expectEqualStrings("r", en.members[0].payload[0].name);
+    try testing.expectEqual(@as(usize, 2), en.members[1].payload.len); // Rect(w, h)
+    try testing.expectEqual(@as(usize, 0), en.members[2].payload.len); // Empty
+    const arms = tree.module.decls[1].func.body[0].return_stmt.value.?.match.arms;
+    // Shape.Circle(r) — an enum-case pattern carrying one sub-pattern.
+    try testing.expect(std.meta.activeTag(arms[0].pattern) == .enum_case);
+    try testing.expect(arms[0].pattern.enum_case.args != null);
+    try testing.expectEqual(@as(usize, 1), arms[0].pattern.enum_case.args.?.len);
+    // Shape.Empty — no args.
+    try testing.expect(arms[1].pattern.enum_case.args == null);
 }
 
 test "parses tuple and list destructuring patterns with nesting" {

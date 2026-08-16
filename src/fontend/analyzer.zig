@@ -1180,7 +1180,9 @@ const Analyzer = struct {
             },
             .enum_ref => |enum_name| {
                 const scope = self.enum_types.get(enum_name) orelse return .unknown;
-                if (scope.symbols.contains(name)) return .{ .named = enum_name };
+                // A plain case is the enum type; a tagged-union case is its
+                // constructor (a `.func` recorded by `buildEnumType`).
+                if (scope.symbols.get(name)) |sym| return sym.ty;
                 try self.report(span, "enum '{s}' has no case '{s}'", .{ enum_name, name });
                 return .unknown;
             },
@@ -1207,7 +1209,22 @@ const Analyzer = struct {
     fn buildEnumType(self: *Analyzer, name: []const u8, members: []const parser.EnumMember) Error!void {
         const scope = try self.newScope(self.module_scope);
         for (members) |m| {
-            try self.declareIn(scope, m.name, .enum_member, .{ .named = name }, m.span);
+            // A tagged-union case is a constructor: type it as a function from
+            // its payload types to the enum, so `Shape.Circle(2.0)` type-checks
+            // (and reuses the ordinary call path). A plain case is the enum itself.
+            var ty: Type = .{ .named = name };
+            if (m.payload.len > 0) {
+                const params = try self.arena.alloc(Type, m.payload.len);
+                const names = try self.arena.alloc([]const u8, m.payload.len);
+                for (m.payload, 0..) |p, i| {
+                    params[i] = if (p.type) |ann| try self.annotationType(ann) else .any;
+                    names[i] = p.name;
+                }
+                const sig = try self.arena.create(FuncSig);
+                sig.* = .{ .params = params, .ret = .{ .named = name }, .required = params.len, .param_names = names };
+                ty = .{ .func = sig };
+            }
+            try self.declareIn(scope, m.name, .enum_member, ty, m.span);
         }
         try self.enum_types.put(self.arena, name, scope);
     }
@@ -2099,6 +2116,7 @@ const Analyzer = struct {
         switch (p) {
             .binding => |b| try self.declareIn(scope, b.name, .binding, .unknown, b.span),
             .tuple, .list => |seq| for (seq.elems) |sub| try self.declarePatternBindings(scope, sub),
+            .enum_case => |ec| if (ec.args) |args| for (args) |sub| try self.declarePatternBindings(scope, sub),
             else => {},
         }
     }
@@ -2110,9 +2128,16 @@ const Analyzer = struct {
             try self.report(ec.span, "unknown enum '{s}'", .{ec.enum_name});
             return;
         };
-        if (!scope.symbols.contains(ec.case)) {
+        const case_sym = scope.symbols.get(ec.case) orelse {
             try self.report(ec.span, "enum '{s}' has no case '{s}'", .{ ec.enum_name, ec.case });
             return;
+        };
+        // `Enum.CASE(p…)` must supply exactly the case's payload arity.
+        if (ec.args) |args| {
+            const arity = if (tagOf(case_sym.ty) == .func) case_sym.ty.func.params.len else 0;
+            if (args.len != arity) {
+                try self.report(ec.span, "case '{s}.{s}' has {d} payload field(s), got {d}", .{ ec.enum_name, ec.case, arity, args.len });
+            }
         }
         if (subject_enum) |se| {
             if (!std.mem.eql(u8, se, ec.enum_name)) {
@@ -2758,6 +2783,51 @@ test "an enum-case pattern against a non-enum subject is reported" {
     var a = try analyzeSource(testing.allocator, src);
     defer a.deinit();
     try expectMessageContains(a, "cannot match an enum case against int");
+}
+
+test "a tagged-union enum type-checks construction, payload, and patterns" {
+    const src =
+        \\enum Shape { Circle(r: float), Empty }
+        \\
+        \\func area(s: Shape) -> float:
+        \\    return match s {
+        \\        Shape.Circle(r): r * r
+        \\        Shape.Empty: 0.0
+        \\    }
+        \\
+        \\func main():
+        \\    print(area(Shape.Circle(2.0)))
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try testing.expectEqual(@as(usize, 0), a.diagnostics.len);
+}
+
+test "a wrong-arity enum payload pattern is reported" {
+    const src =
+        \\enum Shape { Circle(r: float), Empty }
+        \\
+        \\func f(s: Shape) -> float:
+        \\    return match s {
+        \\        Shape.Circle(a, b): a
+        \\        Shape.Empty: 0.0
+        \\    }
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try expectMessageContains(a, "has 1 payload field(s), got 2");
+}
+
+test "constructing a tagged-union case with the wrong argument count is reported" {
+    const src =
+        \\enum Shape { Circle(r: float), Empty }
+        \\
+        \\func main():
+        \\    var c: Shape = Shape.Circle(1.0, 2.0)
+    ;
+    var a = try analyzeSource(testing.allocator, src);
+    defer a.deinit();
+    try expectMessageContains(a, "argument");
 }
 
 // match result type

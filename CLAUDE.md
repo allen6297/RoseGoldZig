@@ -26,7 +26,7 @@ zig build run -- repl           # interactive session (also the default, no file
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- doc FILE.rg    # print Markdown API docs from FILE's ## comments (stdout)
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (410 as of writing)
+zig build test                  # run every test (417 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -63,7 +63,7 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
 | `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. Registers the `std/*.rg` files as named `@embedFile` imports on the frontend test module (they live outside `src/`) so tests can embed them. |
 | `std/*.rg` | The **standard library**, written in RoseGold itself: `lists.rg`, `strings.rg`, `mathx.rg`, `sets.rg`, `test.rg` (a unit-test framework). Imported as `import std.lists` etc.; the CLI auto-discovers the `std/` root so no `--path` is needed (see **Standard library**). Runs on both backends. |
-| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, `defaults.rg`, `features.rg` (bitwise/slicing/named-args/comprehensions), `async.rg` (async/await/gather), `patterns.rg` (match guards + tuple/list destructuring), `stddemo.rg` (uses the bundled `std/` library), and `selftest.rg` (a `std.test` suite — all run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
+| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, `defaults.rg`, `features.rg` (bitwise/slicing/named-args/comprehensions), `async.rg` (async/await/gather), `patterns.rg` (match guards + tuple/list destructuring), `enums.rg` (tagged-union enums — payloads, recursive trees, first-class case constructors), `stddemo.rg` (uses the bundled `std/` library), and `selftest.rg` (a `std.test` suite — all run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
 
 Each layer imports the ones below it (`interpreter`/`analyzer` → `parser` → `lexer`,
 and `loader`/`formatter` → `parser`); there are no upward dependencies. `main.zig`
@@ -115,7 +115,11 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   (optional `: type`), `func name(p: T, q, r = expr) -> R:` (params may be untyped →
   `any`, and may carry a trailing **default value** `= expr`; see **Default parameters**),
   `async func` (returns a `task<R>` instead of `R`; see **Async/await**),
-  `class` (with `extends` / `uses`), `struct` (no inheritance), `enum { A, B = 2 }`,
+  `class` (with `extends` / `uses`), `struct` (no inheritance), `enum { A, B = 2 }`
+  (a **tagged union** when a case carries a payload — `enum Shape { Circle(r: float),
+  Rect(w, h), Empty }`; the payload is a param list, so a case is a first-class
+  constructor `Shape.Circle(2.0)` and `match` destructures it via `Shape.Circle(r)` —
+  see **Tagged-union enums**),
   `signal name(params)`. `pub`/`private` visibility; `static` on a class/struct
   member makes it belong to the type (shared storage / no receiver), reached via
   `Type.member`.
@@ -154,7 +158,8 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   that close over the surrounding scope, `await expr` (a unary prefix binding tighter
   than binary ops; resolves a `task<T>` to its `T` — see **Async/await**), and
   `match subj { pattern: body, ... }`
-  (patterns: literals, `_`, a binding name, an enum case `Enum.CASE`, or a
+  (patterns: literals, `_`, a binding name, an enum case `Enum.CASE` (also
+  `Enum.CASE(p1, p2, …)` to destructure a tagged-union payload), or a
   **destructuring pattern** — a tuple `(p1, p2, …)` or list `[p1, p2, …]` whose
   sub-patterns may nest and bind (`(0, (a, b))`, `[x, y]`). A tuple pattern matches a
   tuple of the same arity element-wise; a list pattern matches a list of *exactly*
@@ -243,6 +248,27 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `await_task` opcode pops a value and — if it's a task — runs `forceTask` (which sets
   `forcing`, consumed by the awaited call so *nested* async calls still defer) and pushes
   the memoized result; a non-task passes through. `gather` mirrors the interpreter.
+
+### Tagged-union enums
+- An enum case may carry a **payload** — a parenthesized param list reusing
+  `parser.Param`: `enum Shape { Circle(r: float), Rect(w: float, h: float), Empty }`.
+  A case is either plain (`Empty`), int-valued (`OK = 200`), or payload-carrying
+  (`Circle(r: float)`); these are mutually exclusive (`EnumMember.payload`).
+- A **payload case is a first-class constructor** — `Shape.Circle` is callable, and
+  `Shape.Circle(2.0)` builds the value; `var mk = Shape.Circle; mk(2.0)` and
+  `map(xs, Shape.Circle)` work too. A plain case (`Shape.Empty`) stays a bare value.
+- **`match` destructures the payload**: `Shape.Circle(r)` binds `r` positionally (reusing
+  the destructuring pattern engine — `Pattern.EnumCase.args`); a bare `Shape.Circle`
+  (no args) matches the case ignoring its payload. Exhaustiveness is still by case name.
+- **Equality is deep** (case name + payload elementwise), and a value prints as
+  `Shape.Circle(2)`.
+- **Both backends, byte-identical.** Runtime: `EnumValue` gains a `payload`; a new
+  `EnumCtor`/`enum_ctor` value is what `get_member` returns for a payload case, and
+  calling it constructs the `EnumValue`. The analyzer types a payload case as a
+  `FuncSig` `(payload types) -> Enum`, so construction reuses the ordinary call/arity
+  path. The VM adds a `check_enum` opcode (refutable name test, payload-agnostic) and
+  extends `seq_get` to index an enum payload, compiled via `emitEnumPattern` on the same
+  failure-ladder machinery as tuple/list patterns. See `examples/enums.rg`.
 
 ### Error handling
 - `raise expr` throws a value; `try: body catch e: handler` runs `body` and, on a raised
