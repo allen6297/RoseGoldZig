@@ -31,3 +31,7 @@ func main():
     print([i for i, v in xs if v > 25])     ## [2, 3, 4]
     var grid = [[r * c for c in range(3)] for r in range(3)]
     print(grid)                             ## [[0, 0, 0], [0, 1, 2], [0, 2, 4]]
+
+    ## method-call syntax: `x.f(args)` on a primitive/collection is `f(x, args)`
+    print("  Rose Gold  ".trim().lower())   ## rose gold
+    print([3, 1, 2].sort().len())           ## 3

@@ -26,7 +26,7 @@ zig build run -- repl           # interactive session (also the default, no file
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- doc FILE.rg    # print Markdown API docs from FILE's ## comments (stdout)
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (417 as of writing)
+zig build test                  # run every test (419 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -144,7 +144,11 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   positional, match a parameter by name, no duplicates, and unfilled params use their
   defaults — see **Named arguments**), indexing `a[i]`, **slicing** `a[start:end]` (list/string; either
   bound optional → 0 / length; clamped, `end<start` ⇒ empty; negatives clamp to 0),
-  member access `x.f`,
+  member access `x.f`, **method-call syntax** — `x.name(args)` is an instance method
+  when `x`'s type has one, otherwise (on a primitive/collection) `name` is a **builtin
+  bound to the receiver**: `"hi".upper()` ≡ `upper("hi")`, `xs.map(f)` ≡ `map(xs, f)`,
+  chainable (`s.trim().upper()`) and first-class (`var f = s.upper`; see **Method-call
+  syntax**),
   array `[...]` and map `{k: v}` literals, **list/map comprehensions**
   `[out for x[, v] in iter if cond]` and `{key: value for x[, v] in iter if cond}`
   (the map form builds a map, last-wins on duplicate keys; the `if` filter and a second
@@ -248,6 +252,22 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   `await_task` opcode pops a value and — if it's a task — runs `forceTask` (which sets
   `forcing`, consumed by the awaited call so *nested* async calls still defer) and pushes
   the memoized result; a non-task passes through. `gather` mirrors the interpreter.
+
+### Method-call syntax
+- `recv.name(args)` resolves `name` as a **member of the receiver first** (an instance
+  field/method, so `inst.method()` and a user method named like a builtin both win). On
+  a **primitive/collection** receiver with no such member, `recv.name` evaluates to a
+  **`bound_builtin`** — the builtin `name` bound to `recv` — so calling it runs
+  `name(recv, args…)`. Builtins already take the receiver-like value first, so
+  `"hi".upper()`→`upper("hi")`, `xs.push(x)`→`push(xs, x)`, `xs.map(f)`→`map(xs, f)` all
+  line up. It's first-class (`var f = s.upper; f()`) and chainable.
+- **Both backends, byte-identical.** A `bound_builtin` value (builtin + receiver) is
+  produced by member access on a primitive (interpreter `evalMember`'s `else`; VM
+  `get_member`'s fallthrough — both via `std.meta.stringToEnum(Builtin, name)`) and
+  consumed by the call path (`callValue` / the `call` opcode) as `builtin(recv, args…)`.
+  The analyzer is already lenient about member access on primitives, so no analyzer
+  change was needed (result types stay `unknown`). Only instance/module/enum/type
+  receivers keep their strict member resolution (a typo'd member still errors).
 
 ### Tagged-union enums
 - An enum case may carry a **payload** — a parenthesized param list reusing

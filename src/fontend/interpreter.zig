@@ -160,6 +160,10 @@ const EnumValue = struct { type_name: []const u8, member: []const u8, payload: [
 /// payload arguments builds the `EnumValue`.
 const EnumCtor = struct { type_name: []const u8, member: []const u8, arity: u32 };
 
+/// Method-call sugar: `recv.builtin(args)` on a primitive/collection binds the
+/// receiver to a builtin, so calling it runs `builtin(recv, args…)`.
+const BoundBuiltin = struct { builtin: Builtin, recv: Value };
+
 /// A live signal: an ordered list of handlers (any callable value) to invoke
 /// when the signal is emitted. Top-level signals are shared; a class signal is
 /// created fresh per instance.
@@ -187,6 +191,8 @@ pub const Value = union(enum) {
     enum_value: *const EnumValue,
     /// The constructor of a tagged-union case; callable to build an `enum_value`.
     enum_ctor: *const EnumCtor,
+    /// A builtin bound to a receiver via method-call syntax (`xs.map`).
+    bound_builtin: *const BoundBuiltin,
     signal: *Signal,
     /// A tuple `(a, b, ...)` — a fixed, ordered group; compared elementwise.
     tuple: *List,
@@ -332,6 +338,7 @@ fn valuesEqual(a: Value, b: Value) bool {
                 break :blk true;
             },
         .enum_ctor => |x| b == .enum_ctor and x == b.enum_ctor,
+        .bound_builtin => |x| b == .bound_builtin and x == b.bound_builtin,
         .signal => |x| b == .signal and x == b.signal,
         .tuple => |x| b == .tuple and blk: {
             if (x.items.len != b.tuple.items.len) break :blk false;
@@ -1951,6 +1958,13 @@ const Interpreter = struct {
                 ev.* = .{ .type_name = ec.type_name, .member = ec.member, .payload = try self.arena.dupe(Value, args) };
                 break :blk .{ .enum_value = ev };
             },
+            // A bound builtin runs `builtin(recv, args…)` (method-call sugar).
+            .bound_builtin => |bb| blk: {
+                const full = try self.arena.alloc(Value, args.len + 1);
+                full[0] = bb.recv;
+                @memcpy(full[1..], args);
+                break :blk try self.callBuiltin(bb.builtin, full, span);
+            },
             else => self.fail(span, "{s} is not callable", .{@tagName(callee)}),
         };
     }
@@ -1989,7 +2003,16 @@ const Interpreter = struct {
                 if (self.staticsEnvFor(ti, m.name)) |env| return env.vars.get(m.name).?;
                 return self.fail(m.span, "type '{s}' has no static member '{s}'", .{ ti.name, m.name });
             },
-            else => return self.fail(m.span, "cannot access a member of {s}", .{@tagName(obj)}),
+            // Method-call sugar on a primitive/collection: `s.upper` / `xs.map`
+            // is the builtin bound to the receiver.
+            else => {
+                if (std.meta.stringToEnum(Builtin, m.name)) |b| {
+                    const bb = try self.arena.create(BoundBuiltin);
+                    bb.* = .{ .builtin = b, .recv = obj };
+                    return .{ .bound_builtin = bb };
+                }
+                return self.fail(m.span, "cannot access a member of {s}", .{@tagName(obj)});
+            },
         }
     }
 
@@ -2351,6 +2374,7 @@ const Interpreter = struct {
                 try buf.append(self.arena, '.');
                 try buf.appendSlice(self.arena, ec.member);
             },
+            .bound_builtin => try buf.appendSlice(self.arena, "<function>"),
             .instance => |inst| {
                 try buf.appendSlice(self.arena, inst.info.name);
                 try buf.appendSlice(self.arena, " {");
@@ -2715,6 +2739,27 @@ test "tagged-union enums construct, destructure, and compare deeply" {
         \\    print(Json.Num(5) == Json.Num(6))
     ;
     try expectOutput(src, "Json.Num(42)\nnull\ntrue\nnum 7\narr 3\ntrue\nfalse\n");
+}
+
+test "method-call syntax on primitives desugars to builtins; user methods win" {
+    const src =
+        \\class Box:
+        \\    var v: int = 0
+        \\    func get() -> int:
+        \\        return v
+        \\    ## a method named like a builtin still takes precedence
+        \\    func upper() -> str:
+        \\        return "BOX"
+        \\
+        \\func main():
+        \\    print("rose".upper())
+        \\    print([3, 1, 2].sort())
+        \\    print([1, 2, 3].map(func(x): x * 2))
+        \\    print("a,b,c".split(",").len())
+        \\    var b = Box()
+        \\    print(b.get(), b.upper())
+    ;
+    try expectOutput(src, "ROSE\n[1, 2, 3]\n[2, 4, 6]\n3\n0 BOX\n");
 }
 
 test "match expression selects the right arm" {

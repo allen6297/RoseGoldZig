@@ -148,6 +148,10 @@ const EnumValue = struct { enum_name: []const u8, member: []const u8, payload: [
 /// The constructor of a tagged-union case; calling it builds the `EnumValue`.
 const EnumCtor = struct { enum_name: []const u8, member: []const u8, arity: u32 };
 
+/// Method-call sugar: a builtin bound to a receiver (`xs.map`); calling it runs
+/// `builtin(recv, args…)`.
+const BoundBuiltin = struct { builtin: Builtin, recv: Value };
+
 const Value = union(enum) {
     nil,
     int: i64,
@@ -165,6 +169,8 @@ const Value = union(enum) {
     enum_value: *const EnumValue,
     /// The constructor of a tagged-union case; callable to build an `enum_value`.
     enum_ctor: *const EnumCtor,
+    /// A builtin bound to a receiver via method-call syntax (`xs.map`).
+    bound_builtin: *const BoundBuiltin,
     module: *RtModule,
     signal: *Signal,
     /// A tuple `(a, b, ...)` — a fixed, ordered group; compared elementwise.
@@ -282,6 +288,7 @@ fn valuesEqual(a: Value, b: Value) bool {
                 break :blk true;
             },
         .enum_ctor => |x| b == .enum_ctor and x == b.enum_ctor,
+        .bound_builtin => |x| b == .bound_builtin and x == b.bound_builtin,
         .module => |x| b == .module and x == b.module,
         .signal => |x| b == .signal and x == b.signal,
         .task => |x| b == .task and x == b.task,
@@ -2406,7 +2413,15 @@ const VM = struct {
                         .module => |m| {
                             if (m.globals.get(name)) |v| try self.push(v) else return self.fail("module '{s}' has no member '{s}'", .{ m.name, name });
                         },
-                        else => return self.fail("cannot access member '{s}' of {s}", .{ name, @tagName(obj) }),
+                        // Method-call sugar on a primitive/collection: `s.upper` /
+                        // `xs.map` is the builtin bound to the receiver.
+                        else => {
+                            if (std.meta.stringToEnum(Builtin, name)) |b| {
+                                const bb = try self.alloc.create(BoundBuiltin);
+                                bb.* = .{ .builtin = b, .recv = obj };
+                                try self.push(.{ .bound_builtin = bb });
+                            } else return self.fail("cannot access member '{s}' of {s}", .{ name, @tagName(obj) });
+                        },
                     }
                 },
                 .set_field => {
@@ -2720,6 +2735,16 @@ const VM = struct {
                 ev.* = .{ .enum_name = ec.enum_name, .member = ec.member, .payload = try self.alloc.dupe(Value, self.stack.items[base..]) };
                 self.stack.shrinkRetainingCapacity(base - 1); // drop callee + args
                 try self.push(.{ .enum_value = ev });
+            },
+            // A bound builtin runs `builtin(recv, args…)` (method-call sugar).
+            .bound_builtin => |bb| {
+                const base = self.stack.items.len - argc;
+                const full = try self.alloc.alloc(Value, argc + 1);
+                full[0] = bb.recv;
+                @memcpy(full[1..], self.stack.items[base..]);
+                const result = try self.callBuiltin(bb.builtin, full);
+                self.stack.shrinkRetainingCapacity(base - 1); // drop callee + args
+                try self.push(result);
             },
             else => return self.fail("{s} is not callable", .{@tagName(callee)}),
         }
@@ -3162,7 +3187,7 @@ const VM = struct {
                 }
                 try buf.append(self.alloc, '}');
             },
-            .closure, .builtin, .bound_method => try buf.appendSlice(self.alloc, "<function>"),
+            .closure, .builtin, .bound_method, .bound_builtin => try buf.appendSlice(self.alloc, "<function>"),
             .module => try buf.appendSlice(self.alloc, "<module>"),
             .task => try buf.appendSlice(self.alloc, "<task>"),
             .signal => |s| {
@@ -3835,6 +3860,26 @@ test "vm: tagged-union enums (byte-identical to the interpreter)" {
         \\    print(Json.Num(5) == Json.Num(6))
     ;
     try expectVMOutput(src, "Json.Num(42)\nnull\ntrue\nnum 7\narr 3\ntrue\nfalse\n");
+}
+
+test "vm: method-call syntax (byte-identical to the interpreter)" {
+    const src =
+        \\class Box:
+        \\    var v: int = 0
+        \\    func get() -> int:
+        \\        return v
+        \\    func upper() -> str:
+        \\        return "BOX"
+        \\
+        \\func main():
+        \\    print("rose".upper())
+        \\    print([3, 1, 2].sort())
+        \\    print([1, 2, 3].map(func(x): x * 2))
+        \\    print("a,b,c".split(",").len())
+        \\    var b = Box()
+        \\    print(b.get(), b.upper())
+    ;
+    try expectVMOutput(src, "ROSE\n[1, 2, 3]\n[2, 4, 6]\n3\n0 BOX\n");
 }
 
 test "vm: match on strings and bools" {
