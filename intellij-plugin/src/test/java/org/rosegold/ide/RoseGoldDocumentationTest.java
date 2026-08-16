@@ -113,6 +113,42 @@ public class RoseGoldDocumentationTest extends BasePlatformTestCase {
         assertTrue(doc, doc.contains("case of enum Light"));
     }
 
+    /** Hovering a static member reached via `Type.member` shows the member's doc. */
+    public void testDocForStaticMethod() {
+        myFixture.configureByText("h.rg",
+                "class Counter:\n" +
+                "    static var total: int = 0\n" +
+                "    ## Bump and return the running total.\n" +
+                "    static func bump() -> int:\n" +
+                "        total = total + 1\n" +
+                "        return total\n" +
+                "\n" +
+                "func main():\n" +
+                "    print(Counter.bu<caret>mp())\n");
+        String doc = docAtCaret();
+        assertNotNull(doc);
+        assertTrue(doc, doc.contains("static func bump() -&gt; int"));
+        assertTrue(doc, doc.contains("Bump and return the running total."));
+        assertTrue(doc, doc.contains("member of Counter"));
+    }
+
+    /** A static field reached via `Type.field` resolves to that class's member, not a same-named one elsewhere. */
+    public void testDocForStaticFieldIsTypeScoped() {
+        myFixture.configureByText("i.rg",
+                "class A:\n" +
+                "    static var tag: int = 1\n" +
+                "\n" +
+                "class B:\n" +
+                "    static var tag: str = \"b\"\n" +
+                "\n" +
+                "func main():\n" +
+                "    print(B.ta<caret>g)\n");
+        String doc = docAtCaret();
+        assertNotNull(doc);
+        assertTrue("should resolve B's tag, not A's: " + doc, doc.contains("static var tag: str = \"b\""));
+        assertTrue(doc, doc.contains("member of B"));
+    }
+
     /** Hovering the enum name itself still shows the enum declaration. */
     public void testDocForEnumType() {
         myFixture.configureByText("g.rg",

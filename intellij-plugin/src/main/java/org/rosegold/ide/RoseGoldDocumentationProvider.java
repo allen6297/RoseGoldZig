@@ -98,6 +98,11 @@ public final class RoseGoldDocumentationProvider extends AbstractDocumentationPr
         if (enumDoc != null) {
             return enumDoc;
         }
+        // `Type.member` — a (static) member reached through its class/struct.
+        String memberDoc = staticMemberDoc(text, offset, name);
+        if (memberDoc != null) {
+            return memberDoc;
+        }
         String builtin = DOCS.get(name);
         if (builtin != null) {
             return "<code>" + builtin + "</code>";
@@ -309,29 +314,67 @@ public final class RoseGoldDocumentationProvider extends AbstractDocumentationPr
      */
     private static @Nullable String declDoc(CharSequence text, String name) {
         for (RoseGoldDeclaration d : RoseGoldDeclarations.scanFlat(text)) {
-            if (!d.name.equals(name)) {
+            if (d.name.equals(name)) {
+                return renderDeclAt(text, d.nameOffset);
+            }
+        }
+        return null;
+    }
+
+    /** The header line at `nameOffset` (colon trimmed) plus its `##` doc block. */
+    private static String renderDeclAt(CharSequence text, int nameOffset) {
+        int lineStart = lineStartOffset(text, nameOffset);
+        int lineEnd = lineEndOffset(text, nameOffset);
+        String header = text.subSequence(lineStart, lineEnd).toString().trim();
+        if (header.endsWith(":")) {
+            header = header.substring(0, header.length() - 1);
+        }
+        List<String> comments = commentsAbove(text, lineStart);
+        StringBuilder sb = new StringBuilder();
+        sb.append("<code>").append(escape(header)).append("</code>");
+        if (!comments.isEmpty()) {
+            sb.append("<br><br>");
+            for (int i = 0; i < comments.size(); i++) {
+                if (i > 0) {
+                    sb.append("<br>");
+                }
+                sb.append(escape(comments.get(i)));
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * When the hovered name is `member` in `Type.member` and `Type` is a
+     * class/struct declared in the file, render that member's declaration (its
+     * header shows `static` when present) with a "member of Type" note.
+     */
+    private static @Nullable String staticMemberDoc(CharSequence text, int offset, String name) {
+        if (offset < 2 || text.charAt(offset - 1) != '.') {
+            return null;
+        }
+        int j = offset - 1; // the '.'
+        int k = j;
+        while (k > 0 && isIdentChar(text.charAt(k - 1))) {
+            k--;
+        }
+        if (k == j) {
+            return null;
+        }
+        String receiver = text.subSequence(k, j).toString();
+        for (RoseGoldDeclaration d : RoseGoldDeclarations.scanFlat(text)) {
+            boolean isType = d.kind == RoseGoldDeclaration.Kind.CLASS || d.kind == RoseGoldDeclaration.Kind.STRUCT;
+            if (!isType || !d.name.equals(receiver)) {
                 continue;
             }
-            int lineStart = lineStartOffset(text, d.nameOffset);
-            int lineEnd = lineEndOffset(text, d.nameOffset);
-            String header = text.subSequence(lineStart, lineEnd).toString().trim();
-            if (header.endsWith(":")) {
-                header = header.substring(0, header.length() - 1);
-            }
-            List<String> comments = commentsAbove(text, lineStart);
-
-            StringBuilder sb = new StringBuilder();
-            sb.append("<code>").append(escape(header)).append("</code>");
-            if (!comments.isEmpty()) {
-                sb.append("<br><br>");
-                for (int i = 0; i < comments.size(); i++) {
-                    if (i > 0) {
-                        sb.append("<br>");
-                    }
-                    sb.append(escape(comments.get(i)));
+            for (RoseGoldDeclaration m : d.children) {
+                boolean member = m.kind == RoseGoldDeclaration.Kind.FUNCTION || m.kind == RoseGoldDeclaration.Kind.VAR;
+                if (member && m.name.equals(name)) {
+                    return renderDeclAt(text, m.nameOffset)
+                            + "<br><br><i>member of " + escape(receiver) + "</i>";
                 }
             }
-            return sb.toString();
+            break;
         }
         return null;
     }
