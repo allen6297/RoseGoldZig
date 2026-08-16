@@ -14,7 +14,9 @@
             <li>Live error highlighting via the RoseGold compiler's <code>check</code> command</li>
             <li>Structure view, code folding, and reformatting via <code>fmt</code></li>
             <li>Live templates, auto-indent after <code>:</code>, go-to-declaration, and find-usages</li>
-            <li>Run configurations that execute a file on the tree-walker or the bytecode VM</li>
+            <li>Run configurations (tree-walker or bytecode VM) with a gutter Run icon on <code>main()</code></li>
+            <li>Inferred-type inlay hints, plus enum-case completion and cross-module go-to</li>
+            <li>Debugging via the <code>dap</code> adapter: breakpoints, stepping, call stack, and variables</li>
         </ul>
         Set the path to the <code>RoseGold_Zig</code> executable in
         <i>Settings | Languages &amp; Frameworks | RoseGold</i>.
@@ -72,6 +74,8 @@
 
         <configurationType implementation="org.rosegold.ide.run.RoseGoldRunConfigurationType"/>
         <runConfigurationProducer implementation="org.rosegold.ide.run.RoseGoldRunConfigurationProducer"/>
+        <programRunner implementation="org.rosegold.ide.debug.RoseGoldDebugRunner"/>
+        <xdebugger.breakpointType implementation="org.rosegold.ide.debug.RoseGoldLineBreakpointType"/>
         <runLineMarkerContributor language="RoseGold"
                                   implementationClass="org.rosegold.ide.RoseGoldRunLineMarkerContributor"/>
     </extensions>
