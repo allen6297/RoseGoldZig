@@ -70,5 +70,7 @@
 
         <configurationType implementation="org.rosegold.ide.run.RoseGoldRunConfigurationType"/>
         <runConfigurationProducer implementation="org.rosegold.ide.run.RoseGoldRunConfigurationProducer"/>
+        <runLineMarkerContributor language="RoseGold"
+                                  implementationClass="org.rosegold.ide.RoseGoldRunLineMarkerContributor"/>
     </extensions>
 </idea-plugin>
