@@ -190,10 +190,20 @@ public final class RoseGoldCompletionContributor extends CompletionContributor {
     private static void addTypeMembers(String text, String receiver, int before,
                                        CompletionResultSet result) {
         Map<String, RoseGoldDeclaration> types = new HashMap<>();
+        boolean receiverIsEnum = false;
         for (RoseGoldDeclaration d : RoseGoldDeclarations.scanFlat(text)) {
             if (d.kind == RoseGoldDeclaration.Kind.CLASS || d.kind == RoseGoldDeclaration.Kind.STRUCT) {
                 types.putIfAbsent(d.name, d);
+            } else if (d.kind == RoseGoldDeclaration.Kind.ENUM && d.name.equals(receiver)) {
+                receiverIsEnum = true;
             }
+        }
+        // `Enum.` → the enum's cases (parsed from its `{ … }` body).
+        if (receiverIsEnum) {
+            for (String cse : enumCaseNames(text, receiver)) {
+                result.addElement(prioritized(base(cse, receiver + " case", false), 25));
+            }
+            return;
         }
         // `Type.` (statics) uses the name directly; otherwise infer the local's type.
         RoseGoldDeclaration type = types.get(receiver);
@@ -300,6 +310,47 @@ public final class RoseGoldCompletionContributor extends CompletionContributor {
             }
         }
         return null;
+    }
+
+    /** The case names of `enum <name> { … }` (payload/`= value` suffixes stripped). */
+    private static List<String> enumCaseNames(String text, String name) {
+        Matcher m = Pattern.compile("\\benum\\s+" + Pattern.quote(name) + "\\s*\\{").matcher(text);
+        if (!m.find()) {
+            return List.of();
+        }
+        int open = m.end() - 1; // the '{'
+        int depth = 0;
+        int close = -1;
+        for (int i = open; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '{') {
+                depth++;
+            } else if (c == '}' && --depth == 0) {
+                close = i;
+                break;
+            }
+        }
+        if (close < 0) {
+            return List.of();
+        }
+        List<String> names = new ArrayList<>();
+        int depthP = 0; // bracket depth, to split cases on top-level commas
+        int start = open + 1;
+        for (int i = open + 1; i <= close; i++) {
+            char c = i < close ? text.charAt(i) : ',';
+            if (c == '(' || c == '[' || c == '<') {
+                depthP++;
+            } else if (c == ')' || c == ']' || c == '>') {
+                depthP--;
+            } else if (c == ',' && depthP == 0) {
+                String part = text.substring(start, i).trim();
+                int e = 0;
+                while (e < part.length() && isIdentChar(part.charAt(e))) e++;
+                if (e > 0) names.add(part.substring(0, e));
+                start = i + 1;
+            }
+        }
+        return names;
     }
 
     private static boolean isIdentChar(char c) {

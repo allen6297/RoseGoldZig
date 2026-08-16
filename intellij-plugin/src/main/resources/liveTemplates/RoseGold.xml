@@ -55,4 +55,17 @@
     <variable name="E" expression="" defaultValue="&quot;e&quot;" alwaysStopAt="true"/>
     <context><option name="ROSEGOLD" value="true"/></context>
   </template>
+
+  <template name="enum" value="enum $NAME$ { $CASES$ }$END$"
+            description="enum definition" toReformat="false" toShortenFQNames="false">
+    <variable name="NAME" expression="" defaultValue="&quot;Name&quot;" alwaysStopAt="true"/>
+    <variable name="CASES" expression="" defaultValue="&quot;A, B&quot;" alwaysStopAt="true"/>
+    <context><option name="ROSEGOLD" value="true"/></context>
+  </template>
+
+  <template name="elif" value="elif $COND$:&#10;    $END$"
+            description="elif branch" toReformat="false" toShortenFQNames="false">
+    <variable name="COND" expression="" defaultValue="" alwaysStopAt="true"/>
+    <context><option name="ROSEGOLD" value="true"/></context>
+  </template>
 </templateSet>

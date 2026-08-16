@@ -61,6 +61,19 @@ public class RoseGoldCompletionTest extends BasePlatformTestCase {
         assertTrue("expected dx: " + items, items.contains("dx"));
     }
 
+    /** `Enum.` offers the enum's cases (parsed from its `{ … }` body). */
+    public void testEnumCaseCompletion() {
+        myFixture.configureByText("e.rg",
+                "enum Color { RED, GREEN = 2, BLUE }\n" +
+                "func main():\n" +
+                "    var c = Color.<caret>\n");
+        myFixture.completeBasic();
+        List<String> items = myFixture.getLookupElementStrings();
+        assertNotNull(items);
+        assertTrue("expected RED/GREEN/BLUE: " + items,
+                items.contains("RED") && items.contains("GREEN") && items.contains("BLUE"));
+    }
+
     /** An untyped/unknown receiver offers no members (no false suggestions). */
     public void testUnknownReceiverOffersNoMembers() {
         myFixture.configureByText("d.rg",
