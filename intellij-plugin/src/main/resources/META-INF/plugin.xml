@@ -44,6 +44,8 @@
                                    implementationClass="org.rosegold.ide.RoseGoldParameterInfoHandler"/>
         <codeInsight.inlayProvider language="RoseGold"
                                    implementationClass="org.rosegold.ide.RoseGoldInlayHintsProvider"/>
+        <codeInsight.inlayProvider language="RoseGold"
+                                   implementationClass="org.rosegold.ide.RoseGoldTypeHintsProvider"/>
         <externalAnnotator language="RoseGold"
                            implementationClass="org.rosegold.ide.RoseGoldExternalAnnotator"/>
         <externalFormatProcessor implementation="org.rosegold.ide.RoseGoldFormattingProcessor"/>
