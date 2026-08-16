@@ -91,7 +91,40 @@ function activate(context) {
       startLanguageServer(context);
     })
   );
+  registerDebugger(context);
   startLanguageServer(context);
+}
+
+/**
+ * Wire the `rosegold` debug type to the `RoseGold_Zig dap` adapter (a DAP server
+ * over stdio), and fill in a default launch config (debug the active file) so
+ * F5 works with no `launch.json`.
+ */
+function registerDebugger(context) {
+  const provider = {
+    resolveDebugConfiguration(folder, config) {
+      if (!config.type && !config.request && !config.name) {
+        const editor = vscode.window.activeTextEditor;
+        if (editor && editor.document.languageId === "rosegold") {
+          config.type = "rosegold";
+          config.name = "Debug RoseGold file";
+          config.request = "launch";
+          config.program = "${file}";
+          config.stopOnEntry = true;
+        }
+      }
+      if (config.program && !config.rosegoldPath) config.rosegoldPath = serverExe();
+      return config;
+    },
+  };
+  const factory = {
+    createDebugAdapterDescriptor(session) {
+      const exe = session.configuration.rosegoldPath || serverExe();
+      return new vscode.DebugAdapterExecutable(exe, ["dap"]);
+    },
+  };
+  context.subscriptions.push(vscode.debug.registerDebugConfigurationProvider("rosegold", provider));
+  context.subscriptions.push(vscode.debug.registerDebugAdapterDescriptorFactory("rosegold", factory));
 }
 
 function deactivate() {

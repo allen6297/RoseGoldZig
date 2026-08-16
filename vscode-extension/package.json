@@ -1,14 +1,14 @@
 {
   "name": "rosegold",
   "displayName": "RoseGold",
-  "description": "Language support for RoseGold (.rg): syntax highlighting and a language-server client (diagnostics, hover, go-to-definition, symbols).",
-  "version": "0.1.0",
+  "description": "Language support for RoseGold (.rg): syntax highlighting, a language-server client (diagnostics, hover, go-to-definition, symbols), and a debugger (breakpoints, stepping, variables).",
+  "version": "0.2.0",
   "publisher": "rosegold",
   "license": "MIT",
   "engines": { "vscode": "^1.75.0" },
-  "categories": ["Programming Languages"],
+  "categories": ["Programming Languages", "Debuggers"],
   "main": "./extension.js",
-  "activationEvents": ["onLanguage:rosegold"],
+  "activationEvents": ["onLanguage:rosegold", "onDebugResolve:rosegold"],
   "contributes": {
     "languages": [
       {
@@ -23,6 +23,44 @@
         "language": "rosegold",
         "scopeName": "source.rosegold",
         "path": "./syntaxes/rosegold.tmLanguage.json"
+      }
+    ],
+    "breakpoints": [{ "language": "rosegold" }],
+    "debuggers": [
+      {
+        "type": "rosegold",
+        "label": "RoseGold",
+        "languages": ["rosegold"],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["program"],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the .rg file to debug.",
+                "default": "${file}"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Pause at the first statement.",
+                "default": true
+              },
+              "rosegoldPath": {
+                "type": "string",
+                "description": "Path to the RoseGold_Zig executable (defaults to rosegold.serverPath or PATH)."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "rosegold",
+            "request": "launch",
+            "name": "Debug RoseGold file",
+            "program": "${file}",
+            "stopOnEntry": true
+          }
+        ]
       }
     ],
     "commands": [

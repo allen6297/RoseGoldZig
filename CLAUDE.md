@@ -35,7 +35,7 @@ zig test src/fontend/parser.zig
 zig test src/fontend/interpreter.zig   # covers parser + lexer too
 ```
 
-The CLI (`run`/`check`/`repl`/`fmt`/`doc`/`lsp`, default `run` with a file / `repl`
+The CLI (`run`/`check`/`repl`/`fmt`/`doc`/`lsp`/`dap`, default `run` with a file / `repl`
 without) prints program output to **stdout** and renders diagnostics (with a source
 line + caret) to **stderr**, exiting non-zero on any error. `repl` starts an
 interactive read-eval-print loop whose definitions and values persist across entries.
@@ -60,6 +60,7 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/fontend/formatter.zig` | Canonical source printer (AST → formatted text) behind `fmt`; re-emits `##` line comments by line. Also exposes `signature(decl)` — a decl's one-line header — used by the doc generator. |
 | `src/fontend/doc.zig` | Markdown API-doc generator behind `doc`: pairs each declaration's `formatter.signature` with the `##` comment block above it (and a module preamble). |
 | `src/fontend/lsp.zig` | Language Server (`lsp`): JSON-RPC over stdio. Reuses the parser+analyzer for live diagnostics (`publishDiagnostics`), plus hover, go-to-definition, and document symbols from a declaration scan. |
+| `src/fontend/dap.zig` | Debug Adapter (`dap`): Debug Adapter Protocol over stdio. Drives the interpreter's per-statement debug hook for breakpoints, step over/into/out + continue, backtrace, and per-frame locals. |
 | `src/fontend/tests.zig` | Test aggregator; the `zig build test` frontend target roots here. |
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
 | `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. Registers the `std/*.rg` files as named `@embedFile` imports on the frontend test module (they live outside `src/`) so tests can embed them. |
@@ -446,6 +447,28 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   (a blank line breaks the run). `stripPrefix` drops each line's leading `##` + one space.
   Reuses the parse tree's `comments` (the same `lexer.Comment{ text, line }` list the
   formatter re-emits).
+
+### Debugger (`dap`)
+- `dap` (`dap.zig`) speaks the **Debug Adapter Protocol over stdio** (same
+  `Content-Length` JSON framing as the LSP). Line breakpoints, step over/into/out +
+  continue, a call-stack backtrace, and each frame's locals. Runs on the freeing
+  allocator (long-running, frees per message).
+- **Cooperative, single-threaded model.** The adapter runs the program via
+  `interpreter.runProgramDebug`, whose per-statement **debug hook** (`StepFn`, called
+  from `execStmt`) decides to pause on a breakpoint or a completed step. When it pauses
+  it emits a `stopped` event and services `stackTrace`/`scopes`/`variables`/step/continue
+  requests **inline** (reading more DAP messages) until the client resumes — which is all
+  a DAP client sends while stopped, so no threads are needed.
+- **Interpreter support.** A guarded debug-frame stack (`debug_frames`, pushed in
+  `callFunction`) is only maintained when a hook is installed, so normal runs pay nothing.
+  `pub` accessors `debugFrameCount`/`debugFrameAt`/`debugLocals` (the last walks a frame's
+  scope chain up to globals, stringifying each local) feed the adapter; `error.Terminate`
+  unwinds cleanly on disconnect. Stepping compares `debugFrameCount` against a saved
+  `step_depth` (over = same-or-shallower, out = strictly shallower, in = always).
+- **Scope (v1):** the tree-walker only (not `--vm`); a single source file (no imports);
+  `stopOnEntry` supported; no conditional breakpoints / watch / set-variable yet. The VS
+  Code extension (`vscode-extension/`) registers the `rosegold` debug type + a default
+  launch config, so F5 on a `.rg` file debugs it (adapter = `RoseGold_Zig dap`).
 
 ### Language Server (`lsp`)
 - `lsp` (`lsp.zig`) speaks **LSP over stdio** (JSON-RPC with `Content-Length` framing;
