@@ -6,9 +6,16 @@ import com.intellij.psi.PsiElement;
 import com.intellij.psi.PsiFile;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
-/** Quick-documentation (Ctrl-Q / hover) for the standard-library builtins. */
+/**
+ * Quick-documentation (Ctrl-Q / hover) for RoseGold: the standard-library
+ * builtins from a table, and — for a name declared in the file — its header line
+ * plus the {@code ##} doc-comment block written directly above it (the same
+ * association the {@code rosegold doc} generator uses).
+ */
 public final class RoseGoldDocumentationProvider extends AbstractDocumentationProvider {
     private static final Map<String, String> DOCS = Map.ofEntries(
             Map.entry("print", "print(values…) — write the values, space-separated, and a newline."),
@@ -64,16 +71,99 @@ public final class RoseGoldDocumentationProvider extends AbstractDocumentationPr
 
     @Override
     public @Nullable String generateDoc(PsiElement element, @Nullable PsiElement originalElement) {
-        String name = null;
-        if (originalElement != null) {
-            name = originalElement.getText();
-        } else if (element != null) {
-            name = element.getText();
-        }
-        if (name == null) {
+        PsiElement e = originalElement != null ? originalElement : element;
+        if (e == null) {
             return null;
         }
-        String doc = DOCS.get(name);
-        return doc == null ? null : "<code>" + doc + "</code>";
+        String name = e.getText();
+        if (name == null || name.isEmpty()) {
+            return null;
+        }
+        String builtin = DOCS.get(name);
+        if (builtin != null) {
+            return "<code>" + builtin + "</code>";
+        }
+        PsiFile file = e.getContainingFile();
+        if (!(file instanceof RoseGoldFile)) {
+            return null;
+        }
+        return declDoc(file.getViewProvider().getContents(), name);
+    }
+
+    /**
+     * Documentation for a name declared in `text`: its header line (colon
+     * trimmed) plus the consecutive `##` comment lines directly above it. Null if
+     * the name isn't a top-level or member declaration.
+     */
+    private static @Nullable String declDoc(CharSequence text, String name) {
+        for (RoseGoldDeclaration d : RoseGoldDeclarations.scanFlat(text)) {
+            if (!d.name.equals(name)) {
+                continue;
+            }
+            int lineStart = lineStartOffset(text, d.nameOffset);
+            int lineEnd = lineEndOffset(text, d.nameOffset);
+            String header = text.subSequence(lineStart, lineEnd).toString().trim();
+            if (header.endsWith(":")) {
+                header = header.substring(0, header.length() - 1);
+            }
+            List<String> comments = commentsAbove(text, lineStart);
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("<code>").append(escape(header)).append("</code>");
+            if (!comments.isEmpty()) {
+                sb.append("<br><br>");
+                for (int i = 0; i < comments.size(); i++) {
+                    if (i > 0) {
+                        sb.append("<br>");
+                    }
+                    sb.append(escape(comments.get(i)));
+                }
+            }
+            return sb.toString();
+        }
+        return null;
+    }
+
+    /** The `##` comment lines (prefix stripped) immediately above `lineStart`. */
+    private static List<String> commentsAbove(CharSequence text, int lineStart) {
+        List<String> out = new ArrayList<>();
+        int ls = lineStart;
+        while (ls > 0) {
+            int nl = ls - 1; // the '\n' ending the previous line
+            int prevStart = lineStartOffset(text, nl);
+            String prev = text.subSequence(prevStart, nl).toString().trim();
+            if (!prev.startsWith("##")) {
+                break;
+            }
+            out.add(0, stripPrefix(prev));
+            ls = prevStart;
+        }
+        return out;
+    }
+
+    private static String stripPrefix(String comment) {
+        String s = comment.startsWith("##") ? comment.substring(2) : comment;
+        return s.startsWith(" ") ? s.substring(1) : s;
+    }
+
+    private static int lineStartOffset(CharSequence t, int off) {
+        int i = off;
+        while (i > 0 && t.charAt(i - 1) != '\n') {
+            i--;
+        }
+        return i;
+    }
+
+    private static int lineEndOffset(CharSequence t, int off) {
+        int i = off;
+        int n = t.length();
+        while (i < n && t.charAt(i) != '\n') {
+            i++;
+        }
+        return i;
+    }
+
+    private static String escape(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 }

@@ -8,7 +8,8 @@
         <ul>
             <li>Syntax highlighting (keywords, types, strings, numbers, comments; function defs vs. calls)</li>
             <li><code>##</code> line-comment toggling and brace matching</li>
-            <li>Keyword, builtin &amp; member completion (a typed local's <code>x.method()</code>), plus quick-doc for the standard library</li>
+            <li>Keyword, builtin &amp; member completion (a typed local's <code>x.method()</code>)</li>
+            <li>Quick-doc / hover (Ctrl-Q) for builtins and your own declarations (signature + <code>##</code> docs)</li>
             <li>Rename refactoring (Shift+F6) across the file</li>
             <li>Live error highlighting via the RoseGold compiler's <code>check</code> command</li>
             <li>Structure view, code folding, and reformatting via <code>fmt</code></li>
