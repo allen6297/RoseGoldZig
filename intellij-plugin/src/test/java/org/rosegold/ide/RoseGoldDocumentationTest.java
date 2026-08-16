@@ -97,4 +97,31 @@ public class RoseGoldDocumentationTest extends BasePlatformTestCase {
         assertTrue(doc, doc.contains("factor: int"));
         assertTrue(doc, doc.contains("parameter of scale"));
     }
+
+    /** Hovering an enum case (`Enum.CASE`) shows the case, its value, and the enum's doc. */
+    public void testDocForEnumCase() {
+        myFixture.configureByText("f.rg",
+                "## Traffic light state.\n" +
+                "enum Light { RED, GREEN = 2, YELLOW }\n" +
+                "\n" +
+                "func main():\n" +
+                "    var s = Light.GR<caret>EEN\n");
+        String doc = docAtCaret();
+        assertNotNull(doc);
+        assertTrue(doc, doc.contains("Light.GREEN = 2"));
+        assertTrue(doc, doc.contains("Traffic light state."));
+        assertTrue(doc, doc.contains("case of enum Light"));
+    }
+
+    /** Hovering the enum name itself still shows the enum declaration. */
+    public void testDocForEnumType() {
+        myFixture.configureByText("g.rg",
+                "enum Light { RED, GREEN, YELLOW }\n" +
+                "\n" +
+                "func main():\n" +
+                "    var s = Li<caret>ght.RED\n");
+        String doc = docAtCaret();
+        assertNotNull(doc);
+        assertTrue(doc, doc.contains("enum Light { RED, GREEN, YELLOW }"));
+    }
 }

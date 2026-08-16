@@ -93,6 +93,11 @@ public final class RoseGoldDocumentationProvider extends AbstractDocumentationPr
         if (moduleDoc != null) {
             return moduleDoc;
         }
+        // `Enum.CASE` — an enum case named after its enum.
+        String enumDoc = enumCaseDoc(text, offset, name);
+        if (enumDoc != null) {
+            return enumDoc;
+        }
         String builtin = DOCS.get(name);
         if (builtin != null) {
             return "<code>" + builtin + "</code>";
@@ -141,6 +146,91 @@ public final class RoseGoldDocumentationProvider extends AbstractDocumentationPr
             return null;
         }
         return "<i>" + escape(receiver) + "</i><br>" + doc;
+    }
+
+    /**
+     * When the hovered name is `CASE` in `Enum.CASE` and `Enum` is an enum
+     * declared in the file, render the case (with its value, if any) plus the
+     * enum's own doc comment.
+     */
+    private static @Nullable String enumCaseDoc(CharSequence text, int offset, String caseName) {
+        if (offset < 2 || text.charAt(offset - 1) != '.') {
+            return null;
+        }
+        int j = offset - 1; // the '.'
+        int k = j;
+        while (k > 0 && isIdentChar(text.charAt(k - 1))) {
+            k--;
+        }
+        if (k == j) {
+            return null;
+        }
+        String receiver = text.subSequence(k, j).toString();
+        RoseGoldDeclaration en = null;
+        for (RoseGoldDeclaration d : RoseGoldDeclarations.scanFlat(text)) {
+            if (d.kind == RoseGoldDeclaration.Kind.ENUM && d.name.equals(receiver)) {
+                en = d;
+                break;
+            }
+        }
+        if (en == null) {
+            return null;
+        }
+        int open = indexOf(text, '{', en.nameOffset);
+        if (open < 0) {
+            return null;
+        }
+        int close = matchBrace(text, open);
+        if (close < 0) {
+            return null;
+        }
+        for (String part : splitParams(text.subSequence(open + 1, close).toString())) {
+            String c = part.trim();
+            int e = 0;
+            while (e < c.length() && isIdentChar(c.charAt(e))) {
+                e++;
+            }
+            if (c.substring(0, e).equals(caseName)) {
+                StringBuilder sb = new StringBuilder();
+                sb.append("<code>").append(escape(receiver)).append('.').append(escape(c)).append("</code>");
+                List<String> comments = commentsAbove(text, lineStartOffset(text, en.nameOffset));
+                if (!comments.isEmpty()) {
+                    sb.append("<br><br>");
+                    for (int i = 0; i < comments.size(); i++) {
+                        if (i > 0) {
+                            sb.append("<br>");
+                        }
+                        sb.append(escape(comments.get(i)));
+                    }
+                }
+                sb.append("<br><br><i>case of enum ").append(escape(receiver)).append("</i>");
+                return sb.toString();
+            }
+        }
+        return null;
+    }
+
+    private static int indexOf(CharSequence t, char ch, int from) {
+        for (int i = from; i < t.length(); i++) {
+            if (t.charAt(i) == ch) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** The index of the `}` matching the `{` at `open`, or -1. */
+    private static int matchBrace(CharSequence t, int open) {
+        int depth = 0;
+        for (int i = open; i < t.length(); i++) {
+            char c = t.charAt(i);
+            if (c == '{') {
+                depth++;
+            } else if (c == '}' && --depth == 0) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     /**
