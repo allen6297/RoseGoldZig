@@ -62,19 +62,39 @@ public final class RoseGoldRenameHandler implements RenameHandler {
         if (KEYWORDS.contains(oldName)) {
             return;
         }
+        final int offset = editor.getCaretModel().getOffset();
         String newName = Messages.showInputDialog(project,
                 "Rename '" + oldName + "' to:", "Rename", null, oldName, new NameValidator());
         if (newName == null || newName.isEmpty() || newName.equals(oldName)) {
             return;
         }
+        final String finalName = newName;
+        WriteCommandAction.runWriteCommandAction(project, "Rename " + oldName, null,
+                () -> applyRename(doc, offset, finalName), file);
+    }
+
+    /**
+     * Rename every occurrence of the identifier at `offset` to `newName` within
+     * `doc`, back-to-front so earlier offsets stay valid. Returns the old name, or
+     * null if `offset` isn't on a renameable (non-keyword) identifier. Must be
+     * called inside a write action. Package-private for tests.
+     */
+    static String applyRename(Document doc, int offset, String newName) {
+        CharSequence text = doc.getCharsSequence();
+        TextRange word = identAt(text, offset);
+        if (word == null) {
+            return null;
+        }
+        String oldName = text.subSequence(word.getStartOffset(), word.getEndOffset()).toString();
+        if (KEYWORDS.contains(oldName)) {
+            return null;
+        }
         List<TextRange> hits = occurrences(text, oldName);
-        WriteCommandAction.runWriteCommandAction(project, "Rename " + oldName, null, () -> {
-            // Replace back-to-front so earlier offsets stay valid.
-            for (int k = hits.size() - 1; k >= 0; k--) {
-                TextRange r = hits.get(k);
-                doc.replaceString(r.getStartOffset(), r.getEndOffset(), newName);
-            }
-        }, file);
+        for (int k = hits.size() - 1; k >= 0; k--) {
+            TextRange r = hits.get(k);
+            doc.replaceString(r.getStartOffset(), r.getEndOffset(), newName);
+        }
+        return oldName;
     }
 
     @Override
@@ -84,7 +104,7 @@ public final class RoseGoldRenameHandler implements RenameHandler {
     }
 
     /** The identifier range covering (or immediately left of) `offset`, or null. */
-    private static @Nullable TextRange identAt(CharSequence text, int offset) {
+    static @Nullable TextRange identAt(CharSequence text, int offset) {
         int n = text.length();
         int start = offset;
         while (start > 0 && isIdentChar(text.charAt(start - 1))) {
@@ -111,7 +131,7 @@ public final class RoseGoldRenameHandler implements RenameHandler {
      * string literals, but scanning inside `${…}` interpolation holes (which, per
      * the language, contain no nested strings).
      */
-    private static List<TextRange> occurrences(CharSequence text, String name) {
+    static List<TextRange> occurrences(CharSequence text, String name) {
         List<TextRange> out = new ArrayList<>();
         int n = text.length();
         int i = 0;
@@ -186,24 +206,29 @@ public final class RoseGoldRenameHandler implements RenameHandler {
         return c == '_' || Character.isLetter(c);
     }
 
+    /** Whether `name` is a valid RoseGold identifier that isn't a language keyword. */
+    static boolean isValidNewName(String name) {
+        if (name == null || name.isEmpty() || KEYWORDS.contains(name) || !isIdentStart(name.charAt(0))) {
+            return false;
+        }
+        for (int k = 1; k < name.length(); k++) {
+            if (!isIdentChar(name.charAt(k))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** Accepts a valid RoseGold identifier that isn't a language keyword. */
     private static final class NameValidator implements InputValidator {
         @Override
         public boolean checkInput(String input) {
-            if (input == null || input.isEmpty() || KEYWORDS.contains(input) || !isIdentStart(input.charAt(0))) {
-                return false;
-            }
-            for (int k = 1; k < input.length(); k++) {
-                if (!isIdentChar(input.charAt(k))) {
-                    return false;
-                }
-            }
-            return true;
+            return isValidNewName(input);
         }
 
         @Override
         public boolean canClose(String input) {
-            return checkInput(input);
+            return isValidNewName(input);
         }
     }
 }
