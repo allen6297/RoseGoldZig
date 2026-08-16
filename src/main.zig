@@ -17,6 +17,7 @@ const Formatter = @import("fontend/formatter.zig");
 const Doc = @import("fontend/doc.zig");
 const Vm = @import("fontend/vm.zig");
 const Lsp = @import("fontend/lsp.zig");
+const Dap = @import("fontend/dap.zig");
 
 const usage =
     \\Usage: rosegold [run|check|repl|fmt] [<file.rg>]
@@ -29,6 +30,7 @@ const usage =
     \\  fmt     re-format the file in canonical style (stdout; `-w` rewrites it)
     \\  doc     generate Markdown API docs from `##` comments (to stdout)
     \\  lsp     run a Language Server over stdio (diagnostics, hover, go-to-def)
+    \\  dap     run a Debug Adapter (DAP) over stdio (breakpoints, stepping)
     \\
     \\  --path DIR (or -I DIR)   add a module search root for imports not found
     \\                           relative to the importing file (repeatable)
@@ -76,6 +78,12 @@ fn handle(
     // frees per message, so it uses a general (freeing) allocator, not the arena.
     if (std.mem.eql(u8, args[1], "lsp")) {
         return Lsp.run(std.heap.smp_allocator, io, out);
+    }
+
+    // `dap`: a Debug Adapter Protocol server over stdio (breakpoints, stepping).
+    // Long-running and frees per message, so it uses a freeing allocator.
+    if (std.mem.eql(u8, args[1], "dap")) {
+        return Dap.run(std.heap.smp_allocator, io, out);
     }
 
     // `fmt [-w] <file>`: re-print the file in canonical style (or rewrite it).

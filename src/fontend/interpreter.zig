@@ -39,7 +39,16 @@ const Expr = parser.Expr;
 const BinaryOp = parser.BinaryOp;
 const Span = lexer.Span;
 
-const Error = std.mem.Allocator.Error || error{Runtime};
+pub const Error = std.mem.Allocator.Error || error{ Runtime, Terminate };
+
+/// A debug hook, called before each statement executes (see `step_fn`). It may
+/// pause (handling debugger requests) and returns after the debugger resumes.
+/// Returning `error.Terminate` unwinds the interpreter to stop the program.
+pub const StepFn = *const fn (ctx: *anyopaque, ip: *Interpreter, line: u32, col: u32) Error!void;
+
+/// One entry of the debug call stack (top-level `main` + each active call), so a
+/// debugger can render a backtrace and each frame's locals.
+pub const DebugFrame = struct { name: []const u8, env: *Env, line: u32 };
 
 const zero_span: Span = .{ .start = 0, .end = 0, .line = 0, .col = 0 };
 
@@ -438,6 +447,72 @@ pub fn runProgram(gpa: std.mem.Allocator, modules: []const ProgramModule) Error!
     };
 }
 
+// --- debugging (Debug Adapter Protocol backend) ------------------------------
+
+/// A local variable exposed to a debugger: its name and stringified value.
+pub const DebugVar = struct { name: []const u8, value: []const u8 };
+
+/// Run `modules` in debug mode: `hook` fires before every statement (see
+/// `StepFn`); it may pause and drive the debugger, reading the interpreter's
+/// `debug*` accessors while stopped. `error.Terminate` from the hook ends the
+/// run cleanly (the debugger asked to stop).
+pub fn runProgramDebug(gpa: std.mem.Allocator, modules: []const ProgramModule, ctx: *anyopaque, hook: StepFn) Error!RunResult {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+
+    const placeholder = try alloc.create(Env);
+    placeholder.* = .{ .parent = null };
+    var output: std.ArrayList(u8) = .empty;
+    var interp = Interpreter{
+        .arena = alloc,
+        .globals = placeholder,
+        .env = placeholder,
+        .output = &output,
+        .step_fn = hook,
+        .step_ctx = ctx,
+    };
+
+    interp.runModules(modules) catch |e| switch (e) {
+        error.Runtime => return .{ .arena = arena, .output = try output.toOwnedSlice(alloc), .runtime_error = interp.runtime_error },
+        error.Terminate => return .{ .arena = arena, .output = try output.toOwnedSlice(alloc), .runtime_error = null },
+        else => return e,
+    };
+    return .{ .arena = arena, .output = try output.toOwnedSlice(alloc), .runtime_error = null };
+}
+
+/// The number of active debug frames (top-level `main` + each live call).
+pub fn debugFrameCount(self: *Interpreter) usize {
+    return self.debug_frames.items.len;
+}
+
+/// Frame `i` counting from the top (0 = innermost): its function name + line.
+pub fn debugFrameAt(self: *Interpreter, i: usize) struct { name: []const u8, line: u32 } {
+    const f = self.debug_frames.items[self.debug_frames.items.len - 1 - i];
+    return .{ .name = f.name, .line = f.line };
+}
+
+/// The locals visible in frame `i` (its scope chain up to — but excluding —
+/// module globals), innermost first, each stringified. For the innermost frame
+/// the live block scopes are included. Allocated in the interpreter's arena.
+pub fn debugLocals(self: *Interpreter, i: usize) Error![]DebugVar {
+    const f = self.debug_frames.items[self.debug_frames.items.len - 1 - i];
+    var out: std.ArrayList(DebugVar) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .{};
+    var env: ?*Env = if (i == 0) self.env else f.env;
+    while (env) |e| : (env = e.parent) {
+        if (e == self.globals) break;
+        var it = e.vars.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (seen.contains(name)) continue; // an inner shadow already won
+            try seen.put(self.arena, name, {});
+            try out.append(self.arena, .{ .name = name, .value = try self.valueToString(entry.value_ptr.*) });
+        }
+    }
+    return out.toOwnedSlice(self.arena);
+}
+
 // --- REPL --------------------------------------------------------------------
 
 /// The result of running one REPL entry: the text it produced (prints plus the
@@ -507,7 +582,7 @@ pub fn replInit(gpa: std.mem.Allocator) Error!*Repl {
 
 const Flow = enum { normal, returned, break_loop, continue_loop };
 
-const Interpreter = struct {
+pub const Interpreter = struct {
     arena: std.mem.Allocator,
     globals: *Env,
     env: *Env,
@@ -531,6 +606,12 @@ const Interpreter = struct {
     /// Current call-stack depth, so runaway recursion becomes a runtime error
     /// instead of a native stack overflow.
     call_depth: u32 = 0,
+    /// A debugger's per-statement hook (null when not debugging), its opaque
+    /// context, and the live call stack it renders (only maintained while a hook
+    /// is installed, so normal runs pay nothing).
+    step_fn: ?StepFn = null,
+    step_ctx: *anyopaque = undefined,
+    debug_frames: std.ArrayList(DebugFrame) = .empty,
 
     fn fail(self: *Interpreter, span: Span, comptime fmt: []const u8, args: anytype) Error {
         self.runtime_error = .{
@@ -1047,7 +1128,35 @@ const Interpreter = struct {
         return buf.toOwnedSlice(self.arena);
     }
 
+    /// The source span of a statement (for the debug hook / diagnostics).
+    fn stmtSpan(s: Stmt) Span {
+        return switch (s) {
+            .var_decl => |x| x.span,
+            .destructure => |x| x.span,
+            .return_stmt => |x| x.span,
+            .if_stmt => |x| x.span,
+            .while_stmt => |x| x.span,
+            .for_stmt => |x| x.span,
+            .assign => |x| x.span,
+            .expr_stmt => |e| parser.exprSpan(e.*),
+            .pass => |sp| sp,
+            .break_stmt => |sp| sp,
+            .continue_stmt => |sp| sp,
+            .try_catch => |x| x.span,
+            .raise => |x| x.span,
+        };
+    }
+
     fn execStmt(self: *Interpreter, stmt: Stmt) Error!Flow {
+        // Debug hook: record the current line on the top frame and give the
+        // debugger a chance to pause before this statement runs.
+        if (self.step_fn) |f| {
+            const sp = stmtSpan(stmt);
+            if (self.debug_frames.items.len > 0) {
+                self.debug_frames.items[self.debug_frames.items.len - 1].line = sp.line;
+            }
+            try f(self.step_ctx, self, sp.line, sp.col);
+        }
         switch (stmt) {
             .pass => {},
             .expr_stmt => |e| _ = try self.eval(e.*),
@@ -1294,6 +1403,10 @@ const Interpreter = struct {
             self.current_statics = saved_statics;
             self.current_static_ti = saved_static_ti;
         }
+        if (self.step_fn != null) try self.debug_frames.append(self.arena, .{ .name = func.name, .env = call_env, .line = span.line });
+        defer if (self.step_fn != null) {
+            _ = self.debug_frames.pop();
+        };
         const flow = try self.execBlock(func.body);
         return if (flow == .returned) self.ret_value else Value.nil;
     }
@@ -2739,6 +2852,50 @@ test "tagged-union enums construct, destructure, and compare deeply" {
         \\    print(Json.Num(5) == Json.Num(6))
     ;
     try expectOutput(src, "Json.Num(42)\nnull\ntrue\nnum 7\narr 3\ntrue\nfalse\n");
+}
+
+const DebugProbe = struct {
+    steps: usize = 0,
+    max_depth: usize = 0,
+    saw_x_10_in_main: bool = false,
+};
+
+fn probeHook(ctx: *anyopaque, ip: *Interpreter, line: u32, col: u32) Error!void {
+    _ = col;
+    const p: *DebugProbe = @ptrCast(@alignCast(ctx));
+    p.steps += 1;
+    const d = debugFrameCount(ip);
+    if (d > p.max_depth) p.max_depth = d;
+    if (line == 6) { // `var y = add(x, 5)` — inside main, x already defined
+        const locals = try debugLocals(ip, 0);
+        for (locals) |v| {
+            if (std.mem.eql(u8, v.name, "x") and std.mem.eql(u8, v.value, "10")) p.saw_x_10_in_main = true;
+        }
+    }
+}
+
+test "the debug hook visits statements and exposes frames + locals" {
+    const gpa = testing.allocator;
+    const src =
+        \\func add(a: int, b: int) -> int:
+        \\    var s = a + b
+        \\    return s
+        \\func main():
+        \\    var x = 10
+        \\    var y = add(x, 5)
+        \\    print(y)
+    ;
+    var tree = try parser.parse(gpa, src);
+    defer tree.deinit();
+    var probe = DebugProbe{};
+    const modules = [_]ProgramModule{.{ .module = tree.module, .imports = &.{} }};
+    var result = try runProgramDebug(gpa, &modules, &probe, probeHook);
+    defer result.deinit();
+
+    try testing.expectEqualStrings("15\n", result.output);
+    try testing.expect(probe.steps == 5); // 3 statements in main + 2 in add
+    try testing.expect(probe.max_depth >= 2); // stepped into add() → main + add
+    try testing.expect(probe.saw_x_10_in_main); // locals inspected at a breakpoint
 }
 
 test "method-call syntax on primitives desugars to builtins; user methods win" {

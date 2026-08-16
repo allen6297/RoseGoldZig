@@ -26,7 +26,8 @@ zig build run -- repl           # interactive session (also the default, no file
 zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w rewrites it
 zig build run -- doc FILE.rg    # print Markdown API docs from FILE's ## comments (stdout)
 zig build run -- lsp            # run the Language Server over stdio (for editors)
-zig build test                  # run every test (419 as of writing)
+zig build run -- dap            # run the Debug Adapter over stdio (breakpoints, stepping)
+zig build test                  # run every test (420 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
