@@ -146,11 +146,15 @@ public final class RoseGoldDocumentationProvider extends AbstractDocumentationPr
         if (modPsi == null) {
             return null;
         }
-        String doc = declDoc(modPsi.getViewProvider().getContents(), member);
-        if (doc == null) {
-            return null;
+        // Only `pub` top-level declarations are exported, so hover mirrors that:
+        // scan the module's roots (not nested members) and require `pub`.
+        CharSequence modText = modPsi.getViewProvider().getContents();
+        for (RoseGoldDeclaration d : RoseGoldDeclarations.scan(modText)) {
+            if (d.name.equals(member) && d.isPublic) {
+                return "<i>" + escape(receiver) + "</i><br>" + renderDeclAt(modText, d.nameOffset);
+            }
         }
-        return "<i>" + escape(receiver) + "</i><br>" + doc;
+        return null;
     }
 
     /**

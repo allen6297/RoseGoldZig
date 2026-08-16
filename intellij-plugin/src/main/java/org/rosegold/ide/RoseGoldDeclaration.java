@@ -15,12 +15,15 @@ public final class RoseGoldDeclaration {
     public final int nameOffset;
     /** Leading-whitespace width of the header line (for nesting). */
     public final int indent;
+    /** Whether the header carried the `pub` modifier (the cross-module export boundary). */
+    public final boolean isPublic;
     public final List<RoseGoldDeclaration> children = new ArrayList<>();
 
-    public RoseGoldDeclaration(Kind kind, String name, int nameOffset, int indent) {
+    public RoseGoldDeclaration(Kind kind, String name, int nameOffset, int indent, boolean isPublic) {
         this.kind = kind;
         this.name = name;
         this.nameOffset = nameOffset;
         this.indent = indent;
+        this.isPublic = isPublic;
     }
 }

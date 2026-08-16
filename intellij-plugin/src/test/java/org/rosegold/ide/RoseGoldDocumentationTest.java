@@ -87,6 +87,20 @@ public class RoseGoldDocumentationTest extends BasePlatformTestCase {
         assertTrue(doc, doc.contains("Doubles its argument."));
     }
 
+    /** A non-`pub` (module-private) member is not exported, so it gets no cross-module doc. */
+    public void testNoDocForPrivateModuleMember() {
+        myFixture.addFileToProject("util.rg",
+                "## A private helper.\n" +
+                "func secret(n: int) -> int:\n" +
+                "    return n\n");
+        myFixture.configureByText("main.rg",
+                "import util\n" +
+                "\n" +
+                "func main():\n" +
+                "    print(util.sec<caret>ret(1))\n");
+        assertNull("a module-private member must not resolve across modules", docAtCaret());
+    }
+
     /** Hovering a function parameter shows the parameter as written. */
     public void testDocForParameter() {
         myFixture.configureByText("e.rg",

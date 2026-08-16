@@ -18,7 +18,7 @@ public final class RoseGoldDeclarations {
     }
 
     private static final Pattern DECL = Pattern.compile(
-            "^\\s*(?:pub\\s+|private\\s+)?(?:static\\s+)?" +
+            "^\\s*(pub\\s+|private\\s+)?(?:static\\s+)?" +
                     "(func|class|struct|enum|signal|const|var)\\s+([A-Za-z_][A-Za-z0-9_]*)");
 
     /** All declarations, nested (top-level list; class members under their class). */
@@ -73,7 +73,7 @@ public final class RoseGoldDeclarations {
         if (!m.find()) {
             return null;
         }
-        RoseGoldDeclaration.Kind kind = switch (m.group(1)) {
+        RoseGoldDeclaration.Kind kind = switch (m.group(2)) {
             case "func" -> RoseGoldDeclaration.Kind.FUNCTION;
             case "class" -> RoseGoldDeclaration.Kind.CLASS;
             case "struct" -> RoseGoldDeclaration.Kind.STRUCT;
@@ -90,6 +90,7 @@ public final class RoseGoldDeclarations {
         while (indent < line.length() && Character.isWhitespace(line.charAt(indent))) {
             indent++;
         }
-        return new RoseGoldDeclaration(kind, m.group(2), lineStartOffset + m.start(2), indent);
+        boolean isPublic = m.group(1) != null && m.group(1).trim().equals("pub");
+        return new RoseGoldDeclaration(kind, m.group(3), lineStartOffset + m.start(3), indent, isPublic);
     }
 }
