@@ -288,6 +288,9 @@ pub const Decl = union(enum) {
         is_static: bool,
         /// `async func`: calling it yields a `Task` that runs when awaited.
         is_async: bool = false,
+        /// `abstract func name(params) -> T` (no body): a contract a concrete
+        /// subclass must implement. `body` is empty.
+        is_abstract: bool = false,
         name: []const u8,
         params: []const Param,
         return_type: ?TypeRef,
@@ -296,6 +299,8 @@ pub const Decl = union(enum) {
     };
     pub const Class = struct {
         visibility: Visibility,
+        /// `abstract class`: cannot be instantiated; may hold abstract methods.
+        is_abstract: bool = false,
         name: []const u8,
         extends: ?TypeRef,
         uses: []const TypeRef,
@@ -578,17 +583,22 @@ const Parser = struct {
 
     fn parseDecl(self: *Parser) Error!Decl {
         const visibility = self.parseVisibility();
+        const is_abstract = self.eat(.kw_abstract);
         const is_static = self.eat(.kw_static);
         const is_async = self.eat(.kw_async);
         if (is_async and !self.at(.kw_func)) {
             try self.err("'async' can only be applied to a function");
             return error.ParseError;
         }
+        if (is_abstract and !(self.at(.kw_class) or self.at(.kw_func))) {
+            try self.err("'abstract' can only be applied to a class or a method");
+            return error.ParseError;
+        }
         switch (self.peekKind()) {
             .kw_import => return .{ .import = try self.parseImport() },
             .kw_const, .kw_var => return .{ .var_decl = try self.parseVarDecl(visibility, is_static) },
-            .kw_func => return .{ .func = try self.parseFunc(visibility, is_static, is_async) },
-            .kw_class => return .{ .class = try self.parseClass(visibility) },
+            .kw_func => return .{ .func = try self.parseFunc(visibility, is_static, is_async, is_abstract) },
+            .kw_class => return .{ .class = try self.parseClass(visibility, is_abstract) },
             .kw_struct => return .{ .struct_decl = try self.parseStruct(visibility) },
             .kw_enum => return .{ .enum_decl = try self.parseEnum(visibility) },
             .kw_signal => return .{ .signal = try self.parseSignal(visibility) },
@@ -737,17 +747,19 @@ const Parser = struct {
         return params.toOwnedSlice(self.alloc);
     }
 
-    fn parseFunc(self: *Parser, visibility: Visibility, is_static: bool, is_async: bool) Error!Decl.Func {
+    fn parseFunc(self: *Parser, visibility: Visibility, is_static: bool, is_async: bool, is_abstract: bool) Error!Decl.Func {
         const kw = try self.expect(.kw_func, "expected 'func'");
         const name = try self.expect(.identifier, "expected a function name");
         const params = try self.parseParamList();
         var return_type: ?TypeRef = null;
         if (self.eat(.arrow)) return_type = try self.parseType();
-        const body = try self.parseColonStmtBlock();
+        // An abstract method is just a signature — no `:` body.
+        const body: []const Stmt = if (is_abstract) &.{} else try self.parseColonStmtBlock();
         return .{
             .visibility = visibility,
             .is_static = is_static,
             .is_async = is_async,
+            .is_abstract = is_abstract,
             .name = name.text,
             .params = params,
             .return_type = return_type,
@@ -768,7 +780,7 @@ const Parser = struct {
         };
     }
 
-    fn parseClass(self: *Parser, visibility: Visibility) Error!Decl.Class {
+    fn parseClass(self: *Parser, visibility: Visibility, is_abstract: bool) Error!Decl.Class {
         const kw = try self.expect(.kw_class, "expected 'class'");
         const name = try self.expect(.identifier, "expected a class name");
         // `extends`/`uses` targets are types, so an imported base `mod.Base` works.
@@ -784,6 +796,7 @@ const Parser = struct {
         const members = try self.parseColonDeclBlock();
         return .{
             .visibility = visibility,
+            .is_abstract = is_abstract,
             .name = name.text,
             .extends = extends,
             .uses = try uses.toOwnedSlice(self.alloc),
@@ -2076,6 +2089,32 @@ test "parses super.method() as a call on a super member access" {
     try testing.expect(std.meta.activeTag(callee) == .member);
     try testing.expect(std.meta.activeTag(callee.member.object.*) == .super_expr);
     try testing.expectEqualStrings("speak", callee.member.name);
+}
+
+test "parses an abstract class with a bodiless abstract method" {
+    const src =
+        \\abstract class Shape:
+        \\    abstract func area() -> float
+        \\    func name() -> str:
+        \\        return "shape"
+    ;
+    var tree = try parse(testing.allocator, src);
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const c = tree.module.decls[0].class;
+    try testing.expect(c.is_abstract);
+    const area = c.members[0].func;
+    try testing.expect(area.is_abstract);
+    try testing.expectEqual(@as(usize, 0), area.body.len);
+    // The concrete method is not abstract and keeps its body.
+    try testing.expect(!c.members[1].func.is_abstract);
+    try testing.expectEqual(@as(usize, 1), c.members[1].func.body.len);
+}
+
+test "abstract on a non-class, non-method declaration is rejected" {
+    var tree = try parse(testing.allocator, "abstract var x = 1");
+    defer tree.deinit();
+    try testing.expect(tree.diagnostics.len > 0);
 }
 
 test "parses a class with methods, for loop, and if/else" {

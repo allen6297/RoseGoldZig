@@ -27,7 +27,7 @@ zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w 
 zig build run -- doc FILE.rg    # print Markdown API docs from FILE's ## comments (stdout)
 zig build run -- lsp            # run the Language Server over stdio (for editors)
 zig build run -- dap            # run the Debug Adapter over stdio (breakpoints, stepping)
-zig build test                  # run every test (425 as of writing)
+zig build test                  # run every test (435 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -117,14 +117,16 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   (optional `: type`), `func name(p: T, q, r = expr) -> R:` (params may be untyped →
   `any`, and may carry a trailing **default value** `= expr`; see **Default parameters**),
   `async func` (returns a `task<R>` instead of `R`; see **Async/await**),
-  `class` (with `extends` / `uses`), `struct` (no inheritance), `enum { A, B = 2 }`
+  `class` (with `extends` / `uses`; optionally `abstract class` — see **super / abstract**),
+  `struct` (no inheritance), `enum { A, B = 2 }`
   (a **tagged union** when a case carries a payload — `enum Shape { Circle(r: float),
   Rect(w, h), Empty }`; the payload is a param list, so a case is a first-class
   constructor `Shape.Circle(2.0)` and `match` destructures it via `Shape.Circle(r)` —
   see **Tagged-union enums**),
   `signal name(params)`. `pub`/`private` visibility; `static` on a class/struct
   member makes it belong to the type (shared storage / no receiver), reached via
-  `Type.member`.
+  `Type.member`. `abstract` on a `class` (can't be constructed) or on a method
+  (`abstract func m() -> T`, no body — a contract; see **super / abstract**).
 - **Statements:** `return`, `if`/`elif`/`else`, `while`, `for x in iter:` (also
   `for i, x in iter:` — a second binding gives index+element for a list/string or
   key+value for a map), `break`, `continue`, `pass`, assignment (incl. compound
@@ -291,6 +293,30 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   path. The VM adds a `check_enum` opcode (refutable name test, payload-agnostic) and
   extends `seq_get` to index an enum payload, compiled via `emitEnumPattern` on the same
   failure-ladder machinery as tuple/list patterns. See `examples/enums.rg`.
+
+### super / abstract
+- **`super.method(...)` / `super.init()`** calls the **base class's** version of a method,
+  bound to the current receiver, **bypassing virtual dispatch** — so an override can extend
+  rather than replace (`return super.speak() + "woof"`), and a subclass `init` can chain the
+  base constructor (`super.init()`). `super` is only meaningful as `super.member(...)`;
+  bare `super`, or `super` outside a method, is an error on both backends. Resolution starts
+  at the **enclosing method's owner's** ancestors (nearest base first) — not the receiver's
+  runtime type — so it's stable regardless of how deep the instance is.
+- **`abstract class C:`** can't be constructed (`C()` is an error — analyzer + both runtimes),
+  and may hold **`abstract func m(params) -> T`** methods: a bodiless contract. A **concrete**
+  subclass **must implement every inherited abstract method** or the analyzer reports it
+  (`class 'B' must implement abstract method 'm' ...`); calling an unimplemented abstract
+  method is also a runtime error. An abstract class may leave methods unimplemented (and
+  inherit a concrete `describe()` that calls the abstract `area()`, resolved virtually on the
+  concrete subclass). Cross-module abstract bases aren't checked at analysis time (only at
+  runtime), matching the lenient one-level-deep cross-module design.
+- **Both backends, byte-identical.** `parser.Expr.super_expr` + `is_abstract` on `Decl.Class`
+  /`Decl.Func` (abstract funcs parse with an empty body). Interpreter: `current_method_owner`
+  tracks the enclosing method's owning `TypeInfo`; `evalSuperMember` walks its ancestors;
+  `TypeInfo.is_abstract` gates `construct` and `callMethod`. VM: each compiled `Function`
+  carries its `owner: *const RtType` (stamped in `buildRtType`) and a `super_method` opcode
+  resolves the base method at runtime off `frame.func.owner`; `RtType.is_abstract` gates the
+  `.type` construct path and `pushFrame`. See `examples/abstract.rg`.
 
 ### Error handling
 - `raise expr` throws a value; `try: body catch e: handler` runs `body` and, on a raised

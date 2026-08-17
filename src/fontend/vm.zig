@@ -80,6 +80,8 @@ const Function = struct {
     /// For a method: the runtime type that DEFINES it, so `super.m()` starts its
     /// lookup at that type's bases (null for plain functions/lambdas).
     owner: ?*const RtType = null,
+    /// An `abstract` method has no body; calling it (unimplemented) is an error.
+    is_abstract: bool = false,
 };
 
 /// A module's runtime namespace: its own top-level bindings (functions, types,
@@ -105,6 +107,7 @@ const Closure = struct { func: *const Function, upvalues: []*UpvalueObj };
 /// overrides applied). Built once at compile time.
 const RtType = struct {
     name: []const u8,
+    is_abstract: bool = false,
     field_names: []const []const u8,
     /// Signal members (own + inherited, base-first); each instance gets its own
     /// fresh signal per name, stored alongside its fields.
@@ -517,6 +520,7 @@ const FnState = struct {
 const TypeDef = struct {
     name: []const u8,
     span: Span,
+    is_abstract: bool = false,
     members: []const Decl,
     super_names: []const []const u8,
     /// Supertypes imported from another module (`extends`/`uses mod.Base`),
@@ -665,8 +669,8 @@ const Compiler = struct {
                 for (e.members) |m| try rt.members.put(self.alloc, m.name, @intCast(m.payload.len));
                 try self.enums.put(self.alloc, e.name, rt);
             },
-            .class => |c| try self.registerType(c.name, c.span, c.members, c.extends, c.uses),
-            .struct_decl => |s| try self.registerType(s.name, s.span, s.members, null, &.{}),
+            .class => |c| try self.registerType(c.name, c.span, c.members, c.extends, c.uses, c.is_abstract),
+            .struct_decl => |s| try self.registerType(s.name, s.span, s.members, null, &.{}, false),
             else => {},
         };
         var type_it = self.types.valueIterator();
@@ -785,6 +789,7 @@ const Compiler = struct {
         members: []const Decl,
         extends: ?parser.TypeRef,
         uses: []const parser.TypeRef,
+        is_abstract: bool,
     ) Error!void {
         var supers: std.ArrayList([]const u8) = .empty;
         var imported: std.ArrayList(*TypeDef) = .empty;
@@ -796,7 +801,7 @@ const Compiler = struct {
             else => return self.fail(declSpan(m), "the --vm backend does not support this class member", .{}),
         };
         const t = try self.alloc.create(TypeDef);
-        t.* = .{ .name = name, .span = span, .members = members, .super_names = try supers.toOwnedSlice(self.alloc), .imported_supers = imported };
+        t.* = .{ .name = name, .span = span, .members = members, .super_names = try supers.toOwnedSlice(self.alloc), .imported_supers = imported, .is_abstract = is_abstract };
         // Collect this type's own static members.
         for (members, 0..) |m, i| switch (m) {
             .var_decl => |v| if (v.is_static) {
@@ -926,6 +931,7 @@ const Compiler = struct {
         _ = t;
         const func = try self.makeFunction(f.name, f.params.len);
         func.is_async = f.is_async;
+        func.is_abstract = f.is_abstract;
         try self.attachDefaults(func, f.params);
         var fs = FnState{ .func = func, .enclosing = null };
         const saved = self.cur;
@@ -946,7 +952,7 @@ const Compiler = struct {
     /// ancestor chain (used to resolve inherited statics).
     fn buildRtType(self: *Compiler, t: *TypeDef) Error!void {
         const rt = t.rttype;
-        rt.* = .{ .name = t.name, .field_names = t.field_names.items, .signal_names = t.signal_names.items };
+        rt.* = .{ .name = t.name, .is_abstract = t.is_abstract, .field_names = t.field_names.items, .signal_names = t.signal_names.items };
         var it = t.methods.iterator();
         while (it.next()) |e| {
             const owner = e.value_ptr.owner;
@@ -2641,6 +2647,7 @@ const VM = struct {
     /// error instead of growing the frame/value stacks until it exhausts memory.
     fn pushFrame(self: *VM, f: *const Function, upvalues: []*UpvalueObj, base: usize) VMError!void {
         if (self.frames.items.len >= max_call_depth) return self.fail("call stack overflow (too much recursion)", .{});
+        if (f.is_abstract) return self.fail("abstract method '{s}' is not implemented", .{f.name});
         try self.frames.append(self.alloc, .{ .func = f, .upvalues = upvalues, .ip = 0, .base = base, .code = f.chunk.code.items });
     }
 
@@ -2747,6 +2754,7 @@ const VM = struct {
                 try self.pushFrame(f, &.{}, base);
             },
             .type => |rt| {
+                if (rt.is_abstract) return self.fail("cannot construct abstract class '{s}'", .{rt.name});
                 // Calling a type constructs an instance: run its constructor.
                 const f = rt.constructor;
                 const n = if (argc == f.arity) argc else try self.fillDefaults(f, argc);
@@ -4137,6 +4145,38 @@ test "vm: super calls the base method + constructor (byte-identical)" {
         \\    print(d.kind, d.name, d.speak())
     ;
     try expectVMOutput(src, "animal Rex ...woof\n");
+}
+
+test "vm: an abstract method is implemented by a concrete subclass (byte-identical)" {
+    const src =
+        \\abstract class Shape:
+        \\    abstract func area() -> float
+        \\    func describe() -> str:
+        \\        return "area is " + str(area())
+        \\
+        \\class Circle extends Shape:
+        \\    var r: float = 1.0
+        \\    func area() -> float:
+        \\        return 3.14 * r * r
+        \\
+        \\func main():
+        \\    var c = Circle()
+        \\    print(c.describe())
+    ;
+    try expectVMOutput(src, "area is 3.14\n");
+}
+
+test "vm: constructing an abstract class is a runtime error" {
+    var result = try runSource(testing.allocator,
+        \\abstract class Shape:
+        \\    abstract func area() -> float
+        \\
+        \\func main():
+        \\    var s = Shape()
+    );
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "cannot construct abstract class 'Shape'") != null);
 }
 
 test "vm: an inherited init runs as the constructor" {

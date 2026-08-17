@@ -504,6 +504,9 @@ const Analyzer = struct {
     /// all supertypes, so a subclass is assignable to any of its ancestors.
     direct_supers: std.StringHashMapUnmanaged([]const []const u8) = .{},
     supertypes: std.StringHashMapUnmanaged(*NameSet) = .{},
+    /// Names of classes declared `abstract` — they can't be constructed, and a
+    /// concrete subclass must implement their abstract methods.
+    abstract_types: std.StringHashMapUnmanaged(void) = .{},
     /// When set, re-declaring a name overwrites it instead of reporting a
     /// duplicate — used by the REPL, where redefinition is normal.
     allow_redefine: bool = false,
@@ -838,6 +841,64 @@ const Analyzer = struct {
         }
     }
 
+    /// Record which classes are `abstract`, and verify that every *concrete*
+    /// class supplies a body for each abstract method it declares or inherits.
+    /// An abstract class may leave abstract methods unimplemented; a concrete
+    /// one may not (nor may a concrete class declare an abstract method of its
+    /// own). Cross-module bases aren't visible here, so their requirements are
+    /// only enforced at runtime (matching the lenient one-level-deep design).
+    fn checkAbstractImplementations(self: *Analyzer, decls: []const Decl) Error!void {
+        var classes: std.StringHashMapUnmanaged(Decl.Class) = .{};
+        for (decls) |decl| switch (decl) {
+            .class => |c| {
+                try classes.put(self.arena, c.name, c);
+                if (c.is_abstract) try self.abstract_types.put(self.arena, c.name, {});
+            },
+            else => {},
+        };
+
+        var it = classes.iterator();
+        while (it.next()) |entry| {
+            const c = entry.value_ptr.*;
+            if (c.is_abstract) continue;
+
+            // Gather abstract-method requirements + concrete implementations
+            // across the class and every same-module ancestor.
+            var required: NameSet = .{};
+            var provided: NameSet = .{};
+            try self.gatherMethods(c, &required, &provided);
+            if (self.supertypes.get(c.name)) |supers| {
+                var sit = supers.keyIterator();
+                while (sit.next()) |base_name| {
+                    if (classes.get(base_name.*)) |base| {
+                        try self.gatherMethods(base, &required, &provided);
+                    }
+                }
+            }
+            var rit = required.keyIterator();
+            while (rit.next()) |name| {
+                if (!provided.contains(name.*)) {
+                    try self.report(c.span, "class '{s}' must implement abstract method '{s}' (or be declared abstract)", .{ c.name, name.* });
+                }
+            }
+        }
+    }
+
+    /// Split a class's own methods into abstract (required) and concrete
+    /// (provided) name sets, accumulating into the caller's sets.
+    fn gatherMethods(self: *Analyzer, c: Decl.Class, required: *NameSet, provided: *NameSet) Error!void {
+        for (c.members) |m| switch (m) {
+            .func => |f| {
+                if (f.is_abstract) {
+                    try required.put(self.arena, f.name, {});
+                } else {
+                    try provided.put(self.arena, f.name, {});
+                }
+            },
+            else => {},
+        };
+    }
+
     // --- declarations --------------------------------------------------------
 
     fn run(self: *Analyzer, module: Module) Error!void {
@@ -874,6 +935,8 @@ const Analyzer = struct {
             .class => |c| try self.flattenInheritedMembers(c.name),
             else => {},
         };
+        // A concrete class must implement every abstract method it inherits.
+        try self.checkAbstractImplementations(module.decls);
         // Phase 2: analyze bodies.
         for (module.decls) |decl| try self.analyzeDecl(decl);
     }
@@ -1025,6 +1088,12 @@ const Analyzer = struct {
     }
 
     fn analyzeFunc(self: *Analyzer, f: Decl.Func) Error!void {
+        // An abstract method is a bodiless signature — nothing to analyze, and it
+        // needn't "return on all paths".
+        if (f.is_abstract) {
+            if (f.return_type) |rt| try self.checkType(rt);
+            return;
+        }
         const fn_scope = try self.newScope(self.current);
         for (f.params) |p| {
             const pty: Type = if (p.type) |ann| blk: {
@@ -1736,6 +1805,9 @@ const Analyzer = struct {
             // Calling a class/struct name constructs an instance; its arguments
             // are checked against the type's `init` (or must be empty if none).
             .type_ref => |type_name| {
+                if (self.abstract_types.contains(type_name)) {
+                    try self.report(c.span, "cannot construct abstract class '{s}'", .{type_name});
+                }
                 const scope = self.user_types.get(type_name);
                 const init_sym: ?Symbol = if (scope) |s| s.symbols.get("init") else null;
                 if (init_sym) |sym| {
@@ -3597,6 +3669,53 @@ test "a correct construction is clean" {
         \\
         \\func main():
         \\    var p: P = P(5)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "constructing an abstract class is reported" {
+    const src =
+        \\abstract class Shape:
+        \\    abstract func area() -> float
+        \\
+        \\func main():
+        \\    var s = Shape()
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "cannot construct abstract class 'Shape'");
+}
+
+test "a concrete subclass that omits an abstract method is reported" {
+    const src =
+        \\abstract class Shape:
+        \\    abstract func area() -> float
+        \\
+        \\class Blob extends Shape:
+        \\    var x: int = 0
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "class 'Blob' must implement abstract method 'area'");
+}
+
+test "an abstract class with an implementing subclass is clean" {
+    const src =
+        \\abstract class Shape:
+        \\    abstract func area() -> float
+        \\    func describe() -> str:
+        \\        return "area is " + str(area())
+        \\
+        \\class Circle extends Shape:
+        \\    var r: float = 1.0
+        \\    func area() -> float:
+        \\        return 3.14 * r * r
+        \\
+        \\func main():
+        \\    var c = Circle()
+        \\    print(c.describe())
     ;
     var analysis = try analyzeSource(testing.allocator, src);
     defer analysis.deinit();

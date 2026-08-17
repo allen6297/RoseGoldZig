@@ -171,8 +171,8 @@ const Formatter = struct {
             },
             .var_decl => |v| try self.varDecl(v),
             .func => |f| try self.func(f),
-            .class => |c| try self.aggregate("class", c.name, c.visibility, c.extends, c.uses, c.members),
-            .struct_decl => |s| try self.aggregate("struct", s.name, s.visibility, null, &.{}, s.members),
+            .class => |c| try self.aggregate("class", c.name, c.visibility, c.is_abstract, c.extends, c.uses, c.members),
+            .struct_decl => |s| try self.aggregate("struct", s.name, s.visibility, false, null, &.{}, s.members),
             .enum_decl => |e| try self.enumDecl(e),
             .signal => |s| {
                 try self.pad();
@@ -214,6 +214,7 @@ const Formatter = struct {
             },
             .func => |f| {
                 try self.w(visPrefix(f.visibility));
+                if (f.is_abstract) try self.w("abstract ");
                 if (f.is_static) try self.w("static ");
                 if (f.is_async) try self.w("async ");
                 try self.w("func ");
@@ -224,8 +225,8 @@ const Formatter = struct {
                     try self.typeRef(rt);
                 }
             },
-            .class => |c| try self.aggregateHeader("class", c.name, c.visibility, c.extends, c.uses),
-            .struct_decl => |s| try self.aggregateHeader("struct", s.name, s.visibility, null, &.{}),
+            .class => |c| try self.aggregateHeader("class", c.name, c.visibility, c.is_abstract, c.extends, c.uses),
+            .struct_decl => |s| try self.aggregateHeader("struct", s.name, s.visibility, false, null, &.{}),
             .enum_decl => |e| {
                 try self.w(visPrefix(e.visibility));
                 try self.w("enum ");
@@ -250,8 +251,9 @@ const Formatter = struct {
         }
     }
 
-    fn aggregateHeader(self: *Formatter, kw: []const u8, name: []const u8, vis: Visibility, extends: ?TypeRef, uses: []const TypeRef) Error!void {
+    fn aggregateHeader(self: *Formatter, kw: []const u8, name: []const u8, vis: Visibility, is_abstract: bool, extends: ?TypeRef, uses: []const TypeRef) Error!void {
         try self.w(visPrefix(vis));
+        if (is_abstract) try self.w("abstract ");
         try self.w(kw);
         try self.w(" ");
         try self.w(name);
@@ -288,6 +290,7 @@ const Formatter = struct {
     fn func(self: *Formatter, f: Decl.Func) Error!void {
         try self.pad();
         try self.w(visPrefix(f.visibility));
+        if (f.is_abstract) try self.w("abstract ");
         if (f.is_static) try self.w("static ");
         if (f.is_async) try self.w("async ");
         try self.w("func ");
@@ -297,14 +300,20 @@ const Formatter = struct {
             try self.w(" -> ");
             try self.typeRef(rt);
         }
+        // An abstract method is a bodiless signature — no `:` block.
+        if (f.is_abstract) {
+            try self.nl();
+            return;
+        }
         try self.w(":");
         try self.nl();
         try self.block(f.body);
     }
 
-    fn aggregate(self: *Formatter, kw: []const u8, name: []const u8, vis: Visibility, extends: ?TypeRef, uses: []const TypeRef, members: []const Decl) Error!void {
+    fn aggregate(self: *Formatter, kw: []const u8, name: []const u8, vis: Visibility, is_abstract: bool, extends: ?TypeRef, uses: []const TypeRef, members: []const Decl) Error!void {
         try self.pad();
         try self.w(visPrefix(vis));
+        if (is_abstract) try self.w("abstract ");
         try self.w(kw);
         try self.w(" ");
         try self.w(name);
@@ -880,6 +889,18 @@ test "formats super calls" {
     const out = try fmt(gpa, "class Dog extends Animal:\n    func init():\n        super . init ( )");
     defer gpa.free(out);
     try testing.expectEqualStrings("class Dog extends Animal:\n    func init():\n        super.init()\n", out);
+}
+
+test "formats an abstract class and its bodiless abstract method" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "abstract class Shape:\n  abstract func area()->float\n  func name()->str:\n    return \"shape\"");
+    defer gpa.free(out);
+    const want =
+        "abstract class Shape:\n" ++
+        "    abstract func area() -> float\n\n" ++
+        "    func name() -> str:\n" ++
+        "        return \"shape\"\n";
+    try testing.expectEqualStrings(want, out);
 }
 
 test "formats a class with fields grouped and methods spaced" {

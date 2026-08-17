@@ -96,6 +96,9 @@ const FieldDef = struct { name: []const u8, value: ?*const Expr };
 /// inherited field list.
 const TypeInfo = struct {
     name: []const u8,
+    /// `abstract class`: cannot be constructed (a runtime backstop; the analyzer
+    /// reports it too).
+    is_abstract: bool = false,
     /// The globals of the module that defines this type, so its methods and
     /// field defaults resolve names in their own module (not the caller's).
     module: *Env = undefined,
@@ -701,6 +704,7 @@ pub const Interpreter = struct {
         members: []const Decl,
         extends: ?parser.TypeRef,
         uses: []const parser.TypeRef,
+        is_abstract: bool,
     ) Error!void {
         var fields: std.ArrayList(FieldDef) = .empty;
         var methods: std.StringHashMapUnmanaged(*const Decl.Func) = .{};
@@ -733,6 +737,7 @@ pub const Interpreter = struct {
         const ti = try self.arena.create(TypeInfo);
         ti.* = .{
             .name = name,
+            .is_abstract = is_abstract,
             .module = self.globals,
             .own_fields = own_fields,
             .methods = methods,
@@ -902,6 +907,7 @@ pub const Interpreter = struct {
         self.call_depth += 1;
         defer self.call_depth -= 1;
         if (self.call_depth > max_call_depth) return self.fail(span, "call stack overflow (too much recursion)", .{});
+        if (ti.is_abstract) return self.fail(span, "cannot construct abstract class '{s}'", .{ti.name});
         const inst = try self.arena.create(Instance);
         inst.* = .{ .info = ti };
 
@@ -985,8 +991,8 @@ pub const Interpreter = struct {
 
         // Bind class/struct/enum names so `Name(...)` and `Enum.CASE` resolve.
         for (module.decls) |decl| switch (decl) {
-            .class => |c| try self.registerType(c.name, c.members, c.extends, c.uses),
-            .struct_decl => |s| try self.registerType(s.name, s.members, null, &.{}),
+            .class => |c| try self.registerType(c.name, c.members, c.extends, c.uses, c.is_abstract),
+            .struct_decl => |s| try self.registerType(s.name, s.members, null, &.{}, false),
             .enum_decl => |en| try self.registerEnum(en.name, en.members),
             else => {},
         };
@@ -1042,13 +1048,13 @@ pub const Interpreter = struct {
     fn registerReplDecl(self: *Interpreter, decl: *const Decl) Error!void {
         switch (decl.*) {
             .class => |c| {
-                try self.registerType(c.name, c.members, c.extends, c.uses);
+                try self.registerType(c.name, c.members, c.extends, c.uses, c.is_abstract);
                 const ti = self.types.get(c.name).?;
                 try self.computeInheritance(ti);
                 try self.initStatics(ti);
             },
             .struct_decl => |s| {
-                try self.registerType(s.name, s.members, null, &.{});
+                try self.registerType(s.name, s.members, null, &.{}, false);
                 const ti = self.types.get(s.name).?;
                 try self.computeInheritance(ti);
                 try self.initStatics(ti);
@@ -1453,6 +1459,7 @@ pub const Interpreter = struct {
         self.call_depth += 1;
         defer self.call_depth -= 1;
         if (self.call_depth > max_call_depth) return self.fail(span, "call stack overflow (too much recursion)", .{});
+        if (func.is_abstract) return self.fail(span, "abstract method '{s}' is not implemented", .{func.name});
         // The method runs in the module of the type that DEFINES it (which may be
         // an imported base), with the receiver in scope and no statics.
         const saved_globals = self.globals;
@@ -3320,6 +3327,38 @@ test "using super outside a method is a runtime error" {
     defer result.deinit();
     try testing.expect(result.runtime_error != null);
     try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "'super' is only valid inside a method") != null);
+}
+
+test "an abstract method is implemented by a concrete subclass" {
+    const src =
+        \\abstract class Shape:
+        \\    abstract func area() -> float
+        \\    func describe() -> str:
+        \\        return "area is " + str(area())
+        \\
+        \\class Circle extends Shape:
+        \\    var r: float = 1.0
+        \\    func area() -> float:
+        \\        return 3.14 * r * r
+        \\
+        \\func main():
+        \\    var c = Circle()
+        \\    print(c.describe())
+    ;
+    try expectOutput(src, "area is 3.14\n");
+}
+
+test "constructing an abstract class is a runtime error" {
+    var result = try runSource(testing.allocator,
+        \\abstract class Shape:
+        \\    abstract func area() -> float
+        \\
+        \\func main():
+        \\    var s = Shape()
+    );
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "cannot construct abstract class 'Shape'") != null);
 }
 
 test "an inherited init runs as the constructor" {
