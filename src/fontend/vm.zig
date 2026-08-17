@@ -77,6 +77,9 @@ const Function = struct {
     param_names: []const []const u8 = &.{},
     /// An `async` function: calling it yields a `Task` (run when awaited).
     is_async: bool = false,
+    /// For a method: the runtime type that DEFINES it, so `super.m()` starts its
+    /// lookup at that type's bases (null for plain functions/lambdas).
+    owner: ?*const RtType = null,
 };
 
 /// A module's runtime namespace: its own top-level bindings (functions, types,
@@ -366,6 +369,7 @@ const Op = enum(u8) {
     interp, // u16 part count -> concat the parts as strings
     new_instance, // u16 rttype index -> push a fresh instance (fields nil)
     get_member, // u16 name-const index -> instance field, or bound method
+    super_method, // u16 name-const -> push a bound method resolved on the current method's base class
     set_field, // u16 name-const index (pops value, instance)
     make_range, // pop end, start -> list [start, end)
     index_get,
@@ -952,6 +956,10 @@ const Compiler = struct {
         const anc = try self.alloc.alloc(*const RtType, t.ancestors.len);
         for (t.ancestors, 0..) |a, i| anc[i] = a.rttype;
         rt.ancestors = anc;
+        // Stamp each own method with its defining type, so `super.m()` inside it
+        // can start its lookup at this type's ancestors.
+        var oit = t.own_compiled.iterator();
+        while (oit.next()) |e| e.value_ptr.*.owner = rt;
     }
 
     /// Populate a type's static storage: a cell (initially nil) per static var
@@ -1528,6 +1536,7 @@ const Compiler = struct {
             .string_literal => |lit| try self.emitConst(.{ .str = try self.unquote(lit.text) }, lit.span),
             .bool_literal => |b| try self.emit(if (b.value) .true_ else .false_, b.span),
             .nil_literal => |sp| try self.emit(.nil, sp),
+            .super_expr => |sp| return self.fail(sp, "'super' is only valid as 'super.method(...)'", .{}),
             .identifier => |id| {
                 if (self.resolveLocal(id.name)) |slot| {
                     try self.emitLocal(.get_local, slot, id.span);
@@ -1589,8 +1598,14 @@ const Compiler = struct {
                 try self.emit(.slice, s.span);
             },
             .member => |mem| {
-                try self.expr(mem.object.*);
-                try self.emitGlobal(.get_member, mem.name, mem.span);
+                // `super.name` resolves on the enclosing method's base at runtime.
+                if (mem.object.* == .super_expr) {
+                    try self.emit(.super_method, mem.span);
+                    try self.emitU16(@intCast(try self.constIndex(.{ .str = mem.name })), mem.span);
+                } else {
+                    try self.expr(mem.object.*);
+                    try self.emitGlobal(.get_member, mem.name, mem.span);
+                }
             },
             .array => |a| {
                 for (a.elements) |el| try self.expr(el.*);
@@ -2379,6 +2394,23 @@ const VM = struct {
                         try inst.fields.put(self.alloc, sname, .{ .signal = sig });
                     }
                     try self.push(.{ .instance = inst });
+                },
+                .super_method => {
+                    const name = chunk.constants.items[self.readU16(frame)].str;
+                    const owner = frame.func.owner orelse return self.fail("'super' is only valid inside a method", .{});
+                    const self_val = self.stack.items[frame.base]; // slot 0 = the receiver
+                    if (self_val != .instance) return self.fail("'super' has no receiver here", .{});
+                    var found: ?*const Function = null;
+                    for (owner.ancestors) |a| {
+                        if (a.methods.get(name)) |f| {
+                            found = f;
+                            break;
+                        }
+                    }
+                    const f = found orelse return self.fail("no super method '{s}' (in the base of '{s}')", .{ name, owner.name });
+                    const bm = try self.alloc.create(BoundMethod);
+                    bm.* = .{ .recv = self_val.instance, .func = f };
+                    try self.push(.{ .bound_method = bm });
                 },
                 .get_member => {
                     const name = chunk.constants.items[self.readU16(frame)].str;
@@ -3285,7 +3317,7 @@ fn disasmInstr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), ch: *const Chu
             try out.print(alloc, " {d} kw:{d}", .{ code[offset + 1], readU16At(code, offset + 2) });
             break :blk offset + 4;
         },
-        .define_global, .get_member, .set_field => blk: {
+        .define_global, .get_member, .set_field, .super_method => blk: {
             try out.print(alloc, " {s}", .{ch.constants.items[readU16At(code, offset + 1)].str});
             break :blk offset + 3;
         },
@@ -4081,6 +4113,30 @@ test "vm: inheritance, override, uses, and virtual dispatch" {
         \\    print(p.hp)
     ;
     try expectVMOutput(src, "4 4 woof woof\nDog { legs: 4, name: rex }\n70\n");
+}
+
+test "vm: super calls the base method + constructor (byte-identical)" {
+    const src =
+        \\class Animal:
+        \\    var kind: str = "?"
+        \\    func init():
+        \\        kind = "animal"
+        \\    func speak() -> str:
+        \\        return "..."
+        \\
+        \\class Dog extends Animal:
+        \\    var name: str = "?"
+        \\    func init():
+        \\        super.init()
+        \\        name = "Rex"
+        \\    func speak() -> str:
+        \\        return super.speak() + "woof"
+        \\
+        \\func main():
+        \\    var d = Dog()
+        \\    print(d.kind, d.name, d.speak())
+    ;
+    try expectVMOutput(src, "animal Rex ...woof\n");
 }
 
 test "vm: an inherited init runs as the constructor" {

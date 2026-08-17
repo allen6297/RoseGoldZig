@@ -1435,6 +1435,9 @@ const Analyzer = struct {
             .int_literal => .int,
             .float_literal => .float,
             .string_literal => .str,
+            // `super` is only meaningful as `super.method(...)`; its member access
+            // and call are typed leniently (result `unknown`).
+            .super_expr => .unknown,
             .interpolation => |x| blk: {
                 for (x.parts) |p| switch (p) {
                     .expr => |pe| _ = try self.typeOf(pe.*),

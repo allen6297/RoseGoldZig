@@ -560,6 +560,7 @@ const Formatter = struct {
             .int_literal, .float_literal, .string_literal => |lit| try self.w(lit.text),
             .bool_literal => |b| try self.w(if (b.value) "true" else "false"),
             .nil_literal => try self.w("nil"),
+            .super_expr => try self.w("super"),
             .identifier => |id| try self.w(id.name),
             .unary => |u| {
                 switch (u.op) {
@@ -691,7 +692,7 @@ const Formatter = struct {
     /// A callee/object position: wrap anything that isn't a simple postfix chain.
     fn callee(self: *Formatter, e: Expr) Error!void {
         switch (e) {
-            .identifier, .call, .index, .member => try self.primary(e),
+            .identifier, .call, .index, .member, .super_expr => try self.primary(e),
             else => {
                 try self.w("(");
                 try self.expr(e);
@@ -872,6 +873,13 @@ test "re-adds precedence-required parentheses" {
     const out = try fmt(gpa, "func main():\n    print((a + b) * c)");
     defer gpa.free(out);
     try testing.expectEqualStrings("func main():\n    print((a + b) * c)\n", out);
+}
+
+test "formats super calls" {
+    const gpa = testing.allocator;
+    const out = try fmt(gpa, "class Dog extends Animal:\n    func init():\n        super . init ( )");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("class Dog extends Animal:\n    func init():\n        super.init()\n", out);
 }
 
 test "formats a class with fields grouped and methods spaced" {

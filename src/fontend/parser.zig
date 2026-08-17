@@ -88,6 +88,9 @@ pub const Expr = union(enum) {
     string_literal: Literal,
     bool_literal: Bool,
     nil_literal: Span,
+    /// `super` — only meaningful as `super.method(...)`; resolves the method on
+    /// the enclosing method's base class, bound to the current instance.
+    super_expr: Span,
     identifier: Ident,
     unary: Unary,
     binary: Binary,
@@ -333,6 +336,7 @@ pub fn exprSpan(e: Expr) Span {
         .int_literal, .float_literal, .string_literal => |lit| lit.span,
         .bool_literal => |b| b.span,
         .nil_literal => |s| s,
+        .super_expr => |s| s,
         .identifier => |id| id.span,
         .unary => |u| u.span,
         .binary => |b| b.span,
@@ -1347,6 +1351,10 @@ const Parser = struct {
                 _ = self.advance();
                 return self.mkExpr(.{ .nil_literal = t.span });
             },
+            .kw_super => {
+                _ = self.advance();
+                return self.mkExpr(.{ .super_expr = t.span });
+            },
             .identifier => {
                 _ = self.advance();
                 return self.mkExpr(.{ .identifier = .{ .name = t.text, .span = t.span } });
@@ -2050,6 +2058,24 @@ test "parses a function with a match expression" {
     try testing.expect(std.meta.activeTag(val.*) == .match);
     try testing.expectEqual(@as(usize, 3), val.match.arms.len);
     try testing.expect(std.meta.activeTag(val.match.arms[2].pattern) == .wildcard);
+}
+
+test "parses super.method() as a call on a super member access" {
+    const src =
+        \\class Dog extends Animal:
+        \\    func speak() -> str:
+        \\        return super.speak()
+    ;
+    var tree = try parse(testing.allocator, src);
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    const body = tree.module.decls[0].class.members[0].func.body;
+    const ret = body[0].return_stmt.value.?;
+    try testing.expect(std.meta.activeTag(ret.*) == .call);
+    const callee = ret.*.call.callee.*;
+    try testing.expect(std.meta.activeTag(callee) == .member);
+    try testing.expect(std.meta.activeTag(callee.member.object.*) == .super_expr);
+    try testing.expectEqualStrings("speak", callee.member.name);
 }
 
 test "parses a class with methods, for loop, and if/else" {

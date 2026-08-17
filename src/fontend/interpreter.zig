@@ -601,6 +601,9 @@ pub const Interpreter = struct {
     /// The type whose `static` method is running, so a bare name can resolve to a
     /// static inherited from a base (walking ancestors), not just an own static.
     current_static_ti: ?*const TypeInfo = null,
+    /// The type that DEFINES the currently-executing instance method, so
+    /// `super.m()` starts its lookup at that type's bases (not the runtime type).
+    current_method_owner: ?*const TypeInfo = null,
     /// Every class/struct by name, so supertypes can be resolved.
     types: std.StringHashMapUnmanaged(*TypeInfo) = .{},
     /// Current call-stack depth, so runaway recursion becomes a runtime error
@@ -1462,17 +1465,20 @@ pub const Interpreter = struct {
         const saved_recv = self.current_receiver;
         const saved_statics = self.current_statics;
         const saved_static_ti = self.current_static_ti;
+        const saved_owner = self.current_method_owner;
         self.env = call_env;
         self.ret_value = .nil;
         self.current_receiver = receiver;
         self.current_statics = null;
         self.current_static_ti = null;
+        self.current_method_owner = owner;
         defer {
             self.env = saved_env;
             self.ret_value = saved_ret;
             self.current_receiver = saved_recv;
             self.current_statics = saved_statics;
             self.current_static_ti = saved_static_ti;
+            self.current_method_owner = saved_owner;
             self.globals = saved_globals;
         }
         const flow = try self.execBlock(func.body);
@@ -1782,6 +1788,7 @@ pub const Interpreter = struct {
             .string_literal => |lit| .{ .str = try self.unquote(lit.text) },
             .bool_literal => |b| .{ .bool = b.value },
             .nil_literal => .nil,
+            .super_expr => |sp| return self.fail(sp, "'super' is only valid as 'super.method(...)'", .{}),
             .identifier => |id| try self.resolveName(id.name, id.span),
             .unary => |u| try self.evalUnary(u),
             .binary => |b| try self.evalBinary(b),
@@ -2082,7 +2089,25 @@ pub const Interpreter = struct {
         };
     }
 
+    /// `super.name`: find `name` starting at the enclosing method's base classes
+    /// (its owner's ancestors, nearest first) and bind it to the current instance.
+    fn evalSuperMember(self: *Interpreter, m: Expr.MemberAccess) Error!Value {
+        const owner = self.current_method_owner orelse return self.fail(m.span, "'super' is only valid inside a method", .{});
+        const recv = self.current_receiver orelse return self.fail(m.span, "'super' has no receiver here", .{});
+        for (owner.ancestors) |a| {
+            if (a.methods.get(m.name)) |func| {
+                const bm = try self.arena.create(BoundMethod);
+                bm.* = .{ .receiver = recv, .func = func, .owner = a };
+                return .{ .bound_method = bm };
+            }
+        }
+        return self.fail(m.span, "no super method '{s}' (in the base of '{s}')", .{ m.name, owner.name });
+    }
+
     fn evalMember(self: *Interpreter, m: Expr.MemberAccess) Error!Value {
+        // `super.name` resolves `name` on the enclosing method's base class,
+        // bound to the current instance (bypassing virtual dispatch).
+        if (m.object.* == .super_expr) return self.evalSuperMember(m);
         const obj = try self.eval(m.object.*);
         switch (obj) {
             .instance => |inst| {
@@ -3264,6 +3289,37 @@ test "a subclass method overrides the base" {
         \\    print(d.speak())
     ;
     try expectOutput(src, "woof\n");
+}
+
+test "super calls the base method and chains the base constructor" {
+    const src =
+        \\class Animal:
+        \\    var kind: str = "?"
+        \\    func init():
+        \\        kind = "animal"
+        \\    func speak() -> str:
+        \\        return "..."
+        \\
+        \\class Dog extends Animal:
+        \\    var name: str = "?"
+        \\    func init():
+        \\        super.init()            ## chain the base constructor
+        \\        name = "Rex"
+        \\    func speak() -> str:
+        \\        return super.speak() + "woof"   ## extend, don't replace
+        \\
+        \\func main():
+        \\    var d = Dog()
+        \\    print(d.kind, d.name, d.speak())
+    ;
+    try expectOutput(src, "animal Rex ...woof\n");
+}
+
+test "using super outside a method is a runtime error" {
+    var result = try runSource(testing.allocator, "func main():\n    print(super.foo())");
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "'super' is only valid inside a method") != null);
 }
 
 test "an inherited init runs as the constructor" {
