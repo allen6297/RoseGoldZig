@@ -5,6 +5,9 @@
 ##   zig build run -- run       examples/mathdemo.rg
 ##   zig build run -- run --vm  examples/mathdemo.rg   ## the bytecode VM
 
+##
+## hello
+##
 struct Point:
     var x: float = 0.0
     var y: float = 0.0
