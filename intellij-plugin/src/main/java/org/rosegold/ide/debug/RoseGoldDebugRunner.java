@@ -50,19 +50,21 @@ public final class RoseGoldDebugRunner extends GenericProgramRunner<com.intellij
         final DetachedProcessHandler handler = new DetachedProcessHandler(process);
         final VirtualFile vf = LocalFileSystem.getInstance().findFileByPath(path);
 
-        XDebugSession session = XDebuggerManager.getInstance(env.getProject()).startSession(env, new XDebugProcessStarter() {
+        final XDebugProcessStarter starter = new XDebugProcessStarter() {
             @Override
             public @NotNull XDebugProcess start(@NotNull XDebugSession session) {
                 return new RoseGoldDebugProcess(session, handler, process.getInputStream(), process.getOutputStream(), vf, path);
             }
-        });
+        };
         // On 2026.1+ the debugger is split (backend/frontend): the debug tool window is
-        // created asynchronously on the frontend, so the backend runner must NOT pull the
-        // RunContentDescriptor. Calling session.getRunContentDescriptor() here is deprecated
-        // and logs a non-fatal "[Split debugger] RunContentDescriptor should not be used"
-        // error (see the 2026.1 debugger-architecture redesign). Returning null lets the
-        // platform show the session's UI itself; any UI work would go through
-        // session.runWhenUiReady(...). `session` is kept live by the started session.
+        // created on the frontend, and the backend runner must NOT pull the
+        // RunContentDescriptor — session.getRunContentDescriptor() is deprecated and logs a
+        // "[Split debugger] RunContentDescriptor should not be used" error. Let the platform
+        // build and SHOW the debug tab itself via startSessionAndShowTab, then return null so
+        // we never touch the descriptor. This keeps the Debug tool window appearing while
+        // avoiding the deprecated call.
+        XDebuggerManager.getInstance(env.getProject())
+            .startSessionAndShowTab(cfg.getName(), env.getContentToReuse(), starter);
         return null;
     }
 }
