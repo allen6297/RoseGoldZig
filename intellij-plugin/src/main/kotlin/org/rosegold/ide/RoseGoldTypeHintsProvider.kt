@@ -50,7 +50,14 @@ class RoseGoldTypeHintsProvider : InlayHintsProvider<NoSettings> {
         override fun collect(element: PsiElement, editor: Editor, sink: InlayHintsSink): Boolean {
             if (element !is PsiFile) return true
             for (hint in collectHints(element.text)) {
-                sink.addInlineElement(hint.offset, false, factory.smallText(": ${hint.type}"), false)
+                // Wrap in roundWithBackground so the small text is vertically
+                // centered on the line (bare smallText is top-aligned and looks
+                // raised) and matches the parameter-name hints' presentation.
+                sink.addInlineElement(
+                    hint.offset, false,
+                    factory.roundWithBackground(factory.smallText(": ${hint.type}")),
+                    false,
+                )
             }
             return true
         }

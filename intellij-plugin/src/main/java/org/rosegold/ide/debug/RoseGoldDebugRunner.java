@@ -56,6 +56,13 @@ public final class RoseGoldDebugRunner extends GenericProgramRunner<com.intellij
                 return new RoseGoldDebugProcess(session, handler, process.getInputStream(), process.getOutputStream(), vf, path);
             }
         });
+        // NOTE: On 2026.1+ with the split debugger, XDebugSession.getRunContentDescriptor()
+        // is deprecated and logs a non-fatal error ("RunContentDescriptor should not be used
+        // in split mode") — the session still starts and breakpoints/stepping work. The
+        // sanctioned replacement (AsyncProgramRunner returning
+        // XSessionStartedResult.getRunContentDescriptor()) is not yet shipped in 2026.2.1
+        // (those types don't exist in the SDK), so this classic path stays until the plugin
+        // targets a platform that ships them.
         return session.getRunContentDescriptor();
     }
 }
