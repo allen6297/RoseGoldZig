@@ -325,12 +325,35 @@ while (frame < 3) : (frame += 1) {                 // …call it many times
   to call back into the *same* Session while it's running, `call` returns
   `error.Reentrant` instead of corrupting the stack.
 
+### Bytecode serialization
+
+Compile a program once and reload it later **without the source or the compiler** — for
+shipping bytecode in a pack file:
+
+```zig
+// Build step: compile → bytes → write to your pack.
+var ser = try vm.serialize(gpa, modules, true);  // true = bake a main() call
+defer ser.deinit();
+try pack.write("player.rgb", ser.bytes);
+
+// Runtime: read bytes → image → run (or load into a Session).
+var image = try vm.deserialize(gpa, bytes);      // AST-free; copies into its arena
+defer image.deinit();
+var result = try vm.runImage(gpa, &image);       // or: session.loadImage(&image)
+```
+
+The compiled graph is cyclic (a type points at its methods; a method points back at the
+type), so serialization uses index tables and a two-phase load. Only the *structural*
+graph is written — module globals, signal handlers, and static-var values are runtime
+state, rebuilt by running the top-level script, exactly as a fresh compile would. Malformed
+bytes are rejected with `error.BadImage`, never a crash. Run an `Image` once (running
+populates its module globals with that run's state); deserialize again for another instance.
+
 **Known gaps.** The VM does not garbage-collect: values allocated during a call live in
 the Session's arena until `deinit`, so for a per-frame loop keep host functions returning
-scalars and avoid growing collections without bound. Compiled bytecode is **not yet
-shared between Sessions** (each compiles its own copy) and there is **no bytecode
-serialization** — both are planned (an export/pack format will need serialized bytecode),
-and neither blocks this API. The analyzer doesn't know about host-registered names, so
+scalars and avoid growing collections without bound. Compiled bytecode is **not yet shared
+between Sessions/Images** (each instance deserializes its own copy — still far cheaper than
+re-parsing + recompiling). The analyzer doesn't know about host-registered names, so
 `check` will flag them as undefined; the VM resolves them at run time.
 
 ## Toolchain

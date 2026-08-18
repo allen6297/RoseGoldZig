@@ -27,7 +27,7 @@ zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w 
 zig build run -- doc FILE.rg    # print Markdown API docs from FILE's ## comments (stdout)
 zig build run -- lsp            # run the Language Server over stdio (for editors)
 zig build run -- dap            # run the Debug Adapter over stdio (breakpoints, stepping)
-zig build test                  # run every test (438 as of writing)
+zig build test                  # run every test (445 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -684,8 +684,40 @@ drives the loader, then the analyzer and interpreter over the loaded module set
 - Tests (in `vm.zig`): host fn + persistent state + repeated calls + clean line/col error
   + post-error recovery; `print` → callback; re-entrancy rejected. **Known gaps:** no GC
   (per-call allocations live until `deinit` — return scalars in a per-frame loop); compiled
-  bytecode isn't shared across Sessions; no bytecode serialization yet (planned for the
-  engine's pack/export format). See the README's **Embedding the VM** section.
+  bytecode isn't shared across Sessions/Images (each deserializes its own copy). See the
+  README's **Embedding the VM** section.
+
+### Bytecode serialization (`vm.serialize`/`deserialize`)
+- Compile once, write the compiled program to bytes, reload later with **no source and no
+  compiler** — for the engine's pack/export format. `pub fn serialize(gpa, modules,
+  entry_runs_main) → SerializeResult{bytes, diagnostics}` (compiles then dumps; `bytes`
+  empty + diagnostics set on a compile error); `pub fn deserialize(gpa, bytes) →
+  Image{arena, programs, global_cache_count}` (copies everything into its own arena, so
+  the input bytes may be freed); `pub fn runImage(gpa, *Image) → Result`; and
+  `Session.loadImage(*Image)` for the embedding path. `entry_runs_main` bakes the `main()`
+  call into the entry script (true = like `run`; false = like the embedding `Session`).
+- **Format = index tables + two-phase load.** The compiled graph is cyclic (a `RtType`
+  points at its method `*Function`s; a method's chunk points back at the type via
+  `new_instance`/`rttypes`; a constructor points at its type), so every reachable
+  `*Function`/`*RtType`/`*RtEnum`/`*RtModule`/`*Signal` is assigned an index (functions come
+  pre-enumerated from `Compiled.all_functions`; the rest via a `Collector` walk over each
+  function's module/owner/chunk-constants/chunk-rttypes/defaults), pointers are written as
+  indices, and `deserialize` allocates every object empty first, then fills them in,
+  resolving indices to the fresh pointers. Header = magic `"RGB1"` + `global_cache_count` +
+  table counts + per-program script index. `BcWriter`/`BcReader` are little-endian; strings
+  are length-prefixed and duped into the image arena (that's what makes the image AST-free).
+- **Only the structural graph is serialized.** A module's `globals`, a `Signal`'s handlers,
+  and static-var *values* are runtime state — left empty and **rebuilt by running the
+  top-level script** (`runImage`/`loadImage` run it exactly as a fresh compile would). A
+  compile-time closure (a default thunk or static method) captures nothing, so it serializes
+  as just its function index. Malformed input → `error.BadImage` (every read is
+  bounds-checked), never a crash.
+- **Run an Image once:** running populates the image's module globals with that run's state,
+  so use one Image per run/Session; deserialize again for another instance (the remaining
+  cross-instance bytecode-sharing gap). Tests (in `vm.zig`): round-trip of functions/
+  recursion, classes/statics/inheritance/super, enums/match/defaults/lambdas/interpolation,
+  signals, a multi-module program, loading an image into a `Session`, and `error.BadImage`
+  on garbage. Each asserts the reloaded run is byte-identical to the original.
 
 ### Known gaps / future work
 - A subclass's own **static method** now sees an inherited static by bare name (both

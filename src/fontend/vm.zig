@@ -3633,7 +3633,35 @@ pub const Session = struct {
         @memset(cache, null);
         self.vm.global_cache = cache;
         self.programs = compiled.programs;
+        try self.runTopLevel();
+        self.loaded = true;
+    }
 
+    /// Convenience: load a single module (the common single-file case).
+    pub fn loadModule(self: *Session, module: Module) LoadError!void {
+        return self.load(&.{.{ .module = module }});
+    }
+
+    /// Load a **deserialized** program (`vm.deserialize`) instead of compiling
+    /// from source — the pack-file path. `image` must outlive the Session (its
+    /// arena owns the bytecode); use one Image per Session, since running it
+    /// populates the image's module globals with this instance's state.
+    pub fn loadImage(self: *Session, image: *const Image) LoadError!void {
+        std.debug.assert(!self.loaded);
+        const a = self.arena.allocator();
+        const cache = try a.alloc(?*Value, image.global_cache_count);
+        @memset(cache, null);
+        self.vm.global_cache = cache;
+        self.programs = image.programs;
+        try self.runTopLevel();
+        self.loaded = true;
+    }
+
+    /// Run each module's top-level script once to define its functions/consts
+    /// and populate globals (builtins + registered natives injected first), so
+    /// `resolve`/`call` are ready. Shared by `load` and `loadImage`.
+    fn runTopLevel(self: *Session) LoadError!void {
+        const a = self.arena.allocator();
         // Mirror VM.run's per-module setup, but (a) reserve headroom for the
         // registered natives so the globals map is sized once and never rehashes
         // (the inline cache stores pointers into it), and (b) inject the natives
@@ -3659,12 +3687,6 @@ pub const Session = struct {
                 },
             };
         }
-        self.loaded = true;
-    }
-
-    /// Convenience: load a single module (the common single-file case).
-    pub fn loadModule(self: *Session, module: Module) LoadError!void {
-        return self.load(&.{.{ .module = module }});
     }
 
     /// Resolve a top-level function `name` in the entry module to a reusable
@@ -3725,6 +3747,591 @@ pub const Session = struct {
         self.vm.forcing = false;
     }
 };
+
+// --- bytecode serialization --------------------------------------------------
+//
+// Compile once, write the compiled program to bytes, reload it later without the
+// source or the compiler — for Strata's export/pack format. The compiled graph
+// is cyclic (a type points at its methods; a method's chunk points back at the
+// type; a constructor points at its type), so we serialize by **index tables**:
+// every reachable `*Function`/`*RtType`/`*RtEnum`/`*RtModule`/`*Signal` gets an
+// index, pointers are written as indices, and deserialization allocates all the
+// objects first (empty) then fills them in, resolving indices to the fresh
+// pointers. Only the *structural* graph is serialized — a module's globals,
+// signal handlers, and static-var values are runtime state, rebuilt by running
+// the top-level script (exactly as a fresh compile would).
+
+const bc_magic = "RGB1"; // RoseGold ByteCode, format v1
+
+pub const SerError = Error || error{Unserializable};
+pub const ImageError = Error || error{BadImage};
+
+/// The result of `serialize`: the bytecode `bytes` (empty on a compile error,
+/// in which case `diagnostics` is non-empty). Everything is arena-owned.
+pub const SerializeResult = struct {
+    arena: std.heap.ArenaAllocator,
+    bytes: []const u8,
+    diagnostics: []const lexer.Diagnostic,
+    pub fn deinit(self: *SerializeResult) void {
+        self.arena.deinit();
+    }
+};
+
+/// A deserialized, runnable program (`deserialize`). Arena-owns the whole
+/// bytecode graph. Run it with `runImage`, or embed it via `Session.loadImage`
+/// — **once**: running populates the image's module globals with that run's
+/// state, so use one Image per run/Session (deserialize again for another).
+pub const Image = struct {
+    arena: std.heap.ArenaAllocator,
+    programs: []const Program,
+    global_cache_count: usize,
+    pub fn deinit(self: *Image) void {
+        self.arena.deinit();
+    }
+};
+
+const BcWriter = struct {
+    buf: *std.ArrayList(u8),
+    a: std.mem.Allocator,
+
+    fn putByte(self: *BcWriter, v: u8) Error!void {
+        try self.buf.append(self.a, v);
+    }
+    fn putU32(self: *BcWriter, v: u32) Error!void {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, v, .little);
+        try self.buf.appendSlice(self.a, &b);
+    }
+    fn putU64(self: *BcWriter, v: u64) Error!void {
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, v, .little);
+        try self.buf.appendSlice(self.a, &b);
+    }
+    fn putUsize(self: *BcWriter, v: usize) Error!void {
+        try self.putU32(@intCast(v));
+    }
+    fn putBool(self: *BcWriter, v: bool) Error!void {
+        try self.putByte(if (v) 1 else 0);
+    }
+    fn putStr(self: *BcWriter, s: []const u8) Error!void {
+        try self.putUsize(s.len);
+        try self.buf.appendSlice(self.a, s);
+    }
+    fn putI64(self: *BcWriter, v: i64) Error!void {
+        try self.putU64(@bitCast(v));
+    }
+    fn putF64(self: *BcWriter, v: f64) Error!void {
+        try self.putU64(@bitCast(v));
+    }
+};
+
+/// Assigns each reachable object an index and records the tables to write.
+/// Functions come pre-enumerated from `Compiled.all_functions`; the rest are
+/// discovered by walking every function's module/owner/chunk/defaults.
+const Collector = struct {
+    a: std.mem.Allocator,
+    func_idx: std.AutoHashMapUnmanaged(*const Function, u32) = .{},
+    type_idx: std.AutoHashMapUnmanaged(*const RtType, u32) = .{},
+    enum_idx: std.AutoHashMapUnmanaged(*const RtEnum, u32) = .{},
+    mod_idx: std.AutoHashMapUnmanaged(*const RtModule, u32) = .{},
+    sig_idx: std.AutoHashMapUnmanaged(*const Signal, u32) = .{},
+    types: std.ArrayList(*const RtType) = .empty,
+    enums: std.ArrayList(*const RtEnum) = .empty,
+    mods: std.ArrayList(*const RtModule) = .empty,
+    sigs: std.ArrayList(*const Signal) = .empty,
+
+    fn collectFunc(self: *Collector, f: *const Function) Error!void {
+        // f is already indexed (from all_functions); collect its references.
+        try self.collectModule(f.module);
+        if (f.owner) |o| try self.collectType(o);
+        for (f.chunk.rttypes.items) |rt| try self.collectType(rt);
+        for (f.chunk.constants.items) |cst| try self.collectValue(cst);
+        for (f.defaults) |d| if (d) |dv| try self.collectValue(dv);
+    }
+    fn collectType(self: *Collector, t: *const RtType) Error!void {
+        if (self.type_idx.contains(t)) return;
+        try self.type_idx.put(self.a, t, @intCast(self.types.items.len));
+        try self.types.append(self.a, t);
+        for (t.ancestors) |anc| try self.collectType(anc); // methods/ctor are in all_functions
+    }
+    fn collectEnum(self: *Collector, e: *const RtEnum) Error!void {
+        if (self.enum_idx.contains(e)) return;
+        try self.enum_idx.put(self.a, e, @intCast(self.enums.items.len));
+        try self.enums.append(self.a, e);
+    }
+    fn collectModule(self: *Collector, m: *const RtModule) Error!void {
+        if (self.mod_idx.contains(m)) return;
+        try self.mod_idx.put(self.a, m, @intCast(self.mods.items.len));
+        try self.mods.append(self.a, m);
+    }
+    fn collectSignal(self: *Collector, s: *const Signal) Error!void {
+        if (self.sig_idx.contains(s)) return;
+        try self.sig_idx.put(self.a, s, @intCast(self.sigs.items.len));
+        try self.sigs.append(self.a, s);
+    }
+    fn collectValue(self: *Collector, v: Value) Error!void {
+        switch (v) {
+            .type => |t| try self.collectType(t),
+            .enum_type => |e| try self.collectEnum(e),
+            .signal => |s| try self.collectSignal(s),
+            .module => |m| try self.collectModule(m),
+            .enum_value => |ev| for (ev.payload) |p| try self.collectValue(p),
+            else => {}, // scalars; a .closure's func is already in the table
+        }
+    }
+};
+
+/// Compile `modules` and serialize the result to bytecode. `entry_runs_main`
+/// bakes a `main()` call into the entry script (like `run`) when true, or omits
+/// it (like the embedding `Session`) when false. On a compile error the result
+/// carries diagnostics and empty bytes.
+pub fn serialize(gpa: std.mem.Allocator, modules: []const ProgramModule, entry_runs_main: bool) SerError!SerializeResult {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    var diags: std.ArrayList(lexer.Diagnostic) = .empty;
+    const compiled = compileAll(a, &diags, modules, entry_runs_main) catch |e| switch (e) {
+        error.Compile => return .{ .arena = arena, .bytes = "", .diagnostics = try diags.toOwnedSlice(a) },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+
+    var col = Collector{ .a = a };
+    for (compiled.all_functions, 0..) |f, i| try col.func_idx.put(a, f, @intCast(i));
+    for (compiled.all_functions) |f| try col.collectFunc(f);
+
+    var buf: std.ArrayList(u8) = .empty;
+    var w = BcWriter{ .buf = &buf, .a = a };
+    try w.buf.appendSlice(a, bc_magic);
+    try w.putUsize(compiled.global_cache_count);
+    try w.putUsize(col.mods.items.len);
+    try w.putUsize(col.enums.items.len);
+    try w.putUsize(col.sigs.items.len);
+    try w.putUsize(col.types.items.len);
+    try w.putUsize(compiled.all_functions.len);
+    try w.putUsize(compiled.programs.len);
+    for (compiled.programs) |p| try w.putUsize(col.func_idx.get(p.script).?);
+    for (col.mods.items) |m| {
+        try w.putStr(m.name);
+        try w.putUsize(m.global_count);
+    }
+    for (col.enums.items) |e| {
+        try w.putStr(e.name);
+        try w.putUsize(e.members.count());
+        var it = e.members.iterator();
+        while (it.next()) |kv| {
+            try w.putStr(kv.key_ptr.*);
+            try w.putU32(kv.value_ptr.*);
+        }
+    }
+    for (col.sigs.items) |s| try w.putStr(s.name);
+    for (col.types.items) |t| try writeType(&col, &w, t);
+    for (compiled.all_functions) |f| try writeFunc(&col, &w, f);
+
+    return .{ .arena = arena, .bytes = try buf.toOwnedSlice(a), .diagnostics = &.{} };
+}
+
+fn writeType(col: *const Collector, w: *BcWriter, t: *const RtType) SerError!void {
+    try w.putStr(t.name);
+    try w.putBool(t.is_abstract);
+    try w.putUsize(t.field_names.len);
+    for (t.field_names) |name| try w.putStr(name);
+    try w.putUsize(t.signal_names.len);
+    for (t.signal_names) |name| try w.putStr(name);
+    try w.putUsize(t.methods.count());
+    var mit = t.methods.iterator();
+    while (mit.next()) |kv| {
+        try w.putStr(kv.key_ptr.*);
+        try w.putUsize(col.func_idx.get(kv.value_ptr.*).?);
+    }
+    try w.putUsize(col.func_idx.get(t.constructor).?);
+    try w.putUsize(t.statics.count());
+    var sit = t.statics.iterator();
+    while (sit.next()) |kv| {
+        try w.putStr(kv.key_ptr.*);
+        try writeValue(col, w, kv.value_ptr.*);
+    }
+    try w.putUsize(t.ancestors.len);
+    for (t.ancestors) |anc| try w.putUsize(col.type_idx.get(anc).?);
+}
+
+fn writeFunc(col: *const Collector, w: *BcWriter, f: *const Function) SerError!void {
+    try w.putStr(f.name);
+    try w.putUsize(f.arity);
+    try writeChunk(col, w, &f.chunk);
+    try w.putUsize(f.upvalues.len);
+    for (f.upvalues) |uv| {
+        try w.putBool(uv.is_local);
+        try w.putByte(uv.index);
+    }
+    try w.putUsize(col.mod_idx.get(f.module).?);
+    try w.putUsize(f.required);
+    try w.putUsize(f.defaults.len);
+    for (f.defaults) |d| {
+        if (d) |dv| {
+            try w.putByte(1);
+            try writeValue(col, w, dv);
+        } else try w.putByte(0);
+    }
+    try w.putUsize(f.param_names.len);
+    for (f.param_names) |name| try w.putStr(name);
+    try w.putBool(f.is_async);
+    if (f.owner) |o| {
+        try w.putByte(1);
+        try w.putUsize(col.type_idx.get(o).?);
+    } else try w.putByte(0);
+    try w.putBool(f.is_abstract);
+}
+
+fn writeChunk(col: *const Collector, w: *BcWriter, ch: *const Chunk) SerError!void {
+    try w.putUsize(ch.code.items.len);
+    try w.buf.appendSlice(w.a, ch.code.items);
+    try w.putUsize(ch.lines.items.len);
+    for (ch.lines.items) |ln| try w.putU32(ln);
+    try w.putUsize(ch.constants.items.len);
+    for (ch.constants.items) |cst| try writeValue(col, w, cst);
+    try w.putUsize(ch.functions.items.len);
+    for (ch.functions.items) |fp| try w.putUsize(col.func_idx.get(fp).?);
+    try w.putUsize(ch.rttypes.items.len);
+    for (ch.rttypes.items) |rt| try w.putUsize(col.type_idx.get(rt).?);
+    try w.putUsize(ch.kw_argnames.items.len);
+    for (ch.kw_argnames.items) |names| {
+        try w.putUsize(names.len);
+        for (names) |on| {
+            if (on) |name| {
+                try w.putByte(1);
+                try w.putStr(name);
+            } else try w.putByte(0);
+        }
+    }
+}
+
+fn writeValue(col: *const Collector, w: *BcWriter, v: Value) SerError!void {
+    switch (v) {
+        .nil => try w.putByte(0),
+        .int => |n| {
+            try w.putByte(1);
+            try w.putI64(n);
+        },
+        .float => |x| {
+            try w.putByte(2);
+            try w.putF64(x);
+        },
+        .bool => |b| {
+            try w.putByte(3);
+            try w.putBool(b);
+        },
+        .str => |s| {
+            try w.putByte(4);
+            try w.putStr(s);
+        },
+        .type => |t| {
+            try w.putByte(5);
+            try w.putUsize(col.type_idx.get(t).?);
+        },
+        .enum_type => |e| {
+            try w.putByte(6);
+            try w.putUsize(col.enum_idx.get(e).?);
+        },
+        .signal => |s| {
+            try w.putByte(7);
+            try w.putUsize(col.sig_idx.get(s).?);
+        },
+        .module => |m| {
+            try w.putByte(8);
+            try w.putUsize(col.mod_idx.get(m).?);
+        },
+        .closure => |cl| {
+            // A compile-time closure (a default thunk or static method) captures
+            // nothing; just record its function.
+            try w.putByte(9);
+            try w.putUsize(col.func_idx.get(cl.func).?);
+        },
+        .enum_value => |ev| {
+            try w.putByte(10);
+            try w.putStr(ev.enum_name);
+            try w.putStr(ev.member);
+            try w.putUsize(ev.payload.len);
+            for (ev.payload) |p| try writeValue(col, w, p);
+        },
+        // Runtime-only values (lists, maps, instances, tasks, natives, …) never
+        // appear as compile-time constants/defaults.
+        else => return error.Unserializable,
+    }
+}
+
+const BcReader = struct {
+    data: []const u8,
+    pos: usize,
+    a: std.mem.Allocator,
+
+    fn getByte(self: *BcReader) ImageError!u8 {
+        if (self.pos >= self.data.len) return error.BadImage;
+        const v = self.data[self.pos];
+        self.pos += 1;
+        return v;
+    }
+    fn getU32(self: *BcReader) ImageError!u32 {
+        if (self.pos + 4 > self.data.len) return error.BadImage;
+        const v = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
+        self.pos += 4;
+        return v;
+    }
+    fn getU64(self: *BcReader) ImageError!u64 {
+        if (self.pos + 8 > self.data.len) return error.BadImage;
+        const v = std.mem.readInt(u64, self.data[self.pos..][0..8], .little);
+        self.pos += 8;
+        return v;
+    }
+    fn getUsize(self: *BcReader) ImageError!usize {
+        return @intCast(try self.getU32());
+    }
+    fn getBool(self: *BcReader) ImageError!bool {
+        return (try self.getByte()) != 0;
+    }
+    fn getStr(self: *BcReader) ImageError![]const u8 {
+        const n = try self.getUsize();
+        if (self.pos + n > self.data.len) return error.BadImage;
+        const s = try self.a.dupe(u8, self.data[self.pos..][0..n]);
+        self.pos += n;
+        return s;
+    }
+    fn getRaw(self: *BcReader, n: usize) ImageError![]const u8 {
+        if (self.pos + n > self.data.len) return error.BadImage;
+        const s = self.data[self.pos..][0..n];
+        self.pos += n;
+        return s;
+    }
+    fn getI64(self: *BcReader) ImageError!i64 {
+        return @bitCast(try self.getU64());
+    }
+    fn getF64(self: *BcReader) ImageError!f64 {
+        return @bitCast(try self.getU64());
+    }
+};
+
+/// Holds the freshly-allocated object tables while filling them in, so pointer
+/// references (written as indices) resolve to the new objects.
+const Loader = struct {
+    r: *BcReader,
+    a: std.mem.Allocator,
+    mods: []*RtModule,
+    enums: []*RtEnum,
+    sigs: []*Signal,
+    types: []*RtType,
+    funcs: []*Function,
+
+    fn func(self: *Loader, i: usize) ImageError!*Function {
+        if (i >= self.funcs.len) return error.BadImage;
+        return self.funcs[i];
+    }
+    fn typ(self: *Loader, i: usize) ImageError!*RtType {
+        if (i >= self.types.len) return error.BadImage;
+        return self.types[i];
+    }
+
+    fn readType(self: *Loader, t: *RtType) ImageError!void {
+        t.name = try self.r.getStr();
+        t.is_abstract = try self.r.getBool();
+        const nf = try self.r.getUsize();
+        const fnames = try self.a.alloc([]const u8, nf);
+        for (fnames) |*x| x.* = try self.r.getStr();
+        t.field_names = fnames;
+        const ns = try self.r.getUsize();
+        const snames = try self.a.alloc([]const u8, ns);
+        for (snames) |*x| x.* = try self.r.getStr();
+        t.signal_names = snames;
+        t.methods = .{};
+        const nm = try self.r.getUsize();
+        var j: usize = 0;
+        while (j < nm) : (j += 1) {
+            const k = try self.r.getStr();
+            try t.methods.put(self.a, k, try self.func(try self.r.getUsize()));
+        }
+        t.constructor = try self.func(try self.r.getUsize());
+        t.statics = .{};
+        const nst = try self.r.getUsize();
+        j = 0;
+        while (j < nst) : (j += 1) {
+            const k = try self.r.getStr();
+            try t.statics.put(self.a, k, try self.readValue());
+        }
+        const na = try self.r.getUsize();
+        const anc = try self.a.alloc(*const RtType, na);
+        for (anc) |*x| x.* = try self.typ(try self.r.getUsize());
+        t.ancestors = anc;
+    }
+
+    fn readFunc(self: *Loader, f: *Function) ImageError!void {
+        f.name = try self.r.getStr();
+        f.arity = try self.r.getUsize();
+        f.chunk = .{};
+        try self.readChunk(&f.chunk);
+        const nu = try self.r.getUsize();
+        const ups = try self.a.alloc(Upvalue, nu);
+        for (ups) |*u| u.* = .{ .is_local = try self.r.getBool(), .index = try self.r.getByte() };
+        f.upvalues = ups;
+        const mi = try self.r.getUsize();
+        if (mi >= self.mods.len) return error.BadImage;
+        f.module = self.mods[mi];
+        f.required = try self.r.getUsize();
+        const nd = try self.r.getUsize();
+        if (nd == 0) {
+            f.defaults = &.{};
+        } else {
+            const defs = try self.a.alloc(?Value, nd);
+            for (defs) |*d| d.* = if ((try self.r.getByte()) == 1) try self.readValue() else null;
+            f.defaults = defs;
+        }
+        const np = try self.r.getUsize();
+        const pnames = try self.a.alloc([]const u8, np);
+        for (pnames) |*x| x.* = try self.r.getStr();
+        f.param_names = pnames;
+        f.is_async = try self.r.getBool();
+        f.owner = if ((try self.r.getByte()) == 1) try self.typ(try self.r.getUsize()) else null;
+        f.is_abstract = try self.r.getBool();
+    }
+
+    fn readChunk(self: *Loader, ch: *Chunk) ImageError!void {
+        const nc = try self.r.getUsize();
+        try ch.code.appendSlice(self.a, try self.r.getRaw(nc));
+        const nl = try self.r.getUsize();
+        var i: usize = 0;
+        while (i < nl) : (i += 1) try ch.lines.append(self.a, try self.r.getU32());
+        const nk = try self.r.getUsize();
+        i = 0;
+        while (i < nk) : (i += 1) try ch.constants.append(self.a, try self.readValue());
+        const nfn = try self.r.getUsize();
+        i = 0;
+        while (i < nfn) : (i += 1) try ch.functions.append(self.a, try self.func(try self.r.getUsize()));
+        const nrt = try self.r.getUsize();
+        i = 0;
+        while (i < nrt) : (i += 1) try ch.rttypes.append(self.a, try self.typ(try self.r.getUsize()));
+        const nkw = try self.r.getUsize();
+        i = 0;
+        while (i < nkw) : (i += 1) {
+            const m = try self.r.getUsize();
+            const names = try self.a.alloc(?[]const u8, m);
+            for (names) |*x| x.* = if ((try self.r.getByte()) == 1) try self.r.getStr() else null;
+            try ch.kw_argnames.append(self.a, names);
+        }
+    }
+
+    fn readValue(self: *Loader) ImageError!Value {
+        const tag = try self.r.getByte();
+        return switch (tag) {
+            0 => .nil,
+            1 => .{ .int = try self.r.getI64() },
+            2 => .{ .float = try self.r.getF64() },
+            3 => .{ .bool = try self.r.getBool() },
+            4 => .{ .str = try self.r.getStr() },
+            5 => .{ .type = try self.typ(try self.r.getUsize()) },
+            6 => blk: {
+                const i = try self.r.getUsize();
+                if (i >= self.enums.len) return error.BadImage;
+                break :blk .{ .enum_type = self.enums[i] };
+            },
+            7 => blk: {
+                const i = try self.r.getUsize();
+                if (i >= self.sigs.len) return error.BadImage;
+                break :blk .{ .signal = self.sigs[i] };
+            },
+            8 => blk: {
+                const i = try self.r.getUsize();
+                if (i >= self.mods.len) return error.BadImage;
+                break :blk .{ .module = self.mods[i] };
+            },
+            9 => blk: {
+                const cl = try self.a.create(Closure);
+                cl.* = .{ .func = try self.func(try self.r.getUsize()), .upvalues = &.{} };
+                break :blk .{ .closure = cl };
+            },
+            10 => blk: {
+                const en = try self.r.getStr();
+                const mem = try self.r.getStr();
+                const np = try self.r.getUsize();
+                const payload = try self.a.alloc(Value, np);
+                for (payload) |*p| p.* = try self.readValue();
+                const ev = try self.a.create(EnumValue);
+                ev.* = .{ .enum_name = en, .member = mem, .payload = payload };
+                break :blk .{ .enum_value = ev };
+            },
+            else => error.BadImage,
+        };
+    }
+};
+
+/// Deserialize bytecode (from `serialize`) into a runnable `Image`. Everything
+/// is copied into the Image's arena, so `bytes` may be freed afterward.
+pub fn deserialize(gpa: std.mem.Allocator, bytes: []const u8) ImageError!Image {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    if (bytes.len < bc_magic.len or !std.mem.eql(u8, bytes[0..bc_magic.len], bc_magic)) return error.BadImage;
+
+    var r = BcReader{ .data = bytes, .pos = bc_magic.len, .a = a };
+    const gcc = try r.getUsize();
+    const nmods = try r.getUsize();
+    const nenums = try r.getUsize();
+    const nsigs = try r.getUsize();
+    const ntypes = try r.getUsize();
+    const nfuncs = try r.getUsize();
+    const nprogs = try r.getUsize();
+    const prog_idx = try a.alloc(usize, nprogs);
+    for (prog_idx) |*pi| pi.* = try r.getUsize();
+
+    // Phase 1: allocate every object empty, so indices resolve to real pointers.
+    const mods = try a.alloc(*RtModule, nmods);
+    for (mods) |*m| m.* = try a.create(RtModule);
+    const enums = try a.alloc(*RtEnum, nenums);
+    for (enums) |*e| e.* = try a.create(RtEnum);
+    const sigs = try a.alloc(*Signal, nsigs);
+    for (sigs) |*s| s.* = try a.create(Signal);
+    const types = try a.alloc(*RtType, ntypes);
+    for (types) |*t| t.* = try a.create(RtType);
+    const funcs = try a.alloc(*Function, nfuncs);
+    for (funcs) |*f| f.* = try a.create(Function);
+
+    var loader = Loader{ .r = &r, .a = a, .mods = mods, .enums = enums, .sigs = sigs, .types = types, .funcs = funcs };
+
+    // Phase 2: fill in. Leaves (modules/enums/signals) first, then types + funcs.
+    for (mods) |m| m.* = .{ .name = try r.getStr(), .global_count = try r.getUsize() };
+    for (enums) |e| {
+        e.* = .{ .name = try r.getStr() };
+        const nm = try r.getUsize();
+        var j: usize = 0;
+        while (j < nm) : (j += 1) {
+            const k = try r.getStr();
+            try e.members.put(a, k, try r.getU32());
+        }
+    }
+    for (sigs) |s| s.* = .{ .name = try r.getStr() };
+    for (types) |t| try loader.readType(t);
+    for (funcs) |f| try loader.readFunc(f);
+
+    const programs = try a.alloc(Program, nprogs);
+    for (programs, prog_idx) |*p, pi| {
+        if (pi >= nfuncs) return error.BadImage;
+        p.* = .{ .script = funcs[pi] };
+    }
+    return .{ .arena = arena, .programs = programs, .global_cache_count = gcc };
+}
+
+/// Run a deserialized `image` (like `runProgram`, but skipping compilation).
+/// Run an Image at most once — see the `Image` note.
+pub fn runImage(gpa: std.mem.Allocator, image: *const Image) Error!Result {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+    const cache = try alloc.alloc(?*Value, image.global_cache_count);
+    @memset(cache, null);
+    var output: std.ArrayList(u8) = .empty;
+    var vm = VM{ .alloc = alloc, .output = &output, .global_cache = cache };
+    vm.run(image.programs) catch |e| switch (e) {
+        error.Runtime => return .{ .arena = arena, .output = try output.toOwnedSlice(alloc), .runtime_error = vm.runtime_error, .diagnostics = &.{} },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    return .{ .arena = arena, .output = try output.toOwnedSlice(alloc), .runtime_error = null, .diagnostics = &.{} };
+}
 
 // --- tests -------------------------------------------------------------------
 
@@ -4957,4 +5564,166 @@ test "embed: a host function re-entering the same Session is rejected" {
     ctx.handle = session.resolve("run").?;
     _ = try session.call(ctx.handle.?, &.{});
     try testing.expect(ctx.got_reentrant);
+}
+
+// --- bytecode serialization tests --------------------------------------------
+
+/// Compile+run `src` directly, then serialize → deserialize → run the reloaded
+/// image, and assert the reloaded run produces identical output (no source or
+/// compiler involved the second time).
+fn expectRoundtrip(src: []const u8) !void {
+    const gpa = testing.allocator;
+    var tree = try parser.parse(gpa, src);
+    defer tree.deinit();
+
+    var orig = try run(gpa, tree.module);
+    defer orig.deinit();
+    try testing.expect(orig.runtime_error == null);
+
+    var ser = try serialize(gpa, &.{.{ .module = tree.module }}, true);
+    defer ser.deinit();
+    try testing.expectEqual(@as(usize, 0), ser.diagnostics.len);
+    try testing.expect(ser.bytes.len > 0);
+
+    var image = try deserialize(gpa, ser.bytes);
+    defer image.deinit();
+    var res = try runImage(gpa, &image);
+    defer res.deinit();
+    try testing.expect(res.runtime_error == null);
+    try testing.expectEqualStrings(orig.output, res.output);
+}
+
+test "serialize: round-trips functions, recursion, and locals/globals" {
+    try expectRoundtrip(
+        \\const BASE = 10
+        \\func fib(n):
+        \\    if n < 2:
+        \\        return n
+        \\    return fib(n - 1) + fib(n - 2)
+        \\func main():
+        \\    var total = 0
+        \\    for i in 0..8:
+        \\        total = total + fib(i)
+        \\    print(total + BASE)
+    );
+}
+
+test "serialize: round-trips classes, statics, inheritance, and super" {
+    try expectRoundtrip(
+        \\class Animal:
+        \\    static var count: int = 0
+        \\    var name: str = "?"
+        \\    func init(n: str):
+        \\        name = n
+        \\        Animal.count = Animal.count + 1
+        \\    func speak() -> str:
+        \\        return name + " makes a sound"
+        \\class Dog extends Animal:
+        \\    func speak() -> str:
+        \\        return super.speak() + " (woof)"
+        \\func main():
+        \\    var d = Dog("Rex")
+        \\    var a = Animal("Cat")
+        \\    print(d.speak())
+        \\    print(a.speak())
+        \\    print(Dog.count)
+    );
+}
+
+test "serialize: round-trips enums, match, defaults, lambdas, and interpolation" {
+    try expectRoundtrip(
+        \\enum Shape { Circle(r: float), Rect(w: float, h: float), Empty }
+        \\func area(s: Shape) -> float:
+        \\    return match s {
+        \\        Shape.Circle(r): 3.14 * r * r
+        \\        Shape.Rect(w, h): w * h
+        \\        Shape.Empty: 0.0
+        \\    }
+        \\func scaled(x, factor = 2):
+        \\    return x * factor
+        \\func main():
+        \\    var shapes = [Shape.Circle(2.0), Shape.Rect(3.0, 4.0), Shape.Empty]
+        \\    var areas = map(shapes, func(s): area(s))
+        \\    for a in areas:
+        \\        print("area = ${a}")
+        \\    print(scaled(5))
+        \\    print(scaled(5, 10))
+    );
+}
+
+test "serialize: round-trips signals" {
+    try expectRoundtrip(
+        \\signal ping(n: int)
+        \\func main():
+        \\    var total = 0
+        \\    connect(ping, func(n): print("got ${n}"))
+        \\    emit(ping, 1)
+        \\    emit(ping, 2)
+        \\    print(total)
+    );
+}
+
+test "serialize: a deserialized image loads into an embedding Session" {
+    const gpa = testing.allocator;
+    var tree = try parser.parse(gpa,
+        \\var total = 0
+        \\func bump(x):
+        \\    total = total + x
+        \\    return total
+    );
+    defer tree.deinit();
+
+    // Compile once (no main), serialize, then reload into a fresh Session.
+    var ser = try serialize(gpa, &.{.{ .module = tree.module }}, false);
+    defer ser.deinit();
+    var image = try deserialize(gpa, ser.bytes);
+    defer image.deinit();
+
+    const session = try Session.init(gpa, null);
+    defer session.deinit();
+    try session.loadImage(&image);
+
+    const bump = session.resolve("bump").?;
+    try testing.expectEqual(@as(i64, 5), asInt(try session.call(bump, &.{intValue(5)})).?);
+    try testing.expectEqual(@as(i64, 12), asInt(try session.call(bump, &.{intValue(7)})).?);
+}
+
+test "serialize: garbage bytes are rejected, not crash" {
+    try testing.expectError(error.BadImage, deserialize(testing.allocator, "not real bytecode"));
+    try testing.expectError(error.BadImage, deserialize(testing.allocator, "RGB1"));
+}
+
+test "serialize: round-trips a multi-module program (imports + cross-module calls)" {
+    const gpa = testing.allocator;
+    var dep_tree = try parser.parse(gpa,
+        \\pub func triple(x: int) -> int:
+        \\    return x * 3
+        \\pub const UNIT = 7
+    );
+    defer dep_tree.deinit();
+    var entry_tree = try parser.parse(gpa,
+        \\import mathutil
+        \\func main():
+        \\    print(mathutil.triple(mathutil.UNIT))
+    );
+    defer entry_tree.deinit();
+
+    const imports = [_]ModuleImport{.{ .name = "mathutil", .module_index = 0 }};
+    const modules = [_]ProgramModule{
+        .{ .module = dep_tree.module, .imports = &.{}, .name = "mathutil" },
+        .{ .module = entry_tree.module, .imports = &imports, .name = "main" },
+    };
+
+    var orig = try runProgram(gpa, &modules);
+    defer orig.deinit();
+    try testing.expect(orig.runtime_error == null);
+
+    var ser = try serialize(gpa, &modules, true);
+    defer ser.deinit();
+    var image = try deserialize(gpa, ser.bytes);
+    defer image.deinit();
+    var res = try runImage(gpa, &image);
+    defer res.deinit();
+    try testing.expect(res.runtime_error == null);
+    try testing.expectEqualStrings(orig.output, res.output); // "21\n"
 }
