@@ -264,6 +264,75 @@ nice way to see how the language lowers:
 ...
 ```
 
+## Embedding the VM
+
+Besides the CLI, the bytecode VM exposes a small **embedding API** (`vm.zig`) for a
+host program — a game engine, say — that wants to keep a VM alive, register native
+functions, and call script functions every frame. It's a second surface layered on
+the same compiler; the CLI/LSP/DAP paths are untouched.
+
+```zig
+const vm = @import("fontend/vm.zig");
+
+// A native the script can call. `ctx` is the pointer you gave at init, so the
+// callback can reach engine state; args/return use the VM's Value.
+fn hostAdd(ctx: ?*anyopaque, args: []const vm.Value) vm.HostError!vm.Value {
+    const engine: *Engine = @ptrCast(@alignCast(ctx.?));
+    const a = vm.asInt(args[0]) orelse return error.HostFailure;
+    const b = vm.asInt(args[1]) orelse return error.HostFailure;
+    return vm.intValue(a + b + engine.base);
+}
+
+var session = try vm.Session.init(gpa, engine);   // VM kept alive; `engine` is the ctx
+defer session.deinit();
+
+try session.registerHost("host_add", hostAdd);    // register before loading
+try session.loadModule(tree.module);              // compile once; runs top-level defs
+
+const update = session.resolve("update").?;       // resolve a function once…
+var frame: i64 = 0;
+while (frame < 3) : (frame += 1) {                 // …call it many times
+    const r = try session.call(update, &.{ vm.intValue(frame) });
+    _ = vm.asInt(r);                               // marshal the result back out
+}
+```
+
+- **Lifetime.** A `Session` owns one compiled program plus **its own module globals,
+  and those globals are the per-instance state** — a script's top-level `var`s persist
+  across `call`s. `init` compiles nothing; `loadModule`/`load` compiles the module(s)
+  **once** and runs their top-level code to define functions and populate globals (but
+  not `main`); `resolve` turns a name into a reusable handle (resolve once, call many —
+  no per-call name lookup); `deinit` frees everything. For many scripted entities the
+  engine creates **one `Session` per script instance** — each is cheap (a small stack +
+  that instance's globals). *(One VM per instance, rather than one VM juggling swapped
+  environments: it keeps state isolation trivial and adds no hidden shared state.)*
+- **Host functions.** `registerHost(name, fn)` makes `fn` callable from RoseGold as an
+  ordinary global. Under the hood a native is just another callable `Value`, so
+  `host_add(a, b)` compiles to the same `get_global` + `call` as any function and rides
+  the existing inline cache — no separate dispatch path. Register before `load`.
+- **Value marshalling.** `intValue`/`floatValue`/`boolValue`/`strValue`/`nilValue` go
+  host → VM; `asInt`/`asFloat`/`asBool`/`asStr` come back (returning `null` on a kind
+  mismatch), and `kindOf(v)` reports the kind first (`int` widens to `float` in the
+  language, so a script may hand back either — you decide whether to coerce). A returned
+  string is borrowed: its bytes must outlive the values holding it.
+- **`print` routing.** `setPrint(fn, ctx)` sends `print`/`echo` output to a callback
+  (one line at a time) instead of the internal buffer — e.g. an editor output panel.
+- **Errors never panic.** A script runtime error makes `call` return `error.Runtime`;
+  `session.lastError()` carries the message with line/col, and the Session resets so the
+  next call still works. A compile failure is `error.Compile` (`compileDiagnostics()`).
+- **Threading.** A `Session` is **single-threaded and owns no shared mutable global
+  state** — use one per thread (one world per thread is fine). If a host function tries
+  to call back into the *same* Session while it's running, `call` returns
+  `error.Reentrant` instead of corrupting the stack.
+
+**Known gaps.** The VM does not garbage-collect: values allocated during a call live in
+the Session's arena until `deinit`, so for a per-frame loop keep host functions returning
+scalars and avoid growing collections without bound. Compiled bytecode is **not yet
+shared between Sessions** (each compiles its own copy) and there is **no bytecode
+serialization** — both are planned (an export/pack format will need serialized bytecode),
+and neither blocks this API. The analyzer doesn't know about host-registered names, so
+`check` will flag them as undefined; the VM resolves them at run time.
+
 ## Toolchain
 
 - **`repl`** — an interactive read-eval-print loop; definitions and values persist

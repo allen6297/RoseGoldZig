@@ -27,7 +27,7 @@ zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w 
 zig build run -- doc FILE.rg    # print Markdown API docs from FILE's ## comments (stdout)
 zig build run -- lsp            # run the Language Server over stdio (for editors)
 zig build run -- dap            # run the Debug Adapter over stdio (breakpoints, stepping)
-zig build test                  # run every test (435 as of writing)
+zig build test                  # run every test (438 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -640,6 +640,52 @@ drives the loader, then the analyzer and interpreter over the loaded module set
 - **Fully covered.** The remaining `--vm` rejections are for constructs the analyzer also
   wouldn't run meaningfully (e.g. a nested type declaration inside a class), reported as a
   clear "the --vm backend does not support …" diagnostic.
+
+### Embedding API (`vm.Session`)
+- A **second public surface** on the VM, for a host (the Strata game engine) that embeds
+  it — distinct from the CLI's `run`/`runProgram`/`disassemble`, which are untouched.
+  `pub const Session` wraps a persistent `VM` + arena + compiled program + registered
+  natives + host context, and outlives many calls. Everything is additive: the private
+  `VM` executor and its per-run lifetime are unchanged.
+- **Lifetime / state model:** one `Session` owns **one compiled program and its own module
+  globals; those globals ARE the per-instance state and persist across `call`s**. Chosen
+  model = **one Session per script instance** (not one VM with swapped environments) — the
+  engine makes one per entity; state isolation is trivial and there's no hidden shared
+  state. `init(gpa, ctx) → *Session` (heap-pinned, since the VM holds pointers into it),
+  `deinit`, `registerHost(name, fn)` (before `load`), `setPrint(fn, ctx)`,
+  `load(modules)`/`loadModule(module)` (compile once + run top-level defs, **not** `main`
+  — via a new `entry_runs_main` param threaded through `compileAll`/`compileModule`),
+  `resolve(name) → ?FnHandle` (resolve once), `call(handle, args) → Value` (call many),
+  `lastError()`, `compileDiagnostics()`.
+- **Opening the closed `Builtin` enum (the load-bearing decision):** a registered native
+  is a new **`native: *const NativeFn`** variant on the VM `Value`, placed straight into
+  the module globals like the compiled-in builtins. So `host_add(a, b)` compiles to the
+  ordinary `get_global` + `call`, resolves through the existing per-site inline cache, and
+  dispatches in `call`'s `switch (callee)` — **no parallel registry, no name-miss
+  fallback, no new opcode**, one extra `Value` tag. `HostFn = *const fn(?*anyopaque,
+  []const Value) HostError!Value`; a `HostFailure` becomes a catchable runtime error, OOM
+  propagates. `load` sizes each module's globals to `global_count + natives.len` so the map
+  never rehashes (the inline cache holds pointers into it).
+- **Marshalling:** `kindOf(v) → ValueKind{nil,int,float,bool,str,other}`; constructors
+  `intValue/floatValue/boolValue/strValue/nilValue`; accessors `asInt/asFloat/asBool/asStr`
+  (null on kind mismatch; strict — no int→float coercion). Returned strings are borrowed.
+- **`print` routing:** an optional `print_fn`/`print_ctx` on the VM; `callBuiltin(.print)`
+  hands the built line to the callback and rolls `output` back. Null ⇒ buffer as before
+  (CLI unchanged).
+- **Re-entrancy + errors:** `Session.call` sets a `running` flag; a host fn calling back
+  into the same Session returns `error.Reentrant` before touching the stack. A runtime
+  error is captured (`last_error`, line/col) and the executor is reset so the Session stays
+  usable — never panics. **The `Value` union is now `pub`** so embedders can name it.
+- **A subtle fix this required:** the `ret` handler's "top-level script returned" path
+  (`frames.len == 0`) discarded the result. An embedded `call` from an idle VM also drives
+  frames to 0, so it was losing the return value. The top-level script frame has `base == 0`
+  and no callee below it; an embedded call always has `base >= 1` (the callee sits at
+  `base-1`) — the handler now distinguishes them and leaves the result for the embedder.
+- Tests (in `vm.zig`): host fn + persistent state + repeated calls + clean line/col error
+  + post-error recovery; `print` → callback; re-entrancy rejected. **Known gaps:** no GC
+  (per-call allocations live until `deinit` — return scalars in a per-frame loop); compiled
+  bytecode isn't shared across Sessions; no bytecode serialization yet (planned for the
+  engine's pack/export format). See the README's **Embedding the VM** section.
 
 ### Known gaps / future work
 - A subclass's own **static method** now sees an inherited static by bare name (both

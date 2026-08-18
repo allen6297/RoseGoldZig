@@ -158,7 +158,30 @@ const EnumCtor = struct { enum_name: []const u8, member: []const u8, arity: u32 
 /// `builtin(recv, args…)`.
 const BoundBuiltin = struct { builtin: Builtin, recv: Value };
 
-const Value = union(enum) {
+// --- embedding: host functions -----------------------------------------------
+
+/// The error set a host (native) function may return. `HostFailure` becomes a
+/// catchable RoseGold runtime error naming the function; `OutOfMemory`
+/// propagates. Deliberately small so the boundary can't leak arbitrary Zig
+/// errors into the VM. See the **Embedding API** section at the bottom.
+pub const HostError = error{ HostFailure, OutOfMemory };
+
+/// A native function callable from RoseGold. `ctx` is the opaque pointer given
+/// at `Session.init`, so the callback can reach engine state; `args` are the
+/// call arguments, borrowed only for the duration of the call (do not retain
+/// them past return). Return a `Value` (build scalars with `intValue`/… ; a
+/// returned string must outlive the call — the VM borrows it).
+pub const HostFn = *const fn (ctx: ?*anyopaque, args: []const Value) HostError!Value;
+
+/// A registered native, stored as a `.native` global so ordinary name
+/// resolution + the inline cache reach it (see the design note by `Session`).
+const NativeFn = struct { name: []const u8, func: HostFn };
+
+/// Where `print`/`echo` output goes when embedding (see `Session.setPrint`);
+/// when null, output buffers into `VM.output` as the CLI expects.
+pub const PrintFn = *const fn (ctx: ?*anyopaque, text: []const u8) void;
+
+pub const Value = union(enum) {
     nil,
     int: i64,
     float: f64,
@@ -168,6 +191,10 @@ const Value = union(enum) {
     map: *Map,
     closure: *Closure,
     builtin: Builtin,
+    /// A host-registered native function (embedding); calling it runs
+    /// `func(host_ctx, args…)`. Opens the closed `Builtin` enum without a
+    /// second dispatch path — a native is just another callable global value.
+    native: *const NativeFn,
     instance: *Instance,
     bound_method: *BoundMethod,
     type: *RtType,
@@ -280,6 +307,7 @@ fn valuesEqual(a: Value, b: Value) bool {
         .map => |x| b == .map and mapsEqual(x, b.map),
         .closure => |x| b == .closure and x == b.closure,
         .builtin => |x| b == .builtin and x == b.builtin,
+        .native => |x| b == .native and x == b.native,
         .instance => |x| b == .instance and x == b.instance,
         .bound_method => |x| b == .bound_method and x == b.bound_method,
         .type => |x| b == .type and x == b.type,
@@ -429,7 +457,7 @@ const Compiled = struct { programs: []const Program, all_functions: []const *con
 /// already-compiled module's types stay reachable (via `module_types`) so
 /// `extends mod.Base` resolves across the boundary. Propagates `error.Compile`
 /// after appending the diagnostic.
-fn compileAll(alloc: std.mem.Allocator, diagnostics: *std.ArrayList(lexer.Diagnostic), modules: []const ProgramModule) Error!Compiled {
+fn compileAll(alloc: std.mem.Allocator, diagnostics: *std.ArrayList(lexer.Diagnostic), modules: []const ProgramModule, entry_runs_main: bool) Error!Compiled {
     // Create every module's runtime namespace up front so imports (which point
     // at earlier modules) can bind to them.
     const rtmods = try alloc.alloc(*RtModule, modules.len);
@@ -450,7 +478,7 @@ fn compileAll(alloc: std.mem.Allocator, diagnostics: *std.ArrayList(lexer.Diagno
         c.current_type = null;
         c.current_static_type = null;
         c.current_imports = pm.imports;
-        programs[i] = try c.compileModule(pm.module, pm.imports, rtmods, i == modules.len - 1);
+        programs[i] = try c.compileModule(pm.module, pm.imports, rtmods, entry_runs_main and i == modules.len - 1);
         module_types[i] = c.types; // reachable by later modules that import this one
     }
     return .{ .programs = programs, .all_functions = c.all_functions.items, .global_cache_count = c.global_cache_count };
@@ -464,7 +492,7 @@ pub fn runProgram(gpa: std.mem.Allocator, modules: []const ProgramModule) Error!
     const alloc = arena.allocator();
 
     var diagnostics: std.ArrayList(lexer.Diagnostic) = .empty;
-    const compiled = compileAll(alloc, &diagnostics, modules) catch |e| switch (e) {
+    const compiled = compileAll(alloc, &diagnostics, modules, true) catch |e| switch (e) {
         error.Compile => return .{ .arena = arena, .output = "", .runtime_error = null, .diagnostics = try diagnostics.toOwnedSlice(alloc) },
         else => return e,
     };
@@ -2069,6 +2097,12 @@ const VM = struct {
     /// re-wrapping it in another Task (see `call`/`callKw` and `forceTask`).
     forcing: bool = false,
     runtime_error: ?RuntimeError = null,
+    /// Embedding: the opaque host context, passed to every native function.
+    host_ctx: ?*anyopaque = null,
+    /// Embedding: when set, `print`/`echo` route their line here instead of
+    /// accumulating in `output` (the CLI leaves this null and reads `output`).
+    print_fn: ?PrintFn = null,
+    print_ctx: ?*anyopaque = null,
 
     fn fail(self: *VM, comptime fmt: []const u8, args: anytype) VMError {
         const line = self.currentLine();
@@ -2298,7 +2332,18 @@ const VM = struct {
                     // Close any upvalues that captured this frame's locals before
                     // they're popped, so escaping closures keep their own copy.
                     self.closeUpvalues(finished.base);
-                    if (self.frames.items.len == 0) return; // script returned
+                    if (self.frames.items.len == 0) {
+                        // Returned to an empty frame stack. A top-level script
+                        // frame has base 0 and no callee below it — its (nil)
+                        // result is discarded (run/load leave the stack empty).
+                        // An *embedded* call (`Session.call` from an idle VM) has
+                        // base >= 1 (the callee sits at base-1): drop the callee
+                        // and leave the result so `callValueSync` can pop it.
+                        if (finished.base == 0) return;
+                        self.stack.shrinkRetainingCapacity(finished.base - 1);
+                        try self.push(result);
+                        return;
+                    }
                     // Drop the frame's locals AND the callee that sat just below.
                     self.stack.shrinkRetainingCapacity(finished.base - 1);
                     try self.push(result);
@@ -2768,6 +2813,20 @@ const VM = struct {
                 self.stack.shrinkRetainingCapacity(base - 1); // drop callee + args
                 try self.push(result);
             },
+            // A host-registered native runs `func(host_ctx, args…)`. Its args are
+            // the live stack slots (valid because a well-behaved host can't
+            // re-enter this VM — `Session.call` guards that). A host failure
+            // becomes a catchable runtime error; OOM propagates.
+            .native => |nf| {
+                const base = self.stack.items.len - argc;
+                const args = self.stack.items[base..];
+                const result = nf.func(self.host_ctx, args) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.HostFailure => return self.fail("host function '{s}' failed", .{nf.name}),
+                };
+                self.stack.shrinkRetainingCapacity(base - 1); // drop callee + args
+                try self.push(result);
+            },
             .enum_ctor => |ec| {
                 if (argc != ec.arity) return self.fail("{s}.{s} expects {d} argument(s), got {d}", .{ ec.enum_name, ec.member, ec.arity, argc });
                 const base = self.stack.items.len - argc;
@@ -2839,11 +2898,19 @@ const VM = struct {
     fn callBuiltin(self: *VM, b: Builtin, args: []const Value) VMError!Value {
         switch (b) {
             .print, .echo => {
+                // Build the line into `output`; if an embedder installed a print
+                // callback, hand it that segment and roll `output` back so the
+                // buffer stays empty (CLI keeps accumulating when there's no cb).
+                const start = self.output.items.len;
                 for (args, 0..) |arg, i| {
                     if (i > 0) try self.output.append(self.alloc, ' ');
                     try self.appendValue(arg);
                 }
                 try self.output.append(self.alloc, '\n');
+                if (self.print_fn) |pf| {
+                    pf(self.print_ctx, self.output.items[start..]);
+                    self.output.shrinkRetainingCapacity(start);
+                }
                 return .nil;
             },
             .len => {
@@ -3227,7 +3294,7 @@ const VM = struct {
                 }
                 try buf.append(self.alloc, '}');
             },
-            .closure, .builtin, .bound_method, .bound_builtin => try buf.appendSlice(self.alloc, "<function>"),
+            .closure, .builtin, .bound_method, .bound_builtin, .native => try buf.appendSlice(self.alloc, "<function>"),
             .module => try buf.appendSlice(self.alloc, "<module>"),
             .task => try buf.appendSlice(self.alloc, "<task>"),
             .signal => |s| {
@@ -3291,7 +3358,7 @@ pub fn disassemble(gpa: std.mem.Allocator, modules: []const ProgramModule) Error
     const alloc = arena.allocator();
 
     var diagnostics: std.ArrayList(lexer.Diagnostic) = .empty;
-    const compiled = compileAll(alloc, &diagnostics, modules) catch |e| switch (e) {
+    const compiled = compileAll(alloc, &diagnostics, modules, true) catch |e| switch (e) {
         error.Compile => return .{ .arena = arena, .text = "", .diagnostics = try diagnostics.toOwnedSlice(alloc) },
         else => return e,
     };
@@ -3384,6 +3451,280 @@ fn writeConst(alloc: std.mem.Allocator, out: *std.ArrayList(u8), v: Value) Error
         else => try out.appendSlice(alloc, @tagName(v)),
     }
 }
+
+// --- embedding API (Session) -------------------------------------------------
+//
+// A second public surface, for a host (the Strata engine) that embeds the VM:
+// a VM created once and kept alive, a function resolved once and called many
+// times, host functions the script can call, and per-instance state that
+// survives between calls. Additive — the CLI/LSP/DAP entry points (`run`,
+// `runProgram`, `disassemble`) are untouched.
+
+/// What a `Value` actually holds — for a host to branch on before marshalling.
+/// `other` is every non-scalar (list, map, instance, closure, enum, …): opaque
+/// to an embedder, which should pass it back into the VM unchanged.
+pub const ValueKind = enum { nil, int, float, bool, str, other };
+
+/// Classify a `Value` without converting it.
+pub fn kindOf(v: Value) ValueKind {
+    return switch (v) {
+        .nil => .nil,
+        .int => .int,
+        .float => .float,
+        .bool => .bool,
+        .str => .str,
+        else => .other,
+    };
+}
+
+// Value constructors (host → VM). Scalars only — composites are built by the VM
+// itself. A string is *borrowed*: its bytes must outlive every value holding it.
+pub fn nilValue() Value {
+    return .nil;
+}
+pub fn intValue(n: i64) Value {
+    return .{ .int = n };
+}
+pub fn floatValue(f: f64) Value {
+    return .{ .float = f };
+}
+pub fn boolValue(b: bool) Value {
+    return .{ .bool = b };
+}
+pub fn strValue(s: []const u8) Value {
+    return .{ .str = s };
+}
+
+// Value accessors (VM → host). Each returns null on a kind mismatch, so a host
+// can `orelse` a default or check `kindOf` first. Strict: `asFloat` does not
+// accept an int (RoseGold widens int→float, so a script may hand back either —
+// the host decides whether to coerce; `kindOf` reports which it got).
+pub fn asInt(v: Value) ?i64 {
+    return switch (v) {
+        .int => |n| n,
+        else => null,
+    };
+}
+pub fn asFloat(v: Value) ?f64 {
+    return switch (v) {
+        .float => |f| f,
+        else => null,
+    };
+}
+pub fn asBool(v: Value) ?bool {
+    return switch (v) {
+        .bool => |b| b,
+        else => null,
+    };
+}
+pub fn asStr(v: Value) ?[]const u8 {
+    return switch (v) {
+        .str => |s| s,
+        else => null,
+    };
+}
+
+/// A resolved function handle: the callable value plus its name (for errors).
+/// Resolve once (a map lookup), then call it many times with no re-resolve.
+pub const FnHandle = struct { callee: Value, name: []const u8 };
+
+/// Errors from `Session.call`.
+///  - `Runtime`     the script raised or hit a runtime error — details (with
+///                  line/col) are in `lastError()`.
+///  - `Reentrant`   a host function tried to call back into the *same* Session
+///                  while it was already running (would corrupt the stack).
+///  - `NotCallable` the handle's value isn't callable (shouldn't happen for a
+///                  handle from `resolve`).
+pub const CallError = error{ Runtime, Reentrant, NotCallable, OutOfMemory };
+
+/// Errors from `Session.load`: a compile failure (diagnostics via
+/// `compileDiagnostics`), a runtime error in top-level code, or OOM.
+pub const LoadError = error{ Compile, Runtime, OutOfMemory };
+
+/// A persistent, embeddable VM. One Session owns one compiled program and its
+/// own module globals — **those globals are the per-instance state and persist
+/// across `call`s.** For many scripted entities the engine creates one Session
+/// per script instance (cheap: a small stack + that instance's globals); the
+/// compiled bytecode is not yet shared between Sessions (see the README's
+/// "known gaps"). Threading: a Session is single-threaded and owns no shared
+/// mutable global state — use one per thread.
+///
+/// Design note — opening the closed `Builtin` enum: a registered host function
+/// is a `.native` `Value` placed straight into the entry module's globals, just
+/// like the compiled-in builtins. So `host_add(a, b)` compiles to the ordinary
+/// `get_global "host_add"` + `call`, resolves through the existing per-site
+/// inline cache, and dispatches in `call`'s `switch (callee)`. No parallel
+/// registry, no name-miss fallback, no new opcode — the whole cost is one extra
+/// `Value` tag. (A fallback table consulted on an unresolved global was the
+/// alternative; it would have added a second lookup on the hot path and left
+/// host functions second-class — not cacheable, not first-class values.)
+pub const Session = struct {
+    gpa: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    vm: VM,
+    output: std.ArrayList(u8),
+    natives: std.ArrayList(*NativeFn),
+    programs: []const Program = &.{},
+    compile_diags: []const lexer.Diagnostic = &.{},
+    loaded: bool = false,
+    /// Set while a `call` is in flight, so a host function re-entering the same
+    /// Session is rejected instead of corrupting the shared stack.
+    running: bool = false,
+    last_error: ?RuntimeError = null,
+
+    /// Create a Session bound to `host_ctx` (handed to every native function).
+    /// Heap-allocated and pinned, since the VM holds pointers back into it.
+    pub fn init(gpa: std.mem.Allocator, host_ctx: ?*anyopaque) Error!*Session {
+        const self = try gpa.create(Session);
+        self.* = .{
+            .gpa = gpa,
+            .arena = std.heap.ArenaAllocator.init(gpa),
+            .vm = undefined,
+            .output = .empty,
+            .natives = .empty,
+        };
+        self.vm = .{ .alloc = self.arena.allocator(), .output = &self.output, .global_cache = &.{}, .host_ctx = host_ctx };
+        return self;
+    }
+
+    /// Destroy the Session and free everything it allocated — globals, compiled
+    /// functions, and any values produced during calls. (The VM does not garbage
+    /// collect: per-call allocations live until here. For a per-frame loop, keep
+    /// host functions returning scalars; see the README's per-frame note.)
+    pub fn deinit(self: *Session) void {
+        self.arena.deinit();
+        const gpa = self.gpa;
+        gpa.destroy(self);
+    }
+
+    /// Route `print`/`echo` to `func(ctx, text)` — one full line per call,
+    /// trailing newline included — instead of buffering. Call before `load`.
+    pub fn setPrint(self: *Session, func: PrintFn, ctx: ?*anyopaque) void {
+        self.vm.print_fn = func;
+        self.vm.print_ctx = ctx;
+    }
+
+    /// Register a native function under `name`, callable from the script. Must be
+    /// called before `load` (natives are injected as globals when modules load).
+    pub fn registerHost(self: *Session, name: []const u8, func: HostFn) Error!void {
+        std.debug.assert(!self.loaded); // register host functions before load()
+        const a = self.arena.allocator();
+        const nf = try a.create(NativeFn);
+        nf.* = .{ .name = name, .func = func };
+        try self.natives.append(a, nf);
+    }
+
+    /// Compile `modules` (dependency order, entry last) and run each module's
+    /// top-level code **once** to define its functions/consts and populate
+    /// globals — but not `main`. After this, `resolve`/`call` are ready. Errors:
+    /// `Compile` (see `compileDiagnostics`), `Runtime` (see `lastError`), OOM.
+    pub fn load(self: *Session, modules: []const ProgramModule) LoadError!void {
+        std.debug.assert(!self.loaded);
+        const a = self.arena.allocator();
+        var diags: std.ArrayList(lexer.Diagnostic) = .empty;
+        const compiled = compileAll(a, &diags, modules, false) catch |e| switch (e) {
+            error.Compile => {
+                self.compile_diags = try diags.toOwnedSlice(a);
+                return error.Compile;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        const cache = try a.alloc(?*Value, compiled.global_cache_count);
+        @memset(cache, null);
+        self.vm.global_cache = cache;
+        self.programs = compiled.programs;
+
+        // Mirror VM.run's per-module setup, but (a) reserve headroom for the
+        // registered natives so the globals map is sized once and never rehashes
+        // (the inline cache stores pointers into it), and (b) inject the natives
+        // alongside the builtins. Then run each module's top-level script.
+        try self.vm.stack.ensureTotalCapacity(a, 1024);
+        try self.vm.frames.ensureTotalCapacity(a, 256);
+        for (self.programs) |program| {
+            const mod = program.script.module;
+            try mod.globals.ensureTotalCapacity(a, @intCast(mod.global_count + self.natives.items.len));
+            inline for (builtin_names, 0..) |bn, i| {
+                try mod.globals.put(a, bn, .{ .builtin = @enumFromInt(i) });
+            }
+            for (self.natives.items) |nf| {
+                try mod.globals.put(a, nf.name, .{ .native = nf });
+            }
+            try self.vm.frames.append(a, .{ .func = program.script, .upvalues = &.{}, .ip = 0, .base = 0, .code = program.script.chunk.code.items });
+            self.vm.exec() catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Runtime => {
+                    self.last_error = self.vm.runtime_error;
+                    self.resetExec();
+                    return error.Runtime;
+                },
+            };
+        }
+        self.loaded = true;
+    }
+
+    /// Convenience: load a single module (the common single-file case).
+    pub fn loadModule(self: *Session, module: Module) LoadError!void {
+        return self.load(&.{.{ .module = module }});
+    }
+
+    /// Resolve a top-level function `name` in the entry module to a reusable
+    /// handle, or null if `name` isn't a defined callable.
+    pub fn resolve(self: *Session, name: []const u8) ?FnHandle {
+        if (!self.loaded or self.programs.len == 0) return null;
+        const entry = self.programs[self.programs.len - 1].script.module;
+        const v = entry.globals.get(name) orelse return null;
+        return switch (v) {
+            .closure, .bound_method, .native, .builtin, .type, .enum_ctor => .{ .callee = v, .name = name },
+            else => null,
+        };
+    }
+
+    /// Call a resolved handle with `args`, returning its result. Reuses the
+    /// persistent stack (no per-call setup allocation beyond what the script
+    /// body does). Detects re-entrancy (a host function calling back into this
+    /// same Session) and, after a runtime error, resets the stack so the Session
+    /// stays usable for the next call. Never panics: bad scripts return errors.
+    pub fn call(self: *Session, handle: FnHandle, args: []const Value) CallError!Value {
+        if (self.running) return error.Reentrant;
+        self.running = true;
+        defer self.running = false;
+        self.last_error = null;
+        return self.vm.callValueSync(handle.callee, args) catch |e| switch (e) {
+            error.OutOfMemory => {
+                self.resetExec();
+                return error.OutOfMemory;
+            },
+            error.Runtime => {
+                self.last_error = self.vm.runtime_error;
+                self.resetExec();
+                return error.Runtime;
+            },
+        };
+    }
+
+    /// The last runtime error (message + line/col), set when `call`/`load`
+    /// returned `error.Runtime`. Valid until the Session is destroyed.
+    pub fn lastError(self: *Session) ?RuntimeError {
+        return self.last_error;
+    }
+
+    /// Diagnostics from the last `load` that returned `error.Compile`.
+    pub fn compileDiagnostics(self: *Session) []const lexer.Diagnostic {
+        return self.compile_diags;
+    }
+
+    /// Clear the executor back to an idle state (empty stack/frames/handlers)
+    /// after an error, so the Session can be called again.
+    fn resetExec(self: *Session) void {
+        self.vm.frames.clearRetainingCapacity();
+        self.vm.stack.clearRetainingCapacity();
+        self.vm.handlers.clearRetainingCapacity();
+        self.vm.open_upvalues.clearRetainingCapacity();
+        self.vm.thrown_value = null;
+        self.vm.runtime_error = null;
+        self.vm.forcing = false;
+    }
+};
 
 // --- tests -------------------------------------------------------------------
 
@@ -4489,4 +4830,131 @@ test "vm: std.test (the bundled framework) runs a suite, matching the interprete
         "import std.test\nfunc ok():\n    test.assert_eq([1, 2], [1, 2])\nfunc bad():\n    test.assert(false, \"nope\")\nfunc main():\n    print(test.run([(\"ok\", ok), (\"bad\", bad)]))",
         "ok   - ok\nFAIL - bad: assertion failed: nope\n1 passed, 1 failed\nfalse\n",
     );
+}
+
+// --- embedding API tests -----------------------------------------------------
+// A host (like the Strata engine) drives the VM through `Session`: register a
+// native, load a script once, resolve a function, call it many times.
+
+const EmbedCtx = struct { base: i64, calls: usize = 0 };
+
+/// A native `host_add(a, b)` that reaches its engine context: returns
+/// `a + b + ctx.base` and records that it was called.
+fn embedHostAdd(ctx: ?*anyopaque, args: []const Value) HostError!Value {
+    const c: *EmbedCtx = @ptrCast(@alignCast(ctx.?));
+    c.calls += 1;
+    if (args.len != 2) return error.HostFailure;
+    const a = asInt(args[0]) orelse return error.HostFailure;
+    const b = asInt(args[1]) orelse return error.HostFailure;
+    return intValue(a + b + c.base);
+}
+
+test "embed: host function, persistent state, repeated calls, and clean errors" {
+    const gpa = testing.allocator;
+    var ctx = EmbedCtx{ .base = 100 };
+
+    var tree = try parser.parse(gpa,
+        \\var total = 0
+        \\
+        \\func bump(x):
+        \\    total = total + host_add(x, 10)
+        \\    return total
+        \\
+        \\func boom():
+        \\    raise "kaboom"
+    );
+    defer tree.deinit();
+
+    const session = try Session.init(gpa, &ctx);
+    defer session.deinit();
+    try session.registerHost("host_add", embedHostAdd);
+    try session.loadModule(tree.module);
+
+    // Resolve once, call many. host_add(x, 10) = x + 10 + base(100); `total` is
+    // a module global that persists across calls, so the sums accumulate.
+    const bump = session.resolve("bump").?;
+    const r1 = try session.call(bump, &.{intValue(1)});
+    const r2 = try session.call(bump, &.{intValue(2)});
+    const r3 = try session.call(bump, &.{intValue(3)});
+    try testing.expectEqual(@as(i64, 111), asInt(r1).?); // 0   + (1+10+100)
+    try testing.expectEqual(@as(i64, 223), asInt(r2).?); // 111 + (2+10+100)
+    try testing.expectEqual(@as(i64, 336), asInt(r3).?); // 223 + (3+10+100)
+
+    // The native saw the context on each call — proof `ctx` crossed the boundary
+    // (and, since the sums grew, that `total` persisted between calls).
+    try testing.expectEqual(@as(usize, 3), ctx.calls);
+
+    // A script runtime error returns an error with a sensible line/col — no panic.
+    const boom = session.resolve("boom").?;
+    try testing.expectError(error.Runtime, session.call(boom, &.{}));
+    const err = session.lastError().?;
+    try testing.expectEqualStrings("kaboom", err.message);
+    try testing.expectEqual(@as(u32, 8), err.line); // the `raise` line
+    try testing.expect(err.col >= 1);
+
+    // The Session recovered from that error and is still callable.
+    const r4 = try session.call(bump, &.{intValue(0)});
+    try testing.expectEqual(@as(i64, 446), asInt(r4).?); // 336 + (0+10+100)
+}
+
+const PrintCap = struct { alloc: std.mem.Allocator, buf: std.ArrayList(u8) = .empty };
+
+fn embedPrint(ctx: ?*anyopaque, text: []const u8) void {
+    const c: *PrintCap = @ptrCast(@alignCast(ctx.?));
+    c.buf.appendSlice(c.alloc, text) catch {};
+}
+
+test "embed: print routes to the host callback" {
+    const gpa = testing.allocator;
+    var cap = PrintCap{ .alloc = gpa };
+    defer cap.buf.deinit(gpa);
+
+    var tree = try parser.parse(gpa,
+        \\func greet():
+        \\    print("hello")
+        \\    print("world")
+    );
+    defer tree.deinit();
+
+    const session = try Session.init(gpa, null);
+    defer session.deinit();
+    session.setPrint(embedPrint, &cap);
+    try session.loadModule(tree.module);
+    _ = try session.call(session.resolve("greet").?, &.{});
+    try testing.expectEqualStrings("hello\nworld\n", cap.buf.items);
+}
+
+const ReentCtx = struct { session: *Session, handle: ?FnHandle = null, got_reentrant: bool = false };
+
+/// A native that tries to call back into the *same* Session — which must be
+/// rejected with `error.Reentrant` rather than corrupting the shared stack.
+fn embedReentrant(ctx: ?*anyopaque, args: []const Value) HostError!Value {
+    _ = args;
+    const c: *ReentCtx = @ptrCast(@alignCast(ctx.?));
+    if (c.handle) |h| {
+        _ = c.session.call(h, &.{}) catch |e| {
+            if (e == error.Reentrant) c.got_reentrant = true;
+        };
+    }
+    return nilValue();
+}
+
+test "embed: a host function re-entering the same Session is rejected" {
+    const gpa = testing.allocator;
+    var tree = try parser.parse(gpa,
+        \\func run():
+        \\    return probe()
+    );
+    defer tree.deinit();
+
+    var ctx = ReentCtx{ .session = undefined };
+    const session = try Session.init(gpa, &ctx);
+    defer session.deinit();
+    ctx.session = session;
+    try session.registerHost("probe", embedReentrant);
+    try session.loadModule(tree.module);
+
+    ctx.handle = session.resolve("run").?;
+    _ = try session.call(ctx.handle.?, &.{});
+    try testing.expect(ctx.got_reentrant);
 }
