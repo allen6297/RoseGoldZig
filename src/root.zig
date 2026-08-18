@@ -2,6 +2,15 @@
 const std = @import("std");
 const Io = std.Io;
 
+/// The bytecode VM, including the embedding surface (`Session`, host
+/// functions, value marshalling, bytecode serialization) that a host program
+/// like Strata uses. See docs/vm-api.md.
+pub const vm = @import("fontend/vm.zig");
+
+/// The parser. An embedder needs it to turn source into the `Module` that
+/// `Session.load` compiles.
+pub const parser = @import("fontend/parser.zig");
+
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
 /// Accepting an `Io.Writer` instance is a handy way to write reusable code.
