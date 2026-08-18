@@ -269,7 +269,8 @@ nice way to see how the language lowers:
 Besides the CLI, the bytecode VM exposes a small **embedding API** (`vm.zig`) for a
 host program — a game engine, say — that wants to keep a VM alive, register native
 functions, and call script functions every frame. It's a second surface layered on
-the same compiler; the CLI/LSP/DAP paths are untouched.
+the same compiler; the CLI/LSP/DAP paths are untouched. Full signature-level
+reference: [`docs/vm-api.md`](docs/vm-api.md).
 
 ```zig
 const vm = @import("fontend/vm.zig");
