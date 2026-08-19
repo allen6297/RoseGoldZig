@@ -62,6 +62,9 @@ const FuncSig = struct {
     param_names: []const []const u8 = &.{},
     /// An `async` function: a call yields `task<ret>` rather than `ret`.
     is_async: bool = false,
+    /// An `extern` function: the body is supplied by the embedding host, so a
+    /// call site has no parameter names to reorder against (see `typeCall`).
+    is_extern: bool = false,
 };
 
 /// An optional type `?T`, carrying the wrapped type and a pre-formatted name
@@ -649,7 +652,7 @@ const Analyzer = struct {
         }
         const ret: Type = if (f.return_type) |rt| try self.annotationType(rt) else .any;
         const sig = try self.arena.create(FuncSig);
-        sig.* = .{ .params = params, .ret = ret, .required = requiredParamCount(f.params), .param_names = names, .is_async = f.is_async };
+        sig.* = .{ .params = params, .ret = ret, .required = requiredParamCount(f.params), .param_names = names, .is_async = f.is_async, .is_extern = f.extern_abi != null };
         return sig;
     }
 
@@ -1088,8 +1091,17 @@ const Analyzer = struct {
     }
 
     fn analyzeFunc(self: *Analyzer, f: Decl.Func) Error!void {
-        // An abstract method is a bodiless signature — nothing to analyze, and it
-        // needn't "return on all paths".
+        // An abstract method and an extern declaration are bodiless signatures —
+        // nothing to analyze, and neither needs to "return on all paths". The
+        // signature itself is still checked, since call sites are typed by it.
+        if (f.extern_abi) |abi| {
+            if (abi == .c) {
+                try self.report(f.span, "extern \"c\" is not supported yet; only extern \"zig\" (the embedding host's registered natives) is available", .{});
+            }
+            for (f.params) |p| if (p.type) |ann| try self.checkType(ann);
+            if (f.return_type) |rt| try self.checkType(rt);
+            return;
+        }
         if (f.is_abstract) {
             if (f.return_type) |rt| try self.checkType(rt);
             return;
@@ -1794,6 +1806,9 @@ const Analyzer = struct {
         const ct = try self.typeOf(c.callee.*);
         switch (ct) {
             .func => |sig| {
+                // An extern resolves to a host `native` value, which carries no
+                // parameter names for the backends to reorder against.
+                if (sig.is_extern) try self.rejectNamedArgs(c);
                 try self.checkArgs(c, sig.params, sig.param_names, sig.required);
                 // Calling an `async` function yields a `task<ret>`, resolved by `await`.
                 return if (sig.is_async) try self.makeTask(sig.ret) else sig.ret;
@@ -2319,6 +2334,63 @@ test "undefined name is reported with its name" {
     var analysis = try analyzeSource(testing.allocator, "const x: int = y");
     defer analysis.deinit();
     try expectMessageContains(analysis, "y");
+}
+
+test "an extern declaration types its call sites" {
+    // The whole point of declaring the host API in source: calls are checked
+    // against the declared signature even though there is no body.
+    const src =
+        \\extern func host_add(a: int, b: int) -> int
+        \\
+        \\func use() -> int:
+        \\    return host_add(1, 2)
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try testing.expectEqual(@as(usize, 0), analysis.diagnostics.len);
+}
+
+test "extern call-site arity and argument types are reported" {
+    const base = "extern func host_add(a: int, b: int) -> int\n\nfunc use():\n    ";
+    const gpa = testing.allocator;
+
+    var wrong_arity = try analyzeSource(gpa, base ++ "host_add(1)");
+    defer wrong_arity.deinit();
+    try expectMessageContains(wrong_arity, "expected 2 argument(s), got 1");
+
+    var wrong_type = try analyzeSource(gpa, base ++ "host_add(\"nope\", 2)");
+    defer wrong_type.deinit();
+    try expectMessageContains(wrong_type, "cannot pass str where int is expected");
+
+    // An extern resolves to a host native, which carries no parameter names for
+    // either backend to reorder against, so named arguments are rejected.
+    var named = try analyzeSource(gpa, base ++ "host_add(1, b: 2)");
+    defer named.deinit();
+    try expectMessageContains(named, "named argument 'b' is not allowed here");
+}
+
+test "an extern return type flows into the caller" {
+    const src =
+        \\extern func host_name() -> str
+        \\
+        \\func use() -> int:
+        \\    return host_name()
+    ;
+    var analysis = try analyzeSource(testing.allocator, src);
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "str");
+}
+
+test "extern \"c\" is reported as not yet supported" {
+    var analysis = try analyzeSource(testing.allocator, "extern \"c\" func c_sqrt(x: float) -> float");
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "extern \"c\" is not supported yet");
+}
+
+test "an extern signature still resolves its annotations" {
+    var analysis = try analyzeSource(testing.allocator, "extern func f(w: Widget)");
+    defer analysis.deinit();
+    try expectMessageContains(analysis, "Widget");
 }
 
 test "duplicate top-level declaration is reported" {

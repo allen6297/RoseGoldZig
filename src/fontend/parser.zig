@@ -264,6 +264,12 @@ pub const EnumMember = struct {
     span: Span,
 };
 
+/// The linkage of an `extern func` — where the runtime finds its body.
+/// `zig` (the default) resolves the name against the embedding host's
+/// registered natives (`vm.Session.registerHost`); `c` is reserved for
+/// shared-library linkage by C ABI and is not implemented yet.
+pub const ExternAbi = enum { zig, c };
+
 pub const Decl = union(enum) {
     import: Import,
     var_decl: VarDecl,
@@ -291,6 +297,10 @@ pub const Decl = union(enum) {
         /// `abstract func name(params) -> T` (no body): a contract a concrete
         /// subclass must implement. `body` is empty.
         is_abstract: bool = false,
+        /// `extern func name(params) -> T` (no body): the body lives outside the
+        /// language, resolved by linkage at load time. Null when not extern;
+        /// `body` is empty when set. Mutually exclusive with `is_abstract`.
+        extern_abi: ?ExternAbi = null,
         name: []const u8,
         params: []const Param,
         return_type: ?TypeRef,
@@ -458,6 +468,9 @@ const Parser = struct {
     diagnostics: *std.ArrayList(Diagnostic),
     /// Current recursion depth (expressions + statement blocks).
     depth: u32 = 0,
+    /// True while parsing a class/struct member block, so declarations that are
+    /// top-level-only (`extern`) can be rejected with a precise message.
+    in_type_body: bool = false,
 
     /// Enter a nesting level, failing if it is too deep. Pair with `leave`.
     fn enter(self: *Parser) Error!void {
@@ -513,11 +526,16 @@ const Parser = struct {
     }
 
     fn err(self: *Parser, message: []const u8) Error!void {
-        const t = self.peek();
+        try self.errAt(self.peek().span, message);
+    }
+
+    /// Report at an explicit span, for when the offending construct is behind
+    /// the cursor by the time it is rejected (e.g. a parameter list).
+    fn errAt(self: *Parser, span: Span, message: []const u8) Error!void {
         try self.diagnostics.append(self.alloc, .{
             .message = message,
-            .line = t.span.line,
-            .col = t.span.col,
+            .line = span.line,
+            .col = span.col,
         });
     }
 
@@ -581,9 +599,55 @@ const Parser = struct {
         return .default;
     }
 
+    /// `extern` or `extern "abi"`; null when the next token isn't `extern`.
+    /// A bare `extern` defaults to `.zig` — the embedding host's natives.
+    fn parseExternAbi(self: *Parser) Error!?ExternAbi {
+        if (!self.eat(.kw_extern)) return null;
+        if (!self.at(.string_literal)) return .zig;
+        // The token text keeps its quotes and a linkage tag is a bare word,
+        // so match it raw rather than unquoting.
+        const text = self.peek().text;
+        if (std.mem.eql(u8, text, "\"zig\"")) {
+            _ = self.advance();
+            return .zig;
+        }
+        if (std.mem.eql(u8, text, "\"c\"")) {
+            _ = self.advance();
+            return .c;
+        }
+        try self.err("unknown extern linkage; expected \"zig\" or \"c\"");
+        return error.ParseError;
+    }
+
+    /// Validate what may accompany `extern`, with the parser positioned at the
+    /// declaration keyword. Extern is a top-level function signature only.
+    fn checkExternModifiers(self: *Parser, is_abstract: bool, is_static: bool, is_async: bool) Error!void {
+        if (!self.at(.kw_func)) {
+            try self.err("'extern' can only be applied to a function");
+            return error.ParseError;
+        }
+        if (self.in_type_body) {
+            try self.err("'extern' is only allowed on a top-level function");
+            return error.ParseError;
+        }
+        if (is_abstract) {
+            try self.err("'extern' and 'abstract' cannot be combined");
+            return error.ParseError;
+        }
+        if (is_static) {
+            try self.err("'extern' and 'static' cannot be combined");
+            return error.ParseError;
+        }
+        if (is_async) {
+            try self.err("'extern' and 'async' cannot be combined");
+            return error.ParseError;
+        }
+    }
+
     fn parseDecl(self: *Parser) Error!Decl {
         const visibility = self.parseVisibility();
         const is_abstract = self.eat(.kw_abstract);
+        const extern_abi = try self.parseExternAbi();
         const is_static = self.eat(.kw_static);
         const is_async = self.eat(.kw_async);
         if (is_async and !self.at(.kw_func)) {
@@ -594,10 +658,11 @@ const Parser = struct {
             try self.err("'abstract' can only be applied to a class or a method");
             return error.ParseError;
         }
+        if (extern_abi != null) try self.checkExternModifiers(is_abstract, is_static, is_async);
         switch (self.peekKind()) {
             .kw_import => return .{ .import = try self.parseImport() },
             .kw_const, .kw_var => return .{ .var_decl = try self.parseVarDecl(visibility, is_static) },
-            .kw_func => return .{ .func = try self.parseFunc(visibility, is_static, is_async, is_abstract) },
+            .kw_func => return .{ .func = try self.parseFunc(visibility, is_static, is_async, is_abstract, extern_abi) },
             .kw_class => return .{ .class = try self.parseClass(visibility, is_abstract) },
             .kw_struct => return .{ .struct_decl = try self.parseStruct(visibility) },
             .kw_enum => return .{ .enum_decl = try self.parseEnum(visibility) },
@@ -747,19 +812,30 @@ const Parser = struct {
         return params.toOwnedSlice(self.alloc);
     }
 
-    fn parseFunc(self: *Parser, visibility: Visibility, is_static: bool, is_async: bool, is_abstract: bool) Error!Decl.Func {
+    fn parseFunc(self: *Parser, visibility: Visibility, is_static: bool, is_async: bool, is_abstract: bool, extern_abi: ?ExternAbi) Error!Decl.Func {
         const kw = try self.expect(.kw_func, "expected 'func'");
         const name = try self.expect(.identifier, "expected a function name");
         const params = try self.parseParamList();
+        // An extern has no compiled body, so there is nowhere to evaluate a
+        // default (both backends run defaults inside the callee's own function).
+        if (extern_abi != null) {
+            for (params) |p| if (p.default != null) {
+                try self.errAt(p.span, "an extern function parameter cannot have a default value");
+                return error.ParseError;
+            };
+        }
         var return_type: ?TypeRef = null;
         if (self.eat(.arrow)) return_type = try self.parseType();
-        // An abstract method is just a signature — no `:` body.
-        const body: []const Stmt = if (is_abstract) &.{} else try self.parseColonStmtBlock();
+        // An abstract method and an extern declaration are both just a
+        // signature — no `:` body.
+        const bodiless = is_abstract or extern_abi != null;
+        const body: []const Stmt = if (bodiless) &.{} else try self.parseColonStmtBlock();
         return .{
             .visibility = visibility,
             .is_static = is_static,
             .is_async = is_async,
             .is_abstract = is_abstract,
+            .extern_abi = extern_abi,
             .name = name.text,
             .params = params,
             .return_type = return_type,
@@ -972,6 +1048,9 @@ const Parser = struct {
         _ = try self.expect(.colon, "expected ':' to open a block");
         self.skipNewlines();
         _ = try self.expect(.indent, "expected an indented block");
+        const saved_in_type = self.in_type_body;
+        self.in_type_body = true;
+        defer self.in_type_body = saved_in_type;
         var decls: std.ArrayList(Decl) = .empty;
         self.skipNewlines();
         while (!self.at(.dedent) and !self.atEnd()) {
@@ -1666,7 +1745,7 @@ pub const ReplChunk = struct {
 
 fn isDeclStart(kind: TokenKind) bool {
     return switch (kind) {
-        .kw_func, .kw_class, .kw_struct, .kw_enum, .kw_signal, .kw_import, .kw_pub, .kw_private, .kw_static => true,
+        .kw_func, .kw_class, .kw_struct, .kw_enum, .kw_signal, .kw_import, .kw_pub, .kw_private, .kw_static, .kw_extern => true,
         else => false,
     };
 }
@@ -2115,6 +2194,62 @@ test "abstract on a non-class, non-method declaration is rejected" {
     var tree = try parse(testing.allocator, "abstract var x = 1");
     defer tree.deinit();
     try testing.expect(tree.diagnostics.len > 0);
+}
+
+test "parses bodiless extern funcs, defaulting the linkage tag to zig" {
+    const src =
+        \\extern func host_add(a: int, b: int) -> int
+        \\extern "zig" func spawn(kind: str) -> int
+        \\pub extern "c" func c_sqrt(x: float) -> float
+        \\extern func no_return(x: int)
+    ;
+    var tree = try parse(testing.allocator, src);
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+
+    // A bare `extern` and an explicit `extern "zig"` mean the same linkage.
+    const bare = tree.module.decls[0].func;
+    try testing.expectEqual(ExternAbi.zig, bare.extern_abi.?);
+    try testing.expectEqual(@as(usize, 0), bare.body.len);
+    try testing.expectEqual(@as(usize, 2), bare.params.len);
+    try testing.expectEqual(ExternAbi.zig, tree.module.decls[1].func.extern_abi.?);
+
+    // The reserved C linkage parses (the analyzer is what rejects it), and
+    // visibility composes so a module can export its host API.
+    const c_decl = tree.module.decls[2].func;
+    try testing.expectEqual(ExternAbi.c, c_decl.extern_abi.?);
+    try testing.expectEqual(Visibility.public, c_decl.visibility);
+
+    // A missing `-> T` is fine; the return type is just absent.
+    try testing.expect(tree.module.decls[3].func.return_type == null);
+}
+
+test "malformed extern declarations are rejected" {
+    const cases = [_][]const u8{
+        "extern \"rust\" func f()", // unknown linkage tag
+        "extern var x = 1", // not a function
+        "extern async func f()", // async has no meaning without a body
+        "extern static func f()",
+        "extern abstract func f()",
+        "extern func f(a: int = 3)", // no body in which to evaluate a default
+        "extern func f():\n    pass", // an extern must stay bodiless
+    };
+    for (cases) |src| {
+        var tree = try parse(testing.allocator, src);
+        defer tree.deinit();
+        try testing.expect(tree.diagnostics.len > 0);
+    }
+}
+
+test "extern is rejected on a class member" {
+    const src =
+        \\class Engine:
+        \\    extern func tick(dt: float)
+    ;
+    var tree = try parse(testing.allocator, src);
+    defer tree.deinit();
+    try testing.expect(tree.diagnostics.len > 0);
+    try testing.expect(std.mem.indexOf(u8, tree.diagnostics[0].message, "top-level") != null);
 }
 
 test "parses a class with methods, for loop, and if/else" {

@@ -162,14 +162,24 @@ fn scanDecls(alloc: std.mem.Allocator, text: []const u8) ![]Decl {
         const indent = i;
         var rest = l[i..];
         var col = i;
-        // Skip optional visibility and `static` modifiers, noting `pub`.
+        // Skip optional modifiers in grammar order, noting `pub`.
         var is_pub = false;
-        inline for (.{ "pub ", "private ", "static " }) |kw| {
+        inline for (.{ "pub ", "private ", "abstract ", "extern ", "static ", "async " }) |kw| {
             if (std.mem.startsWith(u8, rest, kw)) {
                 if (kw[0] == 'p' and kw[1] == 'u') is_pub = true;
                 rest = rest[kw.len..];
                 col += kw.len;
             }
+        }
+        // `extern` may carry a linkage tag (`extern "zig" func …`). Nothing else
+        // starts a declaration line with a quote, so this is safe to try always.
+        if (rest.len > 0 and rest[0] == '"') {
+            var j: usize = 1;
+            while (j < rest.len and rest[j] != '"') j += 1;
+            if (j < rest.len) j += 1; // closing quote
+            while (j < rest.len and (rest[j] == ' ' or rest[j] == '\t')) j += 1;
+            rest = rest[j..];
+            col += j;
         }
         const m = matchKeyword(rest) orelse continue;
         const after = rest[m.len..];

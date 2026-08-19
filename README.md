@@ -311,6 +311,8 @@ while (frame < 3) : (frame += 1) {                 // …call it many times
   ordinary global. Under the hood a native is just another callable `Value`, so
   `host_add(a, b)` compiles to the same `get_global` + `call` as any function and rides
   the existing inline cache — no separate dispatch path. Register before `load`.
+  **`registerFn` (below) is usually the better call** — it takes a plain Zig function
+  and writes the unpacking for you.
 - **Value marshalling.** `intValue`/`floatValue`/`boolValue`/`strValue`/`nilValue` go
   host → VM; `asInt`/`asFloat`/`asBool`/`asStr` come back (returning `null` on a kind
   mismatch), and `kindOf(v)` reports the kind first (`int` widens to `float` in the
@@ -325,6 +327,92 @@ while (frame < 3) : (frame += 1) {                 // …call it many times
   state** — use one per thread (one world per thread is fine). If a host function tries
   to call back into the *same* Session while it's running, `call` returns
   `error.Reentrant` instead of corrupting the stack.
+
+### Declaring the host API in script (`extern`)
+
+`registerHost` alone leaves the boundary untyped: the script just sees a global, so the
+analyzer can't check a call and the editor can't describe one. An **`extern func`**
+declares the host binding in RoseGold source — a signature with no body, resolved by
+*linkage* at load time rather than by a definition:
+
+```rosegold
+## Bindings provided by the engine.
+pub extern func host_add(a: int, b: int) -> int
+extern "zig" func spawn(kind: str, x: float, y: float) -> int
+
+func update(frame: int) -> int:
+    return host_add(frame, 10)
+```
+
+This is Zig's own `extern fn` model, with `Session.registerHost` in the linker's seat —
+and, as in Zig, the declared signature is an **unchecked promise**: linkage verifies the
+name is registered, not that the host's Zig function matches the types you wrote.
+
+- **Call sites get checked.** Arity and argument/return types are enforced against the
+  declaration, and `hover`, `documentSymbol`, `fmt`, and `doc` all work on the host API —
+  it's an ordinary declaration to every tool.
+- **Unregistered means load failure.** A missing native fails when the module loads, the
+  way a linker rejects an undefined symbol, rather than surfacing a confusing "undefined
+  name" at the first call. (So a script using `extern` can't run under the plain
+  `run --vm` CLI — there's no host to register anything.)
+- **A shared bindings module is the intended shape.** One `engine.rg` declaring every
+  `pub extern`, imported by each game script; natives are injected into every module's
+  globals, so it links wherever it's declared.
+- **Linkage tags.** Bare `extern` means `extern "zig"` — the embedding host's registered
+  natives. `extern "c"` is *reserved* for shared-library linkage by C ABI and currently
+  reports "not supported yet"; the syntax exists so adding it later doesn't churn the
+  language.
+- **Limits.** Top-level only (not a class member), no default parameter values, and no
+  named arguments at a call site — a native carries no parameter names for either backend
+  to reorder against. The tree-walker has no embedding API at all, so calling an extern
+  under `run` (without `--vm`) is a runtime error; *declaring* one is fine, so a module
+  can hold bindings and still run its extern-free parts.
+
+### Plain Zig host functions (`registerFn`)
+
+Writing natives against the raw `HostFn` means re-writing the same arity check and
+`asInt`/`asStr` ladder in every one. `registerFn` derives all of it from the Zig
+function's own type at comptime, so you just write Zig:
+
+```zig
+fn spawn(engine: *Engine, kind: []const u8, x: f64, times: i64) i64 {
+    return engine.world.spawn(kind, x, times);
+}
+
+try session.registerFn("spawn", spawn);
+```
+
+- An optional **leading `*Ctx`** parameter receives the Session context. There's no
+  ambiguity: no script value marshals into a single-item pointer, so `[]const u8` is
+  still an ordinary `str` parameter. (The cast to `*Ctx` is *unchecked* — `Session.init`
+  erases the type — so it must match what you passed there. It's the one part of the
+  boundary `wrap` can't verify.)
+- Parameters and the return may be any int or float type, `bool`, `[]const u8`, `void`,
+  or a raw `vm.Value` for "any". Anything else is a **compile error at the `registerFn`
+  call site**, naming the type. The return may be an error union — a returned error
+  becomes a catchable RoseGold error (`OutOfMemory` propagates).
+- `int` widens to `float` as it does everywhere else in the language, and integers are
+  range-checked on the way in.
+
+The payoff beyond ergonomics is that `registerFn` also **records the signature**, which
+turns the `extern` declaration from a promise into a checked contract:
+
+```
+extern func spawn(kind: str, x: float, times: int) -> int    # ✓ matches
+extern func spawn(kind: int, x: float, times: int) -> int    # ✗ at load:
+#   extern 'spawn' parameter 1: declared int, but the host takes str
+```
+
+That check runs at **load**, before any call — so a script and an engine that disagree
+fail immediately and legibly, rather than at the ABI boundary the way C (and Zig's own
+`extern fn`) would. Arguments are checked at **call** time too, which matters for
+`Session.call` from the host since it bypasses the analyzer entirely: you get
+`spawn argument 2: expected float, got str` instead of an opaque failure. Both checks
+stay lenient where the language is — `any` on either side opts out.
+
+`registerHost` remains for natives that want the raw `[]const Value` (variadic-ish
+shapes, or hand-tuned unpacking); those keep the old unchecked behavior. `vm.wrap` is
+exported on its own if you want the generated marshalling without the signature.
 
 ### Bytecode serialization
 

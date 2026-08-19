@@ -1386,6 +1386,13 @@ pub const Interpreter = struct {
         defer self.call_depth -= 1;
         if (self.call_depth > max_call_depth) return self.fail(span, "call stack overflow (too much recursion)", .{});
         const func = fv.decl;
+        // An extern's body is supplied by an embedding host, and only the VM has
+        // an embedding API (`vm.Session`), so the tree-walker can never resolve
+        // one. Declaring it is fine — analysis, `fmt` and `doc` all work — but
+        // calling it here cannot.
+        if (func.extern_abi != null) {
+            return self.fail(span, "extern function '{s}' is not available in this backend (use --vm with an embedding host)", .{func.name});
+        }
         // Run in the function's home module, so its body sees that module's
         // globals rather than the caller's. A plain function has no receiver or
         // statics in scope.
@@ -3113,6 +3120,25 @@ test "list index out of range is a runtime error" {
     defer result.deinit();
     try testing.expect(result.runtime_error != null);
     try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "out of range") != null);
+}
+
+test "calling an extern is a runtime error in the tree-walker" {
+    // Only the VM has an embedding API, so the tree-walker can never link one.
+    var result = try runSource(testing.allocator,
+        \\extern func host_add(a: int, b: int) -> int
+        \\
+        \\func main():
+        \\    print(host_add(1, 2))
+    );
+    defer result.deinit();
+    try testing.expect(result.runtime_error != null);
+    try testing.expect(std.mem.indexOf(u8, result.runtime_error.?.message, "extern function 'host_add' is not available") != null);
+}
+
+test "declaring an extern without calling it runs fine" {
+    // Declaration is analysis-only, so a shared module can declare host bindings
+    // and still run its extern-free parts under the tree-walker.
+    try expectOutput("extern func host_add(a: int, b: int) -> int\n\nfunc main():\n    print(1 + 2)", "3\n");
 }
 
 test "a program with no main produces no output" {

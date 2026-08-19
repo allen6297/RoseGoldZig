@@ -118,6 +118,16 @@ fn visPrefix(v: Visibility) []const u8 {
     };
 }
 
+/// The canonical `extern` prefix. The tag is omitted for the default (`zig`)
+/// linkage, the way a default visibility prints as nothing, so the common case
+/// stays terse and an explicit tag means "not the default".
+fn externPrefix(abi: ?parser.ExternAbi) []const u8 {
+    return switch (abi orelse return "") {
+        .zig => "extern ",
+        .c => "extern \"c\" ",
+    };
+}
+
 const Formatter = struct {
     gpa: std.mem.Allocator,
     buf: *std.ArrayList(u8),
@@ -215,6 +225,7 @@ const Formatter = struct {
             .func => |f| {
                 try self.w(visPrefix(f.visibility));
                 if (f.is_abstract) try self.w("abstract ");
+                try self.w(externPrefix(f.extern_abi));
                 if (f.is_static) try self.w("static ");
                 if (f.is_async) try self.w("async ");
                 try self.w("func ");
@@ -291,6 +302,7 @@ const Formatter = struct {
         try self.pad();
         try self.w(visPrefix(f.visibility));
         if (f.is_abstract) try self.w("abstract ");
+        try self.w(externPrefix(f.extern_abi));
         if (f.is_static) try self.w("static ");
         if (f.is_async) try self.w("async ");
         try self.w("func ");
@@ -300,8 +312,8 @@ const Formatter = struct {
             try self.w(" -> ");
             try self.typeRef(rt);
         }
-        // An abstract method is a bodiless signature — no `:` block.
-        if (f.is_abstract) {
+        // An abstract method and an extern declaration are bodiless — no `:` block.
+        if (f.is_abstract or f.extern_abi != null) {
             try self.nl();
             return;
         }
@@ -788,6 +800,19 @@ test "formats a function canonically" {
     const out = try fmt(gpa, "func  add(a:int,b:int)->int:\n        return a+b*2");
     defer gpa.free(out);
     try testing.expectEqualStrings("func add(a: int, b: int) -> int:\n    return a + b * 2\n", out);
+}
+
+test "formats extern declarations, omitting the default linkage tag" {
+    const gpa = testing.allocator;
+    // A bodiless extern gets no `:` block, and `"zig"` — the default — is
+    // dropped the way a default visibility prints as nothing, while a
+    // non-default linkage is always spelled out.
+    const out = try fmt(gpa, "pub extern   \"zig\"   func host_add(a:int,b:int)->int\nextern \"c\" func c_sqrt(x:float)->float\n");
+    defer gpa.free(out);
+    try testing.expectEqualStrings(
+        "pub extern func host_add(a: int, b: int) -> int\n\nextern \"c\" func c_sqrt(x: float) -> float\n",
+        out,
+    );
 }
 
 test "formats default parameter values" {

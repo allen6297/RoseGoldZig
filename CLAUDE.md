@@ -27,7 +27,7 @@ zig build run -- fmt FILE.rg    # print FILE re-formatted (canonical style); -w 
 zig build run -- doc FILE.rg    # print Markdown API docs from FILE's ## comments (stdout)
 zig build run -- lsp            # run the Language Server over stdio (for editors)
 zig build run -- dap            # run the Debug Adapter over stdio (breakpoints, stepping)
-zig build test                  # run every test (445 as of writing)
+zig build test                  # run every test (462 as of writing)
 
 # Fast iteration on one layer — imports pull in its dependencies, so this
 # also runs the tests of the files it imports:
@@ -65,7 +65,7 @@ Note the directory is spelled **`fontend`** (a typo baked into the real path —
 | `src/root.zig` | Leftover `zig init` scaffold (unused by the language; do not build on it). |
 | `build.zig` | Build. Exe = `main.zig`; frontend test target = `tests.zig`. Registers the `std/*.rg` files as named `@embedFile` imports on the frontend test module (they live outside `src/`) so tests can embed them. |
 | `std/*.rg` | The **standard library**, written in RoseGold itself: `lists.rg`, `strings.rg`, `mathx.rg`, `sets.rg`, `test.rg` (a unit-test framework). Imported as `import std.lists` etc.; the CLI auto-discovers the `std/` root so no `--path` is needed (see **Standard library**). Runs on both backends. |
-| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, `defaults.rg`, `features.rg` (bitwise/slicing/named-args/comprehensions), `async.rg` (async/await/gather), `patterns.rg` (match guards + tuple/list destructuring), `enums.rg` (tagged-union enums — payloads, recursive trees, first-class case constructors), `stddemo.rg` (uses the bundled `std/` library), and `selftest.rg` (a `std.test` suite — all run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
+| `examples/*.rg` | Sample programs: `demo.rg` (single file), `app.rg` + `mathutil.rg` + `geometry.rg` (modules — runs on both backends), `messy.rg` (badly-formatted input for `fmt`), `primes.rg`, `signals.rg`, `mathdemo.rg`, `defaults.rg`, `features.rg` (bitwise/slicing/named-args/comprehensions), `async.rg` (async/await/gather), `patterns.rg` (match guards + tuple/list destructuring), `enums.rg` (tagged-union enums — payloads, recursive trees, first-class case constructors), `stddemo.rg` (uses the bundled `std/` library), and `selftest.rg` (a `std.test` suite — all run on both backends). `pathdemo.rg` + `libs/strutil.rg` demo module search paths (`run --path examples/libs examples/pathdemo.rg`). `extern.rg` declares host bindings (`extern func`) — deliberately **not runnable** from the CLI (no host to register the natives); it's there for `check`/`fmt`/`doc`. `tour.repl` is a REPL input script (`repl < examples/tour.repl`). |
 
 Each layer imports the ones below it (`interpreter`/`analyzer` → `parser` → `lexer`,
 and `loader`/`formatter` → `parser`); there are no upward dependencies. `main.zig`
@@ -123,6 +123,8 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   Rect(w, h), Empty }`; the payload is a param list, so a case is a first-class
   constructor `Shape.Circle(2.0)` and `match` destructures it via `Shape.Circle(r)` —
   see **Tagged-union enums**),
+  `extern func name(params) -> R` (no body — a host binding resolved by linkage;
+  see **Extern functions**),
   `signal name(params)`. `pub`/`private` visibility; `static` on a class/struct
   member makes it belong to the type (shared storage / no receiver), reached via
   `Type.member`. `abstract` on a `class` (can't be constructed) or on a method
@@ -686,6 +688,77 @@ drives the loader, then the analyzer and interpreter over the loaded module set
   (per-call allocations live until `deinit` — return scalars in a per-frame loop); compiled
   bytecode isn't shared across Sessions/Images (each deserializes its own copy). See the
   README's **Embedding the VM** section.
+
+### Extern functions
+- **`extern func host_add(a: int, b: int) -> int`** declares a host binding *in RoseGold
+  source*: a bodiless signature resolved by **linkage** at load time rather than by a
+  definition. Modeled on Zig's `extern fn` with `Session.registerHost` as the linker — and,
+  as in Zig, the declared signature is an **unchecked promise** (linkage verifies the name
+  is registered, not that the host's Zig fn matches). This is what makes the embedding
+  boundary typed: without it a native is just an untyped global (`unknown` to the analyzer).
+- **Linkage tags.** Bare `extern` ⇒ `extern "zig"` (the embedding host's registered
+  natives, the only implemented linkage). `extern "c"` parses and is stored, but the
+  analyzer reports "not supported yet" and the VM compiler refuses — reserved for
+  shared-library/C-ABI FFI so adding it later doesn't churn the language. `parser.ExternAbi`
+  = `enum { zig, c }`; `Decl.Func.extern_abi: ?ExternAbi` (null ⇒ not extern), riding the
+  same bodiless-decl machinery as `is_abstract`.
+- **Restrictions** (all parser errors except the last two): top-level only (not a class
+  member), no `abstract`/`static`/`async`, no **default parameter values** (there's no
+  compiled body in which to evaluate one — both backends run defaults inside the callee),
+  and no **named arguments** at a call site (analyzer — a `.native` carries no
+  `param_names` to reorder against). An unknown tag is rejected too.
+- **VM.** The compiler skips externs entirely (no `Function` is compiled, and nothing
+  `define_global`s over the name), then emits one **`check_extern`** opcode (u16 name
+  const + u16 signature const) per extern into the script body. `Session.runTopLevel` injects natives into every
+  module's globals *before* running the scripts, so the global is already the `.native` and
+  ordinary `get_global` + inline cache + `call`'s `.native` arm handle the rest — **no new
+  call machinery, no new `Value` tag**. `check_extern` fails at *load* ("extern function
+  'X' is not registered by the host") the way a linker rejects an undefined symbol, rather
+  than deferring a confusing "undefined name" to the first call. Being bytecode, it rides
+  the existing chunk serialization for free, so an extern survives an `Image` round-trip
+  and re-links on `loadImage`.
+- **Interpreter.** The tree-walker has no embedding API, so `callFunction` fails at call
+  time ("extern function 'X' is not available in this backend"). *Declaring* one is fine —
+  analysis, `fmt`, `doc` and the LSP all work — so a module can hold bindings and still run
+  its extern-free parts under `run`.
+- **Cross-module** works: a shared `pub extern` bindings module imported by each script is
+  the intended shape (natives land in every module's globals).
+- **fmt** canonicalizes the default tag away (`extern "zig" func` → `extern func`) and keeps
+  a non-default one, mirroring how a default visibility prints as nothing.
+
+### Comptime-wrapped natives (`Session.registerFn` / `vm.wrap`)
+- **`registerFn(name, f)` takes a plain Zig function** and derives everything from its
+  type: `wrap(f)` generates the argument unpacking + result boxing (`@typeInfo(F).@"fn"`
+  + `std.meta.ArgsTuple`), and `signatureOf(f)` records its shape. So a host writes
+  `fn spawn(e: *Engine, kind: []const u8, x: f64) i64` instead of a hand-rolled
+  `asInt`/arity ladder over `[]const Value`. `registerHost(name, hostFn)` is unchanged
+  (raw `HostFn`, no signature, unchecked) and both funnel through `registerNative`.
+- **Ctx detection is total, not heuristic:** a leading **single-item pointer** param
+  (`*Engine`) is the Session context, because no script value can marshal into one —
+  while `[]const u8` is a slice, so it stays an ordinary `str` param. Supported types:
+  any int/float width, `bool`, `[]const u8`, `void`, and raw `Value` (⇒ `any`);
+  anything else is a **`@compileError` at the `registerFn` call site**. The `*Ctx` cast
+  itself stays **unchecked** (`Session.init` erases the type to `?*anyopaque`) — the one
+  part of the boundary `wrap` can't verify; making it checkable would mean a
+  `Session(Ctx)` generic, which would break the existing API. The return may
+  be an error union (error ⇒ catchable `HostFailure`, `OutOfMemory` propagates). Ints
+  are range-checked via `std.math.cast`; **`int` widens to `float`** in `unbox` (the
+  raw `asFloat` stays strict — `wrap` is the layer that follows language semantics).
+- **`HostKind` = `enum { any, int, float, bool, str, void }`**, `HostSignature =
+  { params, ret }`, stored as `NativeFn.signature: ?HostSignature` (null ⇒ raw
+  registration ⇒ unchecked, exactly as before). `hostKindFlows(from, to)` is
+  **directional** — an argument flows script→host, a result flows host→script — so
+  declaring `int` for a host `f64` *param* is fine but declaring an `int` *return* for
+  an `f64` result is not. `any` on either side opts out.
+- **Two checks a raw `registerHost` can't have.** (1) At **load**, `check_extern`
+  compares the declaration against the registered native — the declared kinds ride
+  along as a short string constant (`"sfi:f"` = params, `':'`, return; see
+  `encodeHostKind`/`declaredHostKind`), so it serializes with the constant pool and
+  needs no new image tables. This closes the unchecked-promise hole Zig's `extern fn`
+  and a C linker both leave open. (2) At **call**, `VM.checkHostArgs` validates argc +
+  kinds before dispatch, so a mismatch is `spawn argument 2: expected float, got str`
+  rather than an opaque `HostFailure` — which matters because `Session.call` from the
+  host bypasses the analyzer entirely.
 
 ### Bytecode serialization (`vm.serialize`/`deserialize`)
 - Compile once, write the compiled program to bytes, reload later with **no source and no

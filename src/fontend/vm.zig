@@ -173,9 +173,246 @@ pub const HostError = error{ HostFailure, OutOfMemory };
 /// returned string must outlive the call — the VM borrows it).
 pub const HostFn = *const fn (ctx: ?*anyopaque, args: []const Value) HostError!Value;
 
+/// A parameter or return kind in a registered native's signature. `any` accepts
+/// (and yields) anything — it is what a raw `Value` parameter and every
+/// non-scalar declared type map to, keeping the check as lenient as the rest of
+/// the language rather than inventing a second, stricter type system.
+pub const HostKind = enum { any, int, float, bool, str, void };
+
+/// The shape of a native, derived at comptime by `signatureOf`. When a
+/// registered native carries one, the VM checks arguments before dispatching
+/// (so a mismatch is a clean RoseGold error naming the parameter, not a silent
+/// `HostFailure`), and `check_extern` compares it against the `extern func`
+/// declaration at load — closing the unchecked-promise hole that a C linker,
+/// and plain `registerHost`, both leave open.
+pub const HostSignature = struct {
+    params: []const HostKind,
+    ret: HostKind,
+};
+
 /// A registered native, stored as a `.native` global so ordinary name
 /// resolution + the inline cache reach it (see the design note by `Session`).
-const NativeFn = struct { name: []const u8, func: HostFn };
+/// `signature` is null for a raw `registerHost` (unchecked, as before) and set
+/// for `registerFn`, which derives it from the Zig function's own type.
+const NativeFn = struct {
+    name: []const u8,
+    func: HostFn,
+    signature: ?HostSignature = null,
+};
+
+// --- embedding: comptime-generated marshalling --------------------------------
+//
+// `registerHost` takes a raw `HostFn` and leaves unpacking to the host: every
+// native re-writes the same arity check + `asInt`/`asStr` ladder. `wrap` derives
+// that ladder from the Zig function's type instead, so a host registers plain
+// Zig (`fn(*Engine, i64, i64) i64`) and gets marshalling, arity checking, and a
+// signature for load-time verification for free.
+
+/// Whether `f`'s first parameter is the host context rather than a script
+/// argument. Unambiguous: no script value can marshal into a single-item
+/// pointer, so `*Engine` can only be the context, while `[]const u8` (a slice)
+/// is an ordinary `str` parameter.
+fn hasCtxParam(comptime F: type) bool {
+    const info = @typeInfo(F).@"fn";
+    if (info.params.len == 0) return false;
+    const P = info.params[0].type orelse return false;
+    return switch (@typeInfo(P)) {
+        .pointer => |p| p.size == .one,
+        else => false,
+    };
+}
+
+/// The `HostKind` a Zig type marshals as. A compile error here is the point:
+/// an unsupported parameter type should fail at the `registerFn` call site,
+/// naming the type, rather than at runtime.
+fn hostKindOf(comptime T: type) HostKind {
+    if (T == Value) return .any;
+    if (T == void) return .void;
+    if (T == bool) return .bool;
+    if (T == []const u8) return .str;
+    return switch (@typeInfo(T)) {
+        .int => .int,
+        .float => .float,
+        else => @compileError("host function: unsupported type '" ++ @typeName(T) ++
+            "' (use an integer, a float, bool, []const u8, void, or vm.Value)"),
+    };
+}
+
+/// Like `hostKindOf`, but unwraps an error union so `fn(...) HostError!i64` and
+/// `fn(...) i64` describe the same signature.
+fn hostReturnKind(comptime R: type) HostKind {
+    return switch (@typeInfo(R)) {
+        .error_union => |eu| hostKindOf(eu.payload),
+        else => hostKindOf(R),
+    };
+}
+
+/// VM value → Zig value, or null when the kinds don't line up. `int` widens to
+/// `float` here (as it does everywhere in the language) even though the raw
+/// `asFloat` stays strict — `wrap` is the layer that follows language
+/// semantics, while the raw accessors leave coercion to the host.
+fn unbox(comptime T: type, v: Value) ?T {
+    if (T == Value) return v;
+    if (T == bool) return asBool(v);
+    if (T == []const u8) return asStr(v);
+    switch (@typeInfo(T)) {
+        .int => return std.math.cast(T, asInt(v) orelse return null),
+        .float => {
+            if (asFloat(v)) |x| return @floatCast(x);
+            if (asInt(v)) |n| return @floatFromInt(n);
+            return null;
+        },
+        else => @compileError("unreachable: hostKindOf rejects this type"),
+    }
+}
+
+/// Zig value → VM value.
+fn box(comptime T: type, x: T) Value {
+    if (T == Value) return x;
+    if (T == void) return nilValue();
+    if (T == bool) return boolValue(x);
+    if (T == []const u8) return strValue(x);
+    return switch (@typeInfo(T)) {
+        .int => intValue(@intCast(x)),
+        .float => floatValue(@floatCast(x)),
+        else => @compileError("unreachable: hostKindOf rejects this type"),
+    };
+}
+
+/// Generate a `HostFn` that unpacks `args` into `f`'s parameters and boxes its
+/// result. An optional leading `*Ctx` parameter receives the Session context.
+/// `f` may return `T` or `E!T`; a returned error becomes `HostFailure` except
+/// `OutOfMemory`, which propagates.
+pub fn wrap(comptime f: anytype) HostFn {
+    const F = @TypeOf(f);
+    const info = @typeInfo(F).@"fn";
+    const skip = comptime @intFromBool(hasCtxParam(F));
+    return struct {
+        fn call(ctx: ?*anyopaque, args: []const Value) HostError!Value {
+            // The VM checks arity/kinds ahead of the call whenever a signature
+            // is registered, so these guards are a backstop for a `wrap`ped fn
+            // reached some other way.
+            if (args.len != info.params.len - skip) return error.HostFailure;
+            var tuple: std.meta.ArgsTuple(F) = undefined;
+            if (skip == 1) tuple[0] = @ptrCast(@alignCast(ctx orelse return error.HostFailure));
+            inline for (info.params[skip..], 0..) |p, i| {
+                tuple[i + skip] = unbox(p.type.?, args[i]) orelse return error.HostFailure;
+            }
+            const R = info.return_type.?;
+            const result = @call(.auto, f, tuple);
+            return switch (@typeInfo(R)) {
+                .error_union => |eu| box(eu.payload, result catch |e| {
+                    return if (e == error.OutOfMemory) error.OutOfMemory else error.HostFailure;
+                }),
+                else => box(R, result),
+            };
+        }
+    }.call;
+}
+
+/// The `HostSignature` of a plain Zig function, derived from its type. Paired
+/// with `wrap` by `Session.registerFn`.
+pub fn signatureOf(comptime f: anytype) HostSignature {
+    const F = @TypeOf(f);
+    const info = @typeInfo(F).@"fn";
+    const skip = comptime @intFromBool(hasCtxParam(F));
+    // Container-level consts, so the slice points at static memory.
+    return struct {
+        const kinds = blk: {
+            var out: [info.params.len - skip]HostKind = undefined;
+            for (info.params[skip..], 0..) |p, i| out[i] = hostKindOf(p.type.?);
+            const frozen = out;
+            break :blk frozen;
+        };
+        const sig = HostSignature{ .params = &kinds, .ret = hostReturnKind(info.return_type.?) };
+    }.sig;
+}
+
+/// Whether a value satisfies a declared kind (used for both the call-time
+/// argument check and the load-time declaration check).
+fn hostKindAccepts(want: HostKind, v: Value) bool {
+    return switch (want) {
+        .any => true,
+        .int => v == .int,
+        .float => v == .float or v == .int, // int widens to float
+        .bool => v == .bool,
+        .str => v == .str,
+        .void => v == .nil,
+    };
+}
+
+/// Whether a value of kind `from` can be supplied where `to` is expected.
+/// Directional, because an argument flows script → host while a result flows
+/// host → script: declaring `int` for a host `f64` parameter is fine (int widens
+/// to float), but declaring an `int` return for a host `f64` result is not.
+/// `any` on either side opts out of the check rather than failing it.
+fn hostKindFlows(from: HostKind, to: HostKind) bool {
+    if (from == .any or to == .any) return true;
+    if (from == .int and to == .float) return true; // int widens to float
+    return from == to;
+}
+
+/// The signature of an `extern func` travels in the bytecode as a short string
+/// — one char per parameter, `':'`, then the return — so it serializes with the
+/// constant pool for free and needs no new image tables.
+fn encodeHostKind(k: HostKind) u8 {
+    return switch (k) {
+        .any => 'a',
+        .int => 'i',
+        .float => 'f',
+        .bool => 'b',
+        .str => 's',
+        .void => 'v',
+    };
+}
+
+fn decodeHostKind(c: u8) HostKind {
+    return switch (c) {
+        'i' => .int,
+        'f' => .float,
+        'b' => .bool,
+        's' => .str,
+        'v' => .void,
+        else => .any,
+    };
+}
+
+/// The `HostKind` a *declared* RoseGold type marshals as. Anything that isn't a
+/// scalar — a list, map, user type, optional or generic — is `any`, so the check
+/// covers exactly what the marshalling layer converts and stays out of the way
+/// otherwise.
+fn declaredHostKind(t: ?parser.TypeRef) HostKind {
+    const tr = t orelse return .any;
+    if (tr.optional or tr.module != null or tr.is_tuple or tr.args.len > 0) return .any;
+    if (std.mem.eql(u8, tr.name, "int")) return .int;
+    if (std.mem.eql(u8, tr.name, "float")) return .float;
+    if (std.mem.eql(u8, tr.name, "bool")) return .bool;
+    if (std.mem.eql(u8, tr.name, "str")) return .str;
+    if (std.mem.eql(u8, tr.name, "void")) return .void;
+    return .any;
+}
+
+fn hostKindName(k: HostKind) []const u8 {
+    return switch (k) {
+        .any => "any",
+        .int => "int",
+        .float => "float",
+        .bool => "bool",
+        .str => "str",
+        .void => "void",
+    };
+}
+
+fn valueKindName(v: Value) []const u8 {
+    return switch (kindOf(v)) {
+        .nil => "nil",
+        .int => "int",
+        .float => "float",
+        .bool => "bool",
+        .str => "str",
+        .other => "a non-scalar value",
+    };
+}
 
 /// Where `print`/`echo` output goes when embedding (see `Session.setPrint`);
 /// when null, output buffers into `VM.output` as the CLI expects.
@@ -376,6 +613,7 @@ const Op = enum(u8) {
     get_global, // u16 name-const index
     set_global, // u16
     define_global, // u16
+    check_extern, // u16 name-const index -> assert the name resolves to a host native
     get_upvalue, // u8 index
     set_upvalue, // u8 index (stores top, keeps it on the stack)
     closure, // u16 func-const index -> capture upvalues, push a Closure
@@ -724,8 +962,11 @@ const Compiler = struct {
         while (type_it.next()) |t| try self.compileConstructor(t.*);
 
         // Compile each top-level function (they capture nothing — no enclosing).
+        // An `extern` has no body to compile: its global is the host native that
+        // `Session` injects before this script runs, so nothing is emitted and
+        // nothing must overwrite it.
         var funcs: std.StringHashMapUnmanaged(*Function) = .{};
-        for (module.decls) |decl| if (decl == .func) {
+        for (module.decls) |decl| if (decl == .func and decl.func.extern_abi == null) {
             const f = try self.compileFunction(decl.func, null);
             try funcs.put(self.alloc, decl.func.name, f);
         };
@@ -744,6 +985,18 @@ const Compiler = struct {
             self.cur.stack_top = 0;
             switch (decl) {
                 .func => |fd| {
+                    if (fd.extern_abi) |abi| {
+                        // `extern "c"` is reserved: the analyzer reports it, and
+                        // the compiler refuses rather than emitting a check that
+                        // could never pass.
+                        if (abi == .c) return self.fail(fd.span, "the --vm backend does not support extern \"c\"", .{});
+                        // Name plus the declared signature, so the load-time
+                        // check can compare it against what the host registered.
+                        try self.emitGlobal(.check_extern, fd.name, fd.span);
+                        const sig = try self.encodeExternSignature(fd);
+                        try self.emitU16(@intCast(try self.constIndex(.{ .str = sig })), fd.span);
+                        continue;
+                    }
                     try self.emitClosure(funcs.get(fd.name).?, fd.span);
                     try self.defineGlobal(fd.name, fd.span);
                 },
@@ -1988,6 +2241,16 @@ const Compiler = struct {
         try self.emitGlobal(.define_global, name, span);
     }
 
+    /// Encode an `extern func`'s declared types for `check_extern` (see
+    /// `encodeHostKind`): one char per parameter, `':'`, then the return.
+    fn encodeExternSignature(self: *Compiler, f: Decl.Func) Error![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        for (f.params) |p| try buf.append(self.alloc, encodeHostKind(declaredHostKind(p.type)));
+        try buf.append(self.alloc, ':');
+        try buf.append(self.alloc, encodeHostKind(declaredHostKind(f.return_type)));
+        return buf.toOwnedSlice(self.alloc);
+    }
+
     /// Emit a `get_global`/`set_global` with its name constant plus a unique
     /// inline-cache slot index (u16), so the VM resolves the name once per site.
     fn emitCachedGlobal(self: *Compiler, op: Op, name: []const u8, span: Span) Error!void {
@@ -2112,6 +2375,48 @@ const VM = struct {
             .col = 1,
         };
         return error.Runtime;
+    }
+
+    /// Compare an `extern func` declaration against the registered native's
+    /// signature, at load. A raw `registerHost` native carries none, so the
+    /// declaration stays an unchecked promise (as in Zig and C); a `registerFn`
+    /// one is verified here, before any call can be made.
+    fn checkExternSignature(self: *VM, name: []const u8, declared: []const u8, nf: *const NativeFn) VMError!void {
+        const sig = nf.signature orelse return;
+        const colon = std.mem.indexOfScalar(u8, declared, ':') orelse return;
+        const params = declared[0..colon];
+        const ret = declared[colon + 1 ..];
+        if (params.len != sig.params.len) {
+            return self.fail("extern '{s}' declares {d} parameter(s) but the host registered {d}", .{ name, params.len, sig.params.len });
+        }
+        // An argument flows script → host…
+        for (params, 0..) |c, i| {
+            const want = decodeHostKind(c);
+            if (!hostKindFlows(want, sig.params[i])) {
+                return self.fail("extern '{s}' parameter {d}: declared {s}, but the host takes {s}", .{ name, i + 1, hostKindName(want), hostKindName(sig.params[i]) });
+            }
+        }
+        // …while the result flows host → script.
+        if (ret.len == 1) {
+            const want = decodeHostKind(ret[0]);
+            if (!hostKindFlows(sig.ret, want)) {
+                return self.fail("extern '{s}': declared return {s}, but the host returns {s}", .{ name, hostKindName(want), hostKindName(sig.ret) });
+            }
+        }
+    }
+
+    /// Check a call against a native's registered signature, if it has one. A
+    /// raw `registerHost` native has none and is called as before.
+    fn checkHostArgs(self: *VM, nf: *const NativeFn, args: []const Value) VMError!void {
+        const sig = nf.signature orelse return;
+        if (args.len != sig.params.len) {
+            return self.fail("{s} expects {d} argument(s), got {d}", .{ nf.name, sig.params.len, args.len });
+        }
+        for (sig.params, 0..) |want, i| {
+            if (!hostKindAccepts(want, args[i])) {
+                return self.fail("{s} argument {d}: expected {s}, got {s}", .{ nf.name, i + 1, hostKindName(want), valueKindName(args[i]) });
+            }
+        }
     }
 
     fn currentLine(self: *VM) u32 {
@@ -2267,6 +2572,20 @@ const VM = struct {
                 .define_global => {
                     const name = chunk.constants.items[self.readU16(frame)].str;
                     try frame.func.module.globals.put(self.alloc, name, self.pop());
+                },
+                // An `extern func` compiles to no body; the embedding host is
+                // expected to have registered a native under the same name
+                // (injected into globals before this script runs). Fail here —
+                // at load — the way a linker rejects an undefined symbol, rather
+                // than surfacing a confusing "undefined name" at the first call.
+                .check_extern => {
+                    const name = chunk.constants.items[self.readU16(frame)].str;
+                    const declared = chunk.constants.items[self.readU16(frame)].str;
+                    const slot = frame.func.module.globals.get(name);
+                    if (slot == null or slot.? != .native) {
+                        return self.fail("extern function '{s}' is not registered by the host", .{name});
+                    }
+                    try self.checkExternSignature(name, declared, slot.?.native);
                 },
                 .get_upvalue => {
                     const idx = self.readByte(frame);
@@ -2820,6 +3139,10 @@ const VM = struct {
             .native => |nf| {
                 const base = self.stack.items.len - argc;
                 const args = self.stack.items[base..];
+                // A `registerFn` native knows its own shape, so a bad call is a
+                // precise RoseGold error naming the parameter rather than the
+                // opaque `HostFailure` a hand-written native can only produce.
+                try self.checkHostArgs(nf, args);
                 const result = nf.func(self.host_ctx, args) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.HostFailure => return self.fail("host function '{s}' failed", .{nf.name}),
@@ -3396,6 +3719,14 @@ fn disasmInstr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), ch: *const Chu
             try out.print(alloc, " {s}", .{ch.constants.items[readU16At(code, offset + 1)].str});
             break :blk offset + 3;
         },
+        // Name plus the declared signature (see `encodeHostKind`).
+        .check_extern => blk: {
+            try out.print(alloc, " {s} sig:{s}", .{
+                ch.constants.items[readU16At(code, offset + 1)].str,
+                ch.constants.items[readU16At(code, offset + 3)].str,
+            });
+            break :blk offset + 5;
+        },
         // A get/set_global carries its name constant plus an inline-cache slot.
         .get_global, .set_global => blk: {
             try out.print(alloc, " {s} [cache {d}]", .{ ch.constants.items[readU16At(code, offset + 1)].str, readU16At(code, offset + 3) });
@@ -3606,11 +3937,32 @@ pub const Session = struct {
 
     /// Register a native function under `name`, callable from the script. Must be
     /// called before `load` (natives are injected as globals when modules load).
+    /// The host does its own unpacking and the boundary is unchecked; prefer
+    /// `registerFn`, which derives both from the Zig function's type.
     pub fn registerHost(self: *Session, name: []const u8, func: HostFn) Error!void {
+        return self.registerNative(name, func, null);
+    }
+
+    /// Register a **plain Zig function** under `name`: `wrap` generates its
+    /// argument unpacking and result boxing, and `signatureOf` records its shape
+    /// so the VM can check calls and `check_extern` can verify an `extern func`
+    /// declaration against it at load.
+    ///
+    /// `f` may take a leading `*Ctx` (receiving the Session context) and then any
+    /// number of int/float/bool/`[]const u8`/`Value` parameters, returning one of
+    /// those (or `void`), optionally as an error union.
+    ///
+    ///     fn spawn(e: *Engine, kind: []const u8, x: f64) i64 { … }
+    ///     try session.registerFn("spawn", spawn);
+    pub fn registerFn(self: *Session, name: []const u8, comptime f: anytype) Error!void {
+        return self.registerNative(name, wrap(f), signatureOf(f));
+    }
+
+    fn registerNative(self: *Session, name: []const u8, func: HostFn, sig: ?HostSignature) Error!void {
         std.debug.assert(!self.loaded); // register host functions before load()
         const a = self.arena.allocator();
         const nf = try a.create(NativeFn);
-        nf.* = .{ .name = name, .func = func };
+        nf.* = .{ .name = name, .func = func, .signature = sig };
         try self.natives.append(a, nf);
     }
 
@@ -5504,6 +5856,86 @@ test "embed: host function, persistent state, repeated calls, and clean errors" 
     try testing.expectEqual(@as(i64, 446), asInt(r4).?); // 336 + (0+10+100)
 }
 
+test "embed: a declared extern binds to the registered native" {
+    const gpa = testing.allocator;
+    var ctx = EmbedCtx{ .base = 100 };
+
+    // The `extern` declares the host API in the script's own source, so calls to
+    // it are typed and the name resolves by linkage rather than by a definition.
+    var tree = try parser.parse(gpa,
+        \\extern func host_add(a: int, b: int) -> int
+        \\
+        \\extern "zig" func host_add2(a: int, b: int) -> int
+        \\
+        \\func use(x: int) -> int:
+        \\    return host_add(x, 1) + host_add2(x, 2)
+    );
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+
+    const session = try Session.init(gpa, &ctx);
+    defer session.deinit();
+    try session.registerHost("host_add", embedHostAdd);
+    try session.registerHost("host_add2", embedHostAdd);
+    try session.loadModule(tree.module);
+
+    // (5+1+100) + (5+2+100) = 106 + 107
+    const use = session.resolve("use").?;
+    try testing.expectEqual(@as(i64, 213), asInt(try session.call(use, &.{intValue(5)})).?);
+    try testing.expectEqual(@as(usize, 2), ctx.calls);
+
+    // An extern is reachable as a value too — it is just a `.native` global.
+    const direct = session.resolve("host_add").?;
+    try testing.expectEqual(@as(i64, 111), asInt(try session.call(direct, &.{ intValue(4), intValue(7) })).?);
+}
+
+test "embed: an unregistered extern fails at load, like an undefined symbol" {
+    const gpa = testing.allocator;
+    var tree = try parser.parse(gpa,
+        \\extern func missing(a: int) -> int
+        \\
+        \\func use(x: int) -> int:
+        \\    return missing(x)
+    );
+    defer tree.deinit();
+
+    const session = try Session.init(gpa, null);
+    defer session.deinit();
+    // No `registerHost` — loading must fail immediately rather than deferring a
+    // confusing "undefined name" to the first call.
+    try testing.expectError(error.Runtime, session.loadModule(tree.module));
+    const err = session.lastError().?;
+    try testing.expect(std.mem.indexOf(u8, err.message, "extern function 'missing' is not registered") != null);
+}
+
+test "serialize: an extern survives a round-trip and re-links to the host" {
+    const gpa = testing.allocator;
+    var ctx = EmbedCtx{ .base = 100 };
+    var tree = try parser.parse(gpa,
+        \\extern func host_add(a: int, b: int) -> int
+        \\
+        \\func use(x: int) -> int:
+        \\    return host_add(x, 1)
+    );
+    defer tree.deinit();
+
+    // The extern is linkage, not code: nothing about it is compiled, so the image
+    // carries only the `check_extern` in the script and re-links on load.
+    var ser = try serialize(gpa, &.{.{ .module = tree.module }}, false);
+    defer ser.deinit();
+    try testing.expectEqual(@as(usize, 0), ser.diagnostics.len);
+    var image = try deserialize(gpa, ser.bytes);
+    defer image.deinit();
+
+    const session = try Session.init(gpa, &ctx);
+    defer session.deinit();
+    try session.registerHost("host_add", embedHostAdd);
+    try session.loadImage(&image);
+
+    const use = session.resolve("use").?;
+    try testing.expectEqual(@as(i64, 108), asInt(try session.call(use, &.{intValue(7)})).?);
+}
+
 const PrintCap = struct { alloc: std.mem.Allocator, buf: std.ArrayList(u8) = .empty };
 
 fn embedPrint(ctx: ?*anyopaque, text: []const u8) void {
@@ -5691,6 +6123,217 @@ test "serialize: a deserialized image loads into an embedding Session" {
 test "serialize: garbage bytes are rejected, not crash" {
     try testing.expectError(error.BadImage, deserialize(testing.allocator, "not real bytecode"));
     try testing.expectError(error.BadImage, deserialize(testing.allocator, "RGB1"));
+}
+
+// --- comptime-wrapped natives (`registerFn`) ---------------------------------
+// The host writes plain Zig; `wrap` generates the unpacking and `signatureOf`
+// records the shape. No `asInt`/arity boilerplate in any of these.
+
+/// Takes the Session context as a leading `*Ctx`, then two script arguments.
+fn wrappedAdd(ctx: *EmbedCtx, a: i64, b: i64) i64 {
+    ctx.calls += 1;
+    return a + b + ctx.base;
+}
+
+/// No context parameter, and a mix of the supported scalar types.
+fn wrappedScale(label: []const u8, x: f64, times: i64) f64 {
+    return if (label.len == 0) 0.0 else x * @as(f64, @floatFromInt(times));
+}
+
+/// An error union: the failure becomes a catchable RoseGold runtime error.
+fn wrappedDiv(a: i64, b: i64) HostError!i64 {
+    if (b == 0) return error.HostFailure;
+    return @divTrunc(a, b);
+}
+
+/// A `void` return marshals to nil.
+fn wrappedTouch(ctx: *EmbedCtx) void {
+    ctx.calls += 1;
+}
+
+test "embed: registerFn generates marshalling from the Zig function's type" {
+    const gpa = testing.allocator;
+    var ctx = EmbedCtx{ .base = 100 };
+
+    var tree = try parser.parse(gpa,
+        \\extern func add(a: int, b: int) -> int
+        \\extern func scale(label: str, x: float, times: int) -> float
+        \\extern func div(a: int, b: int) -> int
+        \\extern func touch()
+        \\
+        \\func use() -> int:
+        \\    return add(1, 2)
+        \\
+        \\func scaled() -> float:
+        \\    return scale("k", 1.5, 4)
+        \\
+        \\func widened() -> float:
+        \\    return scale("k", 3, 2)
+        \\
+        \\func safe_div(a: int, b: int) -> int:
+        \\    try:
+        \\        return div(a, b)
+        \\    catch e:
+        \\        return -1
+        \\
+        \\func poke():
+        \\    touch()
+    );
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+
+    const session = try Session.init(gpa, &ctx);
+    defer session.deinit();
+    try session.registerFn("add", wrappedAdd);
+    try session.registerFn("scale", wrappedScale);
+    try session.registerFn("div", wrappedDiv);
+    try session.registerFn("touch", wrappedTouch);
+    try session.loadModule(tree.module);
+
+    try testing.expectEqual(@as(i64, 103), asInt(try session.call(session.resolve("use").?, &.{})).?);
+    try testing.expectEqual(@as(f64, 6.0), asFloat(try session.call(session.resolve("scaled").?, &.{})).?);
+
+    // An int argument for a `float` parameter widens, as it does everywhere else
+    // in the language (the raw `asFloat` stays strict; `wrap` follows the language).
+    try testing.expectEqual(@as(f64, 6.0), asFloat(try session.call(session.resolve("widened").?, &.{})).?);
+
+    // A host error union surfaces as a catchable RoseGold error.
+    const safe_div = session.resolve("safe_div").?;
+    try testing.expectEqual(@as(i64, 5), asInt(try session.call(safe_div, &.{ intValue(10), intValue(2) })).?);
+    try testing.expectEqual(@as(i64, -1), asInt(try session.call(safe_div, &.{ intValue(10), intValue(0) })).?);
+
+    // A `void` host fn returns nil.
+    try testing.expectEqual(ValueKind.nil, kindOf(try session.call(session.resolve("poke").?, &.{})));
+}
+
+test "embed: a wrapped native reports argument mismatches precisely" {
+    const gpa = testing.allocator;
+    var ctx = EmbedCtx{ .base = 0 };
+
+    var tree = try parser.parse(gpa, "extern func add(a: int, b: int) -> int");
+    defer tree.deinit();
+
+    const session = try Session.init(gpa, &ctx);
+    defer session.deinit();
+    try session.registerFn("add", wrappedAdd);
+    try session.loadModule(tree.module);
+
+    // Calling in from the host skips the analyzer, so this is the path where a
+    // registered signature earns its keep: a named error, not a bare HostFailure.
+    const add = session.resolve("add").?;
+    try testing.expectError(error.Runtime, session.call(add, &.{ strValue("x"), intValue(1) }));
+    try testing.expect(std.mem.indexOf(u8, session.lastError().?.message, "add argument 1: expected int, got str") != null);
+
+    try testing.expectError(error.Runtime, session.call(add, &.{intValue(1)}));
+    try testing.expect(std.mem.indexOf(u8, session.lastError().?.message, "add expects 2 argument(s), got 1") != null);
+}
+
+test "embed: a declaration that disagrees with the host is caught at load" {
+    const gpa = testing.allocator;
+    var ctx = EmbedCtx{ .base = 0 };
+
+    // The script promises `(str, int) -> int`; the host registered `(int, int) -> int`.
+    // Zig's own `extern fn` would let this through to a crash at the ABI boundary —
+    // a recorded signature catches it before a single call.
+    var tree = try parser.parse(gpa, "extern func add(a: str, b: int) -> int");
+    defer tree.deinit();
+
+    const session = try Session.init(gpa, &ctx);
+    defer session.deinit();
+    try session.registerFn("add", wrappedAdd);
+    try testing.expectError(error.Runtime, session.loadModule(tree.module));
+    try testing.expect(std.mem.indexOf(u8, session.lastError().?.message, "extern 'add' parameter 1: declared str, but the host takes int") != null);
+}
+
+test "embed: declaration/host mismatches in arity and return type are caught" {
+    const gpa = testing.allocator;
+
+    {
+        var tree = try parser.parse(gpa, "extern func add(a: int) -> int");
+        defer tree.deinit();
+        const session = try Session.init(gpa, null);
+        defer session.deinit();
+        try session.registerFn("add", wrappedAdd);
+        try testing.expectError(error.Runtime, session.loadModule(tree.module));
+        try testing.expect(std.mem.indexOf(u8, session.lastError().?.message, "declares 1 parameter(s) but the host registered 2") != null);
+    }
+    {
+        // The host returns f64; a declared `int` return would silently hand the
+        // script a float. Declaring `float` for an int-returning host is fine
+        // (it widens), so only this direction is an error.
+        var tree = try parser.parse(gpa, "extern func scale(label: str, x: float, times: int) -> int");
+        defer tree.deinit();
+        const session = try Session.init(gpa, null);
+        defer session.deinit();
+        try session.registerFn("scale", wrappedScale);
+        try testing.expectError(error.Runtime, session.loadModule(tree.module));
+        try testing.expect(std.mem.indexOf(u8, session.lastError().?.message, "declared return int, but the host returns float") != null);
+    }
+}
+
+test "embed: an untyped declaration and a raw registerHost both opt out" {
+    const gpa = testing.allocator;
+    var ctx = EmbedCtx{ .base = 100 };
+
+    // `a`/`b` are untyped (`any`) and the return is undeclared, so nothing about
+    // the declaration contradicts the host — the check stays lenient.
+    var tree = try parser.parse(gpa,
+        \\extern func add(a, b)
+        \\extern func raw(a: str, b: bool) -> str
+        \\
+        \\func use() -> int:
+        \\    return add(1, 2)
+    );
+    defer tree.deinit();
+
+    const session = try Session.init(gpa, &ctx);
+    defer session.deinit();
+    try session.registerFn("add", wrappedAdd);
+    // A raw HostFn records no signature, so its declaration is an unchecked
+    // promise — the pre-phase-2 behavior, still available.
+    try session.registerHost("raw", embedHostAdd);
+    try session.loadModule(tree.module);
+
+    try testing.expectEqual(@as(i64, 103), asInt(try session.call(session.resolve("use").?, &.{})).?);
+}
+
+test "embed: a shared bindings module declares the host API for its importers" {
+    // The shape an engine actually uses: one module declares every host binding,
+    // and game scripts import it. Natives are injected into every module's
+    // globals, so the extern links in the module that declares it.
+    const gpa = testing.allocator;
+    var ctx = EmbedCtx{ .base = 100 };
+
+    var dep_tree = try parser.parse(gpa,
+        \\pub extern func host_add(a: int, b: int) -> int
+        \\
+        \\pub func add_ten(x: int) -> int:
+        \\    return host_add(x, 10)
+    );
+    defer dep_tree.deinit();
+    var entry_tree = try parser.parse(gpa,
+        \\import engine
+        \\
+        \\func use(x: int) -> int:
+        \\    return engine.add_ten(x) + engine.host_add(x, 0)
+    );
+    defer entry_tree.deinit();
+
+    const imports = [_]ModuleImport{.{ .name = "engine", .module_index = 0 }};
+    const modules = [_]ProgramModule{
+        .{ .module = dep_tree.module, .imports = &.{}, .name = "engine" },
+        .{ .module = entry_tree.module, .imports = &imports, .name = "main" },
+    };
+
+    const session = try Session.init(gpa, &ctx);
+    defer session.deinit();
+    try session.registerHost("host_add", embedHostAdd);
+    try session.load(&modules);
+
+    // add_ten(5) = 5+10+100 = 115; host_add(5, 0) = 5+0+100 = 105.
+    const use = session.resolve("use").?;
+    try testing.expectEqual(@as(i64, 220), asInt(try session.call(use, &.{intValue(5)})).?);
+    try testing.expectEqual(@as(usize, 2), ctx.calls);
 }
 
 test "serialize: round-trips a multi-module program (imports + cross-module calls)" {

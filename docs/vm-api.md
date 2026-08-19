@@ -141,6 +141,80 @@ fn hostAdd(ctx: ?*anyopaque, args: []const vm.Value) vm.HostError!vm.Value {
 }
 ```
 
+### Comptime-wrapped natives (`registerFn`)
+
+`registerFn` takes a **plain Zig function** and derives the marshalling from its type,
+so the host writes no unpacking boilerplate at all:
+
+```zig
+fn spawn(engine: *Engine, kind: []const u8, x: f64, times: i64) i64 { … }
+
+try session.registerFn("spawn", spawn);   // instead of registerHost + hand-unpacking
+```
+
+- An optional **leading `*Ctx`** parameter receives the Session context. This is
+  unambiguous — no script value marshals into a single-item pointer — so `[]const u8`
+  stays an ordinary `str` parameter. **The context cast is unchecked**: `Session.init`
+  erases the type to `?*anyopaque`, so `*Ctx` must be the type you actually passed
+  there. This is the one part of the boundary `wrap` cannot verify for you.
+- Parameters and the return may be any integer or float type, `bool`, `[]const u8`,
+  `void`, or a raw `vm.Value` (which means "any", opting out of checking). An
+  unsupported type is a **compile error at the `registerFn` call site**, naming the type.
+- The return may be an **error union**; a returned error becomes a catchable RoseGold
+  runtime error, except `error.OutOfMemory`, which propagates.
+- `int` **widens to `float`** here, matching the language. (The raw `asFloat` stays
+  strict — coercion is the host's call when unpacking by hand.)
+- Integer results are range-checked on the way in via `std.math.cast`.
+
+```zig
+pub const HostKind = enum { any, int, float, bool, str, void };
+pub const HostSignature = struct { params: []const HostKind, ret: HostKind };
+
+pub fn wrap(comptime f: anytype) HostFn;              // marshalling only
+pub fn signatureOf(comptime f: anytype) HostSignature; // shape only
+```
+
+`registerFn` is `registerHost(name, wrap(f))` plus `signatureOf(f)`. Recording the
+signature buys two checks a raw `registerHost` can't have:
+
+- **At load**, `check_extern` compares an `extern func` declaration against the
+  registered native and rejects a disagreement — wrong arity, a parameter the host
+  can't accept, or a return the script would misread. This closes the
+  unchecked-promise hole that Zig's own `extern fn` (and a C linker) leave open.
+- **At call**, arguments are validated before dispatch, so a mismatch is a named error
+  (`spawn argument 2: expected float, got str`) rather than an opaque `HostFailure`.
+  This matters most for `Session.call` from the host, which bypasses the analyzer.
+
+Both checks are lenient in the same direction as the language: `any` on either side
+opts out, and `int` flows into `float`. `wrap` is exported separately if you want the
+generated marshalling without the recorded signature.
+
+### Declaring bindings in script (`extern func`)
+
+A registered native alone is untyped to the front end. Declaring it in RoseGold source
+makes the boundary checkable:
+
+```rosegold
+pub extern func host_add(a: int, b: int) -> int
+extern "zig" func spawn(kind: str, x: float, y: float) -> int
+```
+
+The declaration has no body: it is resolved by **linkage** at load time against the
+names given to `registerHost`, mirroring Zig's `extern fn`. As in Zig the signature is
+an **unchecked promise** — linkage verifies the name is registered, not that this Zig
+function's types match what the script declared.
+
+- Call sites are checked for arity and argument/return types; `hover`, `documentSymbol`,
+  `fmt`, and `doc` all work on the declaration.
+- A name with no registered native **fails when the module loads** (an undefined-symbol
+  error), not at the first call. `Session.lastError()` carries the message.
+- Bare `extern` ≡ `extern "zig"`. `extern "c"` is reserved for C-ABI/shared-library
+  linkage and currently reports "not supported yet".
+- Top-level only; no default parameter values and no named arguments at call sites (a
+  native carries no parameter names to reorder against).
+- The declaration compiles to no code, so it costs nothing in a serialized `Image` and
+  re-links on `loadImage`.
+
 ---
 
 ## Print routing
@@ -180,12 +254,17 @@ functions, and any values produced during calls. Errors: `OutOfMemory`.
 ### Configuration (before `load`)
 
 ```zig
+pub fn registerFn(self: *Session, name: []const u8, comptime f: anytype) Error!void
 pub fn registerHost(self: *Session, name: []const u8, func: HostFn) Error!void
 pub fn setPrint(self: *Session, func: PrintFn, ctx: ?*anyopaque) void
 ```
 
-`registerHost` makes `func` callable from RoseGold as the global `name`. Must be
-called before `load` (natives are injected when modules load). `setPrint` routes
+Both `register*` calls make a native callable from RoseGold as the global `name`, and
+both must be called before `load` (natives are injected when modules load).
+**`registerFn` is the one to reach for**: it takes a plain Zig function, generating the
+marshalling and recording the signature for load- and call-time checking (see
+[Comptime-wrapped natives](#comptime-wrapped-natives-registerfn)). `registerHost` takes
+a raw `HostFn`, leaving unpacking to you and the boundary unchecked. `setPrint` routes
 `print`/`echo` to `func`.
 
 ### Loading
